@@ -1,0 +1,6 @@
+name = "inbox-mailbox"
+version = "0.1.0"
+package = "/home/colin/work/actors/inbox/target/wasm32-unknown-unknown/release/inbox_mailbox.wasm"
+
+[[handler]]
+type = "runtime"
