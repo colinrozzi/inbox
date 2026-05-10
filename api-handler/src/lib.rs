@@ -4,9 +4,12 @@
 //! RPC, returns JSON, closes the connection, and shuts itself down.
 //!
 //! Routes:
-//!   GET  /v1/inbox?since=<n>   → list messages since cursor n
-//!   POST /v1/messages          → store a message; body is JSON
-//!     { "from": "...", "to": "...", "subject": "...", "body": "..." }
+//!   GET  /v1/mailboxes                              → list registered addresses
+//!   POST /v1/mailboxes                              → register an address
+//!   GET  /v1/mailboxes/<addr>                       → look up the mailbox record
+//!   GET  /v1/mailboxes/<addr>/inbox?since=<n>       → list messages since cursor n
+//!   POST /v1/mailboxes/<addr>/messages              → store a message
+//!   POST /v1/mailboxes/<addr>/send                  → send a message from this address
 
 #![no_std]
 extern crate alloc;
@@ -150,6 +153,14 @@ fn route(request: &[u8], router_id: &str) -> Vec<u8> {
         };
 
         return match (method, sub) {
+            ("GET", "") => {
+                let body = format!(
+                    r#"{{"address":"{}","mailbox_id":"{}"}}"#,
+                    json_escape(&address),
+                    json_escape(&mailbox_id)
+                );
+                http_response(200, "application/json", body.into_bytes())
+            }
             ("GET", "inbox") => handle_inbox(query, &mailbox_id),
             ("POST", "messages") => handle_post_message(request_str, &mailbox_id),
             ("POST", "send") => handle_send(request_str, &mailbox_id, &address),
