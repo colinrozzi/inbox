@@ -11,7 +11,7 @@
     crane.url = "github:ipetkov/crane";
 
     theater = {
-      url = "github:colinrozzi/theater/release-20260509";
+      url = "github:colinrozzi/theater/release-20260510";
       inputs.nixpkgs.follows = "nixpkgs";
       inputs.rust-overlay.follows = "rust-overlay";
       inputs.crane.follows = "crane";
@@ -61,6 +61,8 @@
             cp target/wasm32-unknown-unknown/release/inbox_acceptor.wasm $out/
             cp target/wasm32-unknown-unknown/release/inbox_api_handler.wasm $out/
             cp target/wasm32-unknown-unknown/release/inbox_mailbox.wasm $out/
+            cp target/wasm32-unknown-unknown/release/inbox_smtp_acceptor.wasm $out/
+            cp target/wasm32-unknown-unknown/release/inbox_smtp_handler.wasm $out/
           '';
         });
 

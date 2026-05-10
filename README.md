@@ -23,9 +23,6 @@ Inbound SMTP listens on `:1025` (smtp-acceptor + smtp-handler). External senders
 
 Outbound SMTP is done synchronously from the api-handler via the `theater:simple/tcp` handler — it connects to whatever address the request specifies (default `localhost:1025`). Real-world deployments would use a relay like Postmark/SES instead of direct delivery.
 
-### Known limitation: same-process self-loop
-
-`POST /v1/send` to `localhost:1025` of the same theater instance currently deadlocks. The api-handler blocks on `tcp_receive` waiting for the SMTP greeting; meanwhile theater's `tcp_transfer` blocks the smtp-acceptor until the target's `handle-connection-transfer` returns; the target's first `tcp_send` is funneled through the same dispatch path. Two separate theater processes on different hosts (or even on different ports of the same host with two instances) work fine — this is the normal deployment shape.
 
 ## Architecture
 
