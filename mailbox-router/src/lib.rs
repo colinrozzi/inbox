@@ -11,7 +11,7 @@ extern crate alloc;
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
-use packr_guest::{export, import, pack_types, FromValue, GraphValue, Value, ValueType};
+use packr_guest::{export, import, pack_types, GraphValue, Value, ValueType};
 
 packr_guest::setup_guest!();
 
@@ -44,15 +44,9 @@ pack_types! {
     }
     exports {
         theater:simple/actor.init: func(state: value, mailbox-manifest: string) -> result<router-state, string>,
-        // We declare the state as `value` (rather than `router-state`) on
-        // every callback to sidestep theater's host-side type validation,
-        // which currently rejects empty `list<binding>` because packr's
-        // `From<Vec<T>>` defaults the elem_type to s32 when the Vec is
-        // empty (the encoded value's type doesn't match the declared
-        // `list<binding>` until at least one binding is registered).
-        theater:inbox/router.register: func(state: value, address: string) -> result<tuple<router-state, string>, string>,
-        theater:inbox/router.lookup: func(state: value, address: string) -> result<tuple<router-state, option<string>>, string>,
-        theater:inbox/router.list: func(state: value) -> result<tuple<router-state, list<binding>>, string>,
+        theater:inbox/router.register: func(state: router-state, address: string) -> result<tuple<router-state, string>, string>,
+        theater:inbox/router.lookup: func(state: router-state, address: string) -> result<tuple<router-state, option<string>>, string>,
+        theater:inbox/router.list: func(state: router-state) -> result<tuple<router-state, list<binding>>, string>,
     }
 }
 
@@ -82,8 +76,8 @@ fn init(_state: Value, mailbox_manifest: String) -> Result<(RouterState, ()), St
 }
 
 #[export(name = "theater:inbox/router.register")]
-fn register(state: Value, address: String) -> Result<(RouterState, String), String> {
-    let mut state = RouterState::from_value(state).map_err(|e| format!("decode state: {:?}", e))?;
+fn register(state: RouterState, address: String) -> Result<(RouterState, String), String> {
+    let mut state = state;
 
     if let Some(b) = state.bindings.iter().find(|b| b.address == address) {
         // Idempotent: registering an existing address returns its current id.
@@ -118,8 +112,7 @@ fn register(state: Value, address: String) -> Result<(RouterState, String), Stri
 }
 
 #[export(name = "theater:inbox/router.lookup")]
-fn lookup(state: Value, address: String) -> Result<(RouterState, Option<String>), String> {
-    let state = RouterState::from_value(state).map_err(|e| format!("decode state: {:?}", e))?;
+fn lookup(state: RouterState, address: String) -> Result<(RouterState, Option<String>), String> {
     let id = state
         .bindings
         .iter()
@@ -129,8 +122,7 @@ fn lookup(state: Value, address: String) -> Result<(RouterState, Option<String>)
 }
 
 #[export(name = "theater:inbox/router.list")]
-fn list(state: Value) -> Result<(RouterState, Vec<Binding>), String> {
-    let state = RouterState::from_value(state).map_err(|e| format!("decode state: {:?}", e))?;
+fn list(state: RouterState) -> Result<(RouterState, Vec<Binding>), String> {
     let bindings = state.bindings.clone();
     Ok((state, bindings))
 }
