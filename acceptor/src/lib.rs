@@ -67,6 +67,7 @@ fn rpc_call(actor_id: String, function: String, params: Value, options: Value) -
 const LISTEN_ADDR: &str = "0.0.0.0:8080";
 const API_HANDLER_MANIFEST: &str = "/home/colin/work/actors/inbox/api-handler/manifest.toml";
 const MAILBOX_MANIFEST: &str = "/home/colin/work/actors/inbox/mailbox/manifest.toml";
+const SMTP_ACCEPTOR_MANIFEST: &str = "/home/colin/work/actors/inbox/smtp-acceptor/manifest.toml";
 
 #[export(name = "theater:simple/actor.init")]
 fn init(_state: Value) -> Result<(AcceptorState, ()), String> {
@@ -91,8 +92,25 @@ fn init(_state: Value) -> Result<(AcceptorState, ()), String> {
     let listener_id = tcp_listen(String::from(LISTEN_ADDR))
         .map_err(|e| format!("listen failed: {}", e))?;
     log(format!(
-        "[inbox-acceptor] listening on {} (id={})",
+        "[inbox-acceptor] HTTP listening on {} (id={})",
         LISTEN_ADDR, listener_id
+    ));
+
+    // Spawn the SMTP acceptor and pass it the mailbox ID so inbound mail
+    // lands in the same store as the API.
+    let smtp_acceptor_id =
+        supervisor_spawn(String::from(SMTP_ACCEPTOR_MANIFEST), None, None)
+            .map_err(|e| format!("spawn smtp-acceptor failed: {}", e))?;
+    let smtp_init_params = Value::Tuple(alloc::vec![Value::String(mailbox_id.clone())]);
+    let _ = rpc_call(
+        smtp_acceptor_id.clone(),
+        String::from("theater:simple/actor.init"),
+        smtp_init_params,
+        Value::Tuple(alloc::vec![]),
+    );
+    log(format!(
+        "[inbox-acceptor] spawned smtp-acceptor {}",
+        smtp_acceptor_id
     ));
 
     Ok((

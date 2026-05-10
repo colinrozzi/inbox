@@ -1,0 +1,15 @@
+name = "inbox-smtp-acceptor"
+version = "0.1.0"
+package = "/home/colin/work/actors/inbox/target/wasm32-unknown-unknown/release/inbox_smtp_acceptor.wasm"
+
+[[handler]]
+type = "runtime"
+
+[[handler]]
+type = "tcp"
+
+[[handler]]
+type = "supervisor"
+
+[[handler]]
+type = "rpc"

@@ -31,6 +31,7 @@ pack_types! {
             shutdown: func(data: option<list<u8>>) -> result<_, string>,
         }
         theater:simple/tcp {
+            connect: func(address: string) -> result<string, string>,
             receive: func(connection-id: string, max-bytes: u32) -> result<list<u8>, string>,
             send: func(connection-id: string, data: list<u8>) -> result<u64, string>,
             close: func(connection-id: string) -> result<_, string>,
@@ -50,6 +51,9 @@ fn log(msg: String);
 
 #[import(module = "theater:simple/runtime", name = "shutdown")]
 fn shutdown(data: Option<Vec<u8>>) -> Result<(), String>;
+
+#[import(module = "theater:simple/tcp", name = "connect")]
+fn tcp_connect(address: String) -> Result<String, String>;
 
 #[import(module = "theater:simple/tcp", name = "receive")]
 fn tcp_receive(connection_id: String, max_bytes: u32) -> Result<Vec<u8>, String>;
@@ -108,6 +112,7 @@ fn route(request: &[u8], mailbox_id: &str) -> Vec<u8> {
     match (method, path) {
         ("GET", "/v1/inbox") => handle_inbox(query, mailbox_id),
         ("POST", "/v1/messages") => handle_post_message(request_str, mailbox_id),
+        ("POST", "/v1/send") => handle_send(request_str, mailbox_id),
         _ => http_response(404, "application/json", br#"{"error":"not found"}"#.to_vec()),
     }
 }
@@ -170,6 +175,180 @@ fn handle_post_message(request_str: &str, mailbox_id: &str) -> Vec<u8> {
 
     let json = format!(r#"{{"id":{}}}"#, id);
     http_response(201, "application/json", json.into_bytes())
+}
+
+/// `POST /v1/send` — deliver a message via SMTP and record it in the mailbox.
+///
+/// Body: `{"from":"...", "to":"...", "subject":"...", "body":"..."}`
+/// Optional: `"smtp_server":"localhost:1025"` to override the SMTP target
+/// (default: derived from the recipient domain — for now we assume
+/// `localhost:1025` when no override is given, since we don't do MX lookups
+/// yet).
+fn handle_send(request_str: &str, mailbox_id: &str) -> Vec<u8> {
+    let body = match request_str.find("\r\n\r\n") {
+        Some(i) => &request_str[i + 4..],
+        None => return http_response(400, "application/json", br#"{"error":"missing body"}"#.to_vec()),
+    };
+
+    let parsed = parse_simple_json_object(body);
+    let get = |k: &str| parsed.iter().find(|(kk, _)| kk == k).map(|(_, v)| v.clone()).unwrap_or_default();
+    let from = get("from");
+    let to = get("to");
+    let subject = get("subject");
+    let msg_body = get("body");
+    let smtp_server = {
+        let s = get("smtp_server");
+        if s.is_empty() { String::from("localhost:1025") } else { s }
+    };
+
+    if from.is_empty() || to.is_empty() {
+        return http_response(400, "application/json", br#"{"error":"from and to are required"}"#.to_vec());
+    }
+
+    if let Err(e) = smtp_deliver(&smtp_server, &from, &to, &subject, &msg_body) {
+        log(format!("[inbox-api] smtp deliver failed: {}", e));
+        let body = format!(r#"{{"error":"smtp deliver failed: {}"}}"#, json_escape(&e));
+        return http_response(502, "application/json", body.into_bytes());
+    }
+
+    // Record the sent message in our own mailbox so the sender has a copy.
+    let _ = rpc_call(
+        mailbox_id.to_string(),
+        String::from("theater:inbox/mailbox.put-message"),
+        Value::Tuple(alloc::vec![
+            Value::String(from),
+            Value::String(to),
+            Value::String(subject),
+            Value::String(msg_body),
+        ]),
+        Value::Tuple(alloc::vec![]),
+    );
+
+    http_response(200, "application/json", br#"{"status":"sent"}"#.to_vec())
+}
+
+// ============================================================================
+// SMTP client
+// ============================================================================
+
+/// Talk SMTP to `server_addr` and deliver one message.
+fn smtp_deliver(
+    server_addr: &str,
+    from: &str,
+    to: &str,
+    subject: &str,
+    body: &str,
+) -> Result<(), String> {
+    let conn = tcp_connect(server_addr.to_string())
+        .map_err(|e| format!("connect to {} failed: {}", server_addr, e))?;
+
+    // Greeting (220).
+    smtp_expect(&conn, 220).map_err(|e| {
+        let _ = tcp_close(conn.clone());
+        e
+    })?;
+
+    let result = smtp_session(&conn, from, to, subject, body);
+    let _ = tcp_close(conn);
+    result
+}
+
+fn smtp_session(
+    conn: &str,
+    from: &str,
+    to: &str,
+    subject: &str,
+    body: &str,
+) -> Result<(), String> {
+    smtp_command(conn, "EHLO inbox.local\r\n", 250)?;
+    smtp_command(conn, &format!("MAIL FROM:<{}>\r\n", from), 250)?;
+    smtp_command(conn, &format!("RCPT TO:<{}>\r\n", to), 250)?;
+    smtp_command(conn, "DATA\r\n", 354)?;
+
+    // Headers + body, terminated by lone "." line.
+    let mut data = String::new();
+    data.push_str(&format!("From: {}\r\n", from));
+    data.push_str(&format!("To: {}\r\n", to));
+    data.push_str(&format!("Subject: {}\r\n", subject));
+    data.push_str("MIME-Version: 1.0\r\n");
+    data.push_str("Content-Type: text/plain; charset=utf-8\r\n");
+    data.push_str("\r\n");
+    // Dot-stuff: any line starting with "." gets prefixed with another ".".
+    for line in body.split('\n') {
+        let line = line.trim_end_matches('\r');
+        if line.starts_with('.') {
+            data.push('.');
+        }
+        data.push_str(line);
+        data.push_str("\r\n");
+    }
+    data.push_str(".\r\n");
+
+    tcp_send(conn.to_string(), data.into_bytes())
+        .map_err(|e| format!("DATA send failed: {}", e))?;
+    smtp_expect(conn, 250)?;
+
+    smtp_command(conn, "QUIT\r\n", 221)?;
+    Ok(())
+}
+
+fn smtp_command(conn: &str, line: &str, expected: u16) -> Result<(), String> {
+    tcp_send(conn.to_string(), line.as_bytes().to_vec())
+        .map_err(|e| format!("send {:?} failed: {}", line.trim(), e))?;
+    smtp_expect(conn, expected)
+}
+
+/// Read until we see a complete SMTP reply, then assert the code matches.
+/// SMTP replies are one or more lines: "NNN-..." for continuation,
+/// "NNN ..." (space) for the final line.
+fn smtp_expect(conn: &str, expected: u16) -> Result<(), String> {
+    let mut buf = Vec::new();
+    loop {
+        let chunk = tcp_receive(conn.to_string(), 4096)
+            .map_err(|e| format!("receive failed: {}", e))?;
+        if chunk.is_empty() {
+            return Err(String::from("connection closed before reply complete"));
+        }
+        buf.extend_from_slice(&chunk);
+        // Check whether we have a final line (a CRLF preceded by "NNN ").
+        if let Some(last_line_start) = find_last_smtp_line_start(&buf) {
+            if buf.len() > last_line_start + 3 && buf[last_line_start + 3] == b' '
+                && buf.ends_with(b"\r\n")
+            {
+                let code = parse_smtp_code(&buf[last_line_start..]).ok_or_else(|| {
+                    String::from("invalid SMTP reply (no 3-digit code on final line)")
+                })?;
+                if code != expected {
+                    let text = core::str::from_utf8(&buf).unwrap_or("");
+                    return Err(format!("expected {}, got {}: {}", expected, code, text.trim()));
+                }
+                return Ok(());
+            }
+        }
+    }
+}
+
+/// Find the start index of the last line in `buf`. A "line" ends with CRLF.
+fn find_last_smtp_line_start(buf: &[u8]) -> Option<usize> {
+    if buf.is_empty() {
+        return None;
+    }
+    // Find the last CRLF and take what follows; if the buffer ends with CRLF,
+    // skip it and look for the previous one.
+    let end = if buf.ends_with(b"\r\n") { buf.len() - 2 } else { buf.len() };
+    let slice = &buf[..end];
+    match slice.windows(2).rposition(|w| w == b"\r\n") {
+        Some(pos) => Some(pos + 2),
+        None => Some(0),
+    }
+}
+
+fn parse_smtp_code(line: &[u8]) -> Option<u16> {
+    if line.len() < 3 {
+        return None;
+    }
+    let s = core::str::from_utf8(&line[..3]).ok()?;
+    s.parse::<u16>().ok()
 }
 
 // ============================================================================
