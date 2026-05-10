@@ -17,7 +17,7 @@ packr_guest::setup_guest!();
 #[derive(Clone, GraphValue)]
 #[graph(crate = "packr_guest::composite_abi")]
 pub struct SmtpHandlerState {
-    pub mailbox_id: String,
+    pub router_id: String,
 }
 
 pack_types! {
@@ -36,7 +36,7 @@ pack_types! {
         }
     }
     exports {
-        theater:simple/actor.init: func(state: value, mailbox-id: string) -> result<smtp-handler-state, string>,
+        theater:simple/actor.init: func(state: value, router-id: string) -> result<smtp-handler-state, string>,
         theater:simple/tcp-client.handle-connection-transfer: func(state: smtp-handler-state, connection-id: string) -> result<smtp-handler-state, string>,
     }
 }
@@ -62,8 +62,8 @@ fn rpc_call(actor_id: String, function: String, params: Value, options: Value) -
 const HOSTNAME: &str = "inbox.local";
 
 #[export(name = "theater:simple/actor.init")]
-fn init(_state: Value, mailbox_id: String) -> Result<(SmtpHandlerState, ()), String> {
-    Ok((SmtpHandlerState { mailbox_id }, ()))
+fn init(_state: Value, router_id: String) -> Result<(SmtpHandlerState, ()), String> {
+    Ok((SmtpHandlerState { router_id }, ()))
 }
 
 #[export(name = "theater:simple/tcp-client.handle-connection-transfer")]
@@ -71,7 +71,7 @@ fn handle_connection_transfer(
     state: SmtpHandlerState,
     connection_id: String,
 ) -> Result<(SmtpHandlerState, ()), String> {
-    if let Err(e) = run_session(&connection_id, &state.mailbox_id) {
+    if let Err(e) = run_session(&connection_id, &state.router_id) {
         log(format!("[inbox-smtp] session error: {}", e));
     }
     let _ = tcp_close(connection_id);
@@ -83,11 +83,12 @@ fn handle_connection_transfer(
 // SMTP server state machine
 // ============================================================================
 
-fn run_session(conn: &str, mailbox_id: &str) -> Result<(), String> {
+fn run_session(conn: &str, router_id: &str) -> Result<(), String> {
     send_line(conn, &format!("220 {} ESMTP inbox", HOSTNAME))?;
 
     let mut mail_from: Option<String> = None;
-    let mut rcpts: Vec<String> = Vec::new();
+    // Each accepted recipient: (address, mailbox_id) resolved via the router.
+    let mut rcpts: Vec<(String, String)> = Vec::new();
 
     loop {
         let line = read_line(conn)?;
@@ -119,10 +120,19 @@ fn run_session(conn: &str, mailbox_id: &str) -> Result<(), String> {
                     send_line(conn, "503 Need MAIL command first")?;
                 } else {
                     match extract_address(trimmed, "TO:") {
-                        Some(addr) => {
-                            rcpts.push(addr);
-                            send_line(conn, "250 OK")?;
-                        }
+                        Some(addr) => match router_lookup(router_id, &addr) {
+                            Ok(Some(mbox_id)) => {
+                                rcpts.push((addr, mbox_id));
+                                send_line(conn, "250 OK")?;
+                            }
+                            Ok(None) => {
+                                send_line(conn, "550 No such recipient")?;
+                            }
+                            Err(e) => {
+                                log(format!("[inbox-smtp] router lookup failed: {}", e));
+                                send_line(conn, "451 Temporary lookup failure")?;
+                            }
+                        },
                         None => send_line(conn, "501 Syntax error in RCPT TO")?,
                     }
                 }
@@ -142,10 +152,10 @@ fn run_session(conn: &str, mailbox_id: &str) -> Result<(), String> {
                 let (subject, body) = parse_headers_and_body(&raw);
                 let from = mail_from.clone().unwrap_or_default();
 
-                // Store the message in the mailbox once per recipient.
-                for to in &rcpts {
+                // Store on each recipient's mailbox.
+                for (to, mbox_id) in &rcpts {
                     let _ = rpc_call(
-                        mailbox_id.to_string(),
+                        mbox_id.clone(),
                         String::from("theater:inbox/mailbox.put-message"),
                         Value::Tuple(alloc::vec![
                             Value::String(from.clone()),
@@ -182,6 +192,34 @@ fn run_session(conn: &str, mailbox_id: &str) -> Result<(), String> {
             "" => {} // ignore blank lines
             _ => send_line(conn, "502 Command not implemented")?,
         }
+    }
+}
+
+/// Ask the router to resolve an address to a mailbox actor ID.
+fn router_lookup(router_id: &str, address: &str) -> Result<Option<String>, String> {
+    let result = rpc_call(
+        router_id.to_string(),
+        String::from("theater:inbox/router.lookup"),
+        Value::Tuple(alloc::vec![Value::String(address.to_string())]),
+        Value::Tuple(alloc::vec![]),
+    );
+    // Result<Variant<"ok", [Option<String>]>, _>
+    let ok_payload = match result {
+        Value::Result { value: Ok(inner), .. } => match *inner {
+            Value::Variant { case_name, payload, .. } if case_name == "ok" => {
+                payload.into_iter().next()
+            }
+            _ => None,
+        },
+        _ => None,
+    };
+    match ok_payload {
+        Some(Value::Option { value: Some(inner), .. }) => match *inner {
+            Value::String(id) => Ok(Some(id)),
+            _ => Err(String::from("unexpected router response shape")),
+        },
+        Some(Value::Option { value: None, .. }) => Ok(None),
+        _ => Err(String::from("router rpc returned no payload")),
     }
 }
 

@@ -18,9 +18,8 @@ packr_guest::setup_guest!();
 #[graph(crate = "packr_guest::composite_abi")]
 pub struct AcceptorState {
     pub listener_id: String,
-    pub mailbox_id: String,
+    pub router_id: String,
     pub api_handler_manifest: String,
-    pub mailbox_manifest: String,
 }
 
 pack_types! {
@@ -67,23 +66,22 @@ fn rpc_call(actor_id: String, function: String, params: Value, options: Value) -
 const LISTEN_ADDR: &str = "0.0.0.0:8080";
 const API_HANDLER_MANIFEST: &str = "/home/colin/work/actors/inbox/api-handler/manifest.toml";
 const MAILBOX_MANIFEST: &str = "/home/colin/work/actors/inbox/mailbox/manifest.toml";
+const ROUTER_MANIFEST: &str = "/home/colin/work/actors/inbox/mailbox-router/manifest.toml";
 const SMTP_ACCEPTOR_MANIFEST: &str = "/home/colin/work/actors/inbox/smtp-acceptor/manifest.toml";
 
 #[export(name = "theater:simple/actor.init")]
 fn init(_state: Value) -> Result<(AcceptorState, ()), String> {
     log(String::from("[inbox-acceptor] init"));
 
-    // Spawn the singleton mailbox actor and initialize it.
-    let mailbox_id = supervisor_spawn(String::from(MAILBOX_MANIFEST), None, None)
-        .map_err(|e| format!("spawn mailbox failed: {}", e))?;
-    log(format!("[inbox-acceptor] spawned mailbox {}", mailbox_id));
+    // Spawn the mailbox-router. It owns the address → mailbox-actor mapping
+    // and spawns mailbox actors on demand.
+    let router_id = supervisor_spawn(String::from(ROUTER_MANIFEST), None, None)
+        .map_err(|e| format!("spawn router failed: {}", e))?;
+    log(format!("[inbox-acceptor] spawned mailbox-router {}", router_id));
 
-    let init_params = Value::Tuple(alloc::vec![Value::Option {
-        inner_type: ValueType::List(alloc::boxed::Box::new(ValueType::U8)),
-        value: None,
-    }]);
+    let init_params = Value::Tuple(alloc::vec![Value::String(String::from(MAILBOX_MANIFEST))]);
     let _ = rpc_call(
-        mailbox_id.clone(),
+        router_id.clone(),
         String::from("theater:simple/actor.init"),
         init_params,
         Value::Tuple(alloc::vec![]),
@@ -96,12 +94,12 @@ fn init(_state: Value) -> Result<(AcceptorState, ()), String> {
         LISTEN_ADDR, listener_id
     ));
 
-    // Spawn the SMTP acceptor and pass it the mailbox ID so inbound mail
-    // lands in the same store as the API.
+    // Spawn the SMTP acceptor and pass it the router ID so inbound mail
+    // can be routed to the right mailbox.
     let smtp_acceptor_id =
         supervisor_spawn(String::from(SMTP_ACCEPTOR_MANIFEST), None, None)
             .map_err(|e| format!("spawn smtp-acceptor failed: {}", e))?;
-    let smtp_init_params = Value::Tuple(alloc::vec![Value::String(mailbox_id.clone())]);
+    let smtp_init_params = Value::Tuple(alloc::vec![Value::String(router_id.clone())]);
     let _ = rpc_call(
         smtp_acceptor_id.clone(),
         String::from("theater:simple/actor.init"),
@@ -113,12 +111,12 @@ fn init(_state: Value) -> Result<(AcceptorState, ()), String> {
         smtp_acceptor_id
     ));
 
+    let _ = ValueType::Bool; // silence unused if no other ValueType use
     Ok((
         AcceptorState {
             listener_id,
-            mailbox_id,
+            router_id,
             api_handler_manifest: String::from(API_HANDLER_MANIFEST),
-            mailbox_manifest: String::from(MAILBOX_MANIFEST),
         },
         (),
     ))
@@ -132,8 +130,8 @@ fn handle_connection(
     let handler_id = supervisor_spawn(state.api_handler_manifest.clone(), None, None)
         .map_err(|e| format!("spawn api-handler failed: {}", e))?;
 
-    // Pass mailbox_id to the handler via init params (as a String).
-    let init_params = Value::Tuple(alloc::vec![Value::String(state.mailbox_id.clone())]);
+    // Pass router_id to the handler via init params (as a String).
+    let init_params = Value::Tuple(alloc::vec![Value::String(state.router_id.clone())]);
     let _ = rpc_call(
         handler_id.clone(),
         String::from("theater:simple/actor.init"),

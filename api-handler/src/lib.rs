@@ -21,7 +21,7 @@ packr_guest::setup_guest!();
 #[derive(Clone, GraphValue)]
 #[graph(crate = "packr_guest::composite_abi")]
 pub struct HandlerState {
-    pub mailbox_id: String,
+    pub router_id: String,
 }
 
 pack_types! {
@@ -41,7 +41,7 @@ pack_types! {
         }
     }
     exports {
-        theater:simple/actor.init: func(state: value, mailbox-id: string) -> result<handler-state, string>,
+        theater:simple/actor.init: func(state: value, router-id: string) -> result<handler-state, string>,
         theater:simple/tcp-client.handle-connection-transfer: func(state: handler-state, connection-id: string) -> result<handler-state, string>,
     }
 }
@@ -68,8 +68,8 @@ fn tcp_close(connection_id: String) -> Result<(), String>;
 fn rpc_call(actor_id: String, function: String, params: Value, options: Value) -> Value;
 
 #[export(name = "theater:simple/actor.init")]
-fn init(_state: Value, mailbox_id: String) -> Result<(HandlerState, ()), String> {
-    Ok((HandlerState { mailbox_id }, ()))
+fn init(_state: Value, router_id: String) -> Result<(HandlerState, ()), String> {
+    Ok((HandlerState { router_id }, ()))
 }
 
 #[export(name = "theater:simple/tcp-client.handle-connection-transfer")]
@@ -79,7 +79,7 @@ fn handle_connection_transfer(
 ) -> Result<(HandlerState, ()), String> {
     let request = tcp_receive(connection_id.clone(), 65536).unwrap_or_default();
 
-    let response = route(&request, &state.mailbox_id);
+    let response = route(&request, &state.router_id);
 
     if let Err(e) = tcp_send(connection_id.clone(), response) {
         log(format!("[inbox-api] send failed: {}", e));
@@ -94,7 +94,7 @@ fn handle_connection_transfer(
 // Routing
 // ============================================================================
 
-fn route(request: &[u8], mailbox_id: &str) -> Vec<u8> {
+fn route(request: &[u8], router_id: &str) -> Vec<u8> {
     let request_str = match core::str::from_utf8(request) {
         Ok(s) => s,
         Err(_) => return http_response(400, "application/json", br#"{"error":"non-utf8 request"}"#.to_vec()),
@@ -109,11 +109,133 @@ fn route(request: &[u8], mailbox_id: &str) -> Vec<u8> {
         None => (path_and_query, ""),
     };
 
-    match (method, path) {
-        ("GET", "/v1/inbox") => handle_inbox(query, mailbox_id),
-        ("POST", "/v1/messages") => handle_post_message(request_str, mailbox_id),
-        ("POST", "/v1/send") => handle_send(request_str, mailbox_id),
-        _ => http_response(404, "application/json", br#"{"error":"not found"}"#.to_vec()),
+    // POST /v1/mailboxes — register a new address.
+    if method == "POST" && path == "/v1/mailboxes" {
+        return handle_register_mailbox(request_str, router_id);
+    }
+
+    // GET /v1/mailboxes — list registered addresses.
+    if method == "GET" && path == "/v1/mailboxes" {
+        return handle_list_mailboxes(router_id);
+    }
+
+    // /v1/mailboxes/<address>/...
+    if let Some(rest) = path.strip_prefix("/v1/mailboxes/") {
+        // Split address from any sub-path.
+        let (address_enc, sub) = match rest.find('/') {
+            Some(i) => (&rest[..i], &rest[i + 1..]),
+            None => (rest, ""),
+        };
+        let address = url_decode(address_enc);
+
+        // Resolve the address → mailbox id via the router.
+        let mailbox_id = match resolve_mailbox(router_id, &address) {
+            Ok(Some(id)) => id,
+            Ok(None) => {
+                return http_response(
+                    404,
+                    "application/json",
+                    format!(r#"{{"error":"unknown address: {}"}}"#, json_escape(&address))
+                        .into_bytes(),
+                );
+            }
+            Err(e) => {
+                return http_response(
+                    500,
+                    "application/json",
+                    format!(r#"{{"error":"router rpc failed: {}"}}"#, json_escape(&e))
+                        .into_bytes(),
+                );
+            }
+        };
+
+        return match (method, sub) {
+            ("GET", "inbox") => handle_inbox(query, &mailbox_id),
+            ("POST", "messages") => handle_post_message(request_str, &mailbox_id),
+            ("POST", "send") => handle_send(request_str, &mailbox_id, &address),
+            _ => http_response(404, "application/json", br#"{"error":"not found"}"#.to_vec()),
+        };
+    }
+
+    http_response(404, "application/json", br#"{"error":"not found"}"#.to_vec())
+}
+
+/// `POST /v1/mailboxes` — register a new address.
+fn handle_register_mailbox(request_str: &str, router_id: &str) -> Vec<u8> {
+    let body = match request_str.find("\r\n\r\n") {
+        Some(i) => &request_str[i + 4..],
+        None => return http_response(400, "application/json", br#"{"error":"missing body"}"#.to_vec()),
+    };
+    let parsed = parse_simple_json_object(body);
+    let address = parsed.iter().find(|(k, _)| k == "address").map(|(_, v)| v.clone()).unwrap_or_default();
+    if address.is_empty() {
+        return http_response(400, "application/json", br#"{"error":"address is required"}"#.to_vec());
+    }
+
+    let result = rpc_call(
+        router_id.to_string(),
+        String::from("theater:inbox/router.register"),
+        Value::Tuple(alloc::vec![Value::String(address.clone())]),
+        Value::Tuple(alloc::vec![]),
+    );
+    let mailbox_id = match unwrap_rpc_result(result) {
+        Some(Value::String(id)) => id,
+        _ => return http_response(500, "application/json", br#"{"error":"router rpc failed"}"#.to_vec()),
+    };
+
+    let body = format!(
+        r#"{{"address":"{}","mailbox_id":"{}"}}"#,
+        json_escape(&address),
+        json_escape(&mailbox_id)
+    );
+    http_response(201, "application/json", body.into_bytes())
+}
+
+/// `GET /v1/mailboxes` — list all registered addresses.
+fn handle_list_mailboxes(router_id: &str) -> Vec<u8> {
+    let result = rpc_call(
+        router_id.to_string(),
+        String::from("theater:inbox/router.list"),
+        Value::Tuple(alloc::vec![]),
+        Value::Tuple(alloc::vec![]),
+    );
+    let bindings = match unwrap_rpc_result(result) {
+        Some(Value::List { items, .. }) => items,
+        _ => return http_response(500, "application/json", br#"{"error":"router rpc failed"}"#.to_vec()),
+    };
+    let parts: Vec<String> = bindings
+        .iter()
+        .map(|b| match b {
+            Value::Record { fields, .. } => {
+                let addr = fields
+                    .iter()
+                    .find(|(k, _)| k == "address")
+                    .and_then(|(_, v)| if let Value::String(s) = v { Some(s.clone()) } else { None })
+                    .unwrap_or_default();
+                format!(r#""{}""#, json_escape(&addr))
+            }
+            _ => String::from(r#""""#),
+        })
+        .collect();
+    let body = format!(r#"{{"mailboxes":[{}]}}"#, parts.join(","));
+    http_response(200, "application/json", body.into_bytes())
+}
+
+/// Look up a mailbox actor ID by address through the router.
+fn resolve_mailbox(router_id: &str, address: &str) -> Result<Option<String>, String> {
+    let result = rpc_call(
+        router_id.to_string(),
+        String::from("theater:inbox/router.lookup"),
+        Value::Tuple(alloc::vec![Value::String(address.to_string())]),
+        Value::Tuple(alloc::vec![]),
+    );
+    match unwrap_rpc_result(result) {
+        Some(Value::Option { value: Some(inner), .. }) => match *inner {
+            Value::String(id) => Ok(Some(id)),
+            _ => Err(String::from("unexpected router response shape")),
+        },
+        Some(Value::Option { value: None, .. }) => Ok(None),
+        _ => Err(String::from("router rpc failed")),
     }
 }
 
@@ -177,14 +299,11 @@ fn handle_post_message(request_str: &str, mailbox_id: &str) -> Vec<u8> {
     http_response(201, "application/json", json.into_bytes())
 }
 
-/// `POST /v1/send` — deliver a message via SMTP and record it in the mailbox.
-///
-/// Body: `{"from":"...", "to":"...", "subject":"...", "body":"..."}`
-/// Optional: `"smtp_server":"localhost:1025"` to override the SMTP target
-/// (default: derived from the recipient domain — for now we assume
-/// `localhost:1025` when no override is given, since we don't do MX lookups
-/// yet).
-fn handle_send(request_str: &str, mailbox_id: &str) -> Vec<u8> {
+/// `POST /v1/mailboxes/<addr>/send` — deliver a message via SMTP and
+/// record it in the sender's mailbox. The sender (`from`) is the address
+/// in the URL path; the body provides `to`, `subject`, `body`, and an
+/// optional `smtp_server` override.
+fn handle_send(request_str: &str, mailbox_id: &str, from: &str) -> Vec<u8> {
     let body = match request_str.find("\r\n\r\n") {
         Some(i) => &request_str[i + 4..],
         None => return http_response(400, "application/json", br#"{"error":"missing body"}"#.to_vec()),
@@ -192,7 +311,6 @@ fn handle_send(request_str: &str, mailbox_id: &str) -> Vec<u8> {
 
     let parsed = parse_simple_json_object(body);
     let get = |k: &str| parsed.iter().find(|(kk, _)| kk == k).map(|(_, v)| v.clone()).unwrap_or_default();
-    let from = get("from");
     let to = get("to");
     let subject = get("subject");
     let msg_body = get("body");
@@ -200,9 +318,10 @@ fn handle_send(request_str: &str, mailbox_id: &str) -> Vec<u8> {
         let s = get("smtp_server");
         if s.is_empty() { String::from("localhost:1025") } else { s }
     };
+    let from = from.to_string();
 
-    if from.is_empty() || to.is_empty() {
-        return http_response(400, "application/json", br#"{"error":"from and to are required"}"#.to_vec());
+    if to.is_empty() {
+        return http_response(400, "application/json", br#"{"error":"to is required"}"#.to_vec());
     }
 
     if let Err(e) = smtp_deliver(&smtp_server, &from, &to, &subject, &msg_body) {
@@ -438,6 +557,38 @@ fn message_to_json(msg: &Value) -> String {
         r#"{{"id":{},"from":"{}","to":"{}","subject":"{}","body":"{}","received_at":{}}}"#,
         id, json_escape(&from), json_escape(&to), json_escape(&subject), json_escape(&body), received_at
     )
+}
+
+/// Minimal URL percent-decoder. Plus signs become spaces (`form-urlencoded`
+/// convention), `%XX` decodes one hex byte. Sufficient for our query params
+/// and path segments — we do not need full RFC 3986 fidelity.
+fn url_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b'%' if i + 2 < bytes.len() => {
+                let hex = core::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or("");
+                if let Ok(byte) = u8::from_str_radix(hex, 16) {
+                    out.push(byte);
+                    i += 3;
+                } else {
+                    out.push(bytes[i]);
+                    i += 1;
+                }
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8(out).unwrap_or_else(|_| s.to_string())
 }
 
 fn json_escape(s: &str) -> String {

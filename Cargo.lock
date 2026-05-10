@@ -117,6 +117,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "inbox-mailbox-router"
+version = "0.1.0"
+dependencies = [
+ "packr-guest",
+]
+
+[[package]]
 name = "inbox-smtp-acceptor"
 version = "0.1.0"
 dependencies = [

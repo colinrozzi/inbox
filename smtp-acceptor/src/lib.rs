@@ -16,7 +16,7 @@ packr_guest::setup_guest!();
 #[graph(crate = "packr_guest::composite_abi")]
 pub struct SmtpAcceptorState {
     pub listener_id: String,
-    pub mailbox_id: String,
+    pub router_id: String,
     pub smtp_handler_manifest: String,
 }
 
@@ -37,7 +37,7 @@ pack_types! {
         }
     }
     exports {
-        theater:simple/actor.init: func(state: value, mailbox-id: string) -> result<smtp-acceptor-state, string>,
+        theater:simple/actor.init: func(state: value, router-id: string) -> result<smtp-acceptor-state, string>,
         theater:simple/tcp-client.handle-connection: func(state: smtp-acceptor-state, connection-id: string) -> result<smtp-acceptor-state, string>,
     }
 }
@@ -65,8 +65,8 @@ const LISTEN_ADDR: &str = "0.0.0.0:1025";
 const SMTP_HANDLER_MANIFEST: &str = "/home/colin/work/actors/inbox/smtp-handler/manifest.toml";
 
 #[export(name = "theater:simple/actor.init")]
-fn init(_state: Value, mailbox_id: String) -> Result<(SmtpAcceptorState, ()), String> {
-    log(format!("[inbox-smtp-acceptor] init (mailbox={})", mailbox_id));
+fn init(_state: Value, router_id: String) -> Result<(SmtpAcceptorState, ()), String> {
+    log(format!("[inbox-smtp-acceptor] init (router={})", router_id));
 
     let listener_id = tcp_listen(String::from(LISTEN_ADDR))
         .map_err(|e| format!("listen failed: {}", e))?;
@@ -78,7 +78,7 @@ fn init(_state: Value, mailbox_id: String) -> Result<(SmtpAcceptorState, ()), St
     Ok((
         SmtpAcceptorState {
             listener_id,
-            mailbox_id,
+            router_id,
             smtp_handler_manifest: String::from(SMTP_HANDLER_MANIFEST),
         },
         (),
@@ -93,8 +93,8 @@ fn handle_connection(
     let handler_id = supervisor_spawn(state.smtp_handler_manifest.clone(), None, None)
         .map_err(|e| format!("spawn smtp-handler failed: {}", e))?;
 
-    // Pass mailbox_id to the handler via init params.
-    let init_params = Value::Tuple(alloc::vec![Value::String(state.mailbox_id.clone())]);
+    // Pass router_id to the handler via init params.
+    let init_params = Value::Tuple(alloc::vec![Value::String(state.router_id.clone())]);
     let _ = rpc_call(
         handler_id.clone(),
         String::from("theater:simple/actor.init"),
