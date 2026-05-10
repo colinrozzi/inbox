@@ -53,7 +53,7 @@
         theaterBin = theater.packages.${system}.default;
 
       in {
-        # nix build — produces all three .wasm artifacts in $out
+        # nix build — produces all six .wasm artifacts in $out
         packages.default = craneLib.buildPackage (commonArgs // {
           inherit cargoArtifacts;
           installPhaseCommand = ''
@@ -61,10 +61,14 @@
             cp target/wasm32-unknown-unknown/release/inbox_acceptor.wasm $out/
             cp target/wasm32-unknown-unknown/release/inbox_api_handler.wasm $out/
             cp target/wasm32-unknown-unknown/release/inbox_mailbox.wasm $out/
+            cp target/wasm32-unknown-unknown/release/inbox_mailbox_router.wasm $out/
             cp target/wasm32-unknown-unknown/release/inbox_smtp_acceptor.wasm $out/
             cp target/wasm32-unknown-unknown/release/inbox_smtp_handler.wasm $out/
           '';
         });
+
+        # nix build .#theater — exposes the pinned theater binary used at runtime
+        packages.theater = theaterBin;
 
         packages.clippy = craneLib.cargoClippy (commonArgs // {
           inherit cargoArtifacts;
