@@ -20,6 +20,9 @@ pub struct AcceptorState {
     pub listener_id: String,
     pub router_id: String,
     pub api_handler_manifest: String,
+    /// PEM-encoded RSA private key used by api-handler children to DKIM-sign
+    /// outbound mail. Comes from the acceptor manifest's `initial_state`.
+    pub dkim_private_key_pem: String,
 }
 
 pack_types! {
@@ -70,8 +73,18 @@ const ROUTER_MANIFEST: &str = "/home/colin/work/actors/inbox/mailbox-router/mani
 const SMTP_ACCEPTOR_MANIFEST: &str = "/home/colin/work/actors/inbox/smtp-acceptor/manifest.toml";
 
 #[export(name = "theater:simple/actor.init")]
-fn init(_state: Value) -> Result<(AcceptorState, ()), String> {
+fn init(state: Value) -> Result<(AcceptorState, ()), String> {
     log(String::from("[inbox-acceptor] init"));
+
+    // initial_state in the manifest carries the DKIM private key (PEM).
+    let dkim_private_key_pem = match state {
+        Value::String(s) if !s.is_empty() => s,
+        _ => {
+            return Err(String::from(
+                "acceptor needs initial_state = \"<DKIM private key PEM>\" in manifest",
+            ))
+        }
+    };
 
     // Spawn the mailbox-router. It owns the address → mailbox-actor mapping
     // and spawns mailbox actors on demand.
@@ -117,6 +130,7 @@ fn init(_state: Value) -> Result<(AcceptorState, ()), String> {
             listener_id,
             router_id,
             api_handler_manifest: String::from(API_HANDLER_MANIFEST),
+            dkim_private_key_pem,
         },
         (),
     ))
@@ -130,8 +144,11 @@ fn handle_connection(
     let handler_id = supervisor_spawn(state.api_handler_manifest.clone(), None, None)
         .map_err(|e| format!("spawn api-handler failed: {}", e))?;
 
-    // Pass router_id to the handler via init params (as a String).
-    let init_params = Value::Tuple(alloc::vec![Value::String(state.router_id.clone())]);
+    // Pass router_id and DKIM key to the handler via init params.
+    let init_params = Value::Tuple(alloc::vec![
+        Value::String(state.router_id.clone()),
+        Value::String(state.dkim_private_key_pem.clone()),
+    ]);
     let _ = rpc_call(
         handler_id.clone(),
         String::from("theater:simple/actor.init"),

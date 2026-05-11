@@ -21,10 +21,21 @@ use packr_guest::{export, import, pack_types, GraphValue, Value};
 
 packr_guest::setup_guest!();
 
+// The rsa crate pulls in getrandom transitively even though our PKCS#1 v1.5
+// signing path is deterministic. Wire a custom backend that errors — it's
+// never actually called along the sign() codepath.
+getrandom::register_custom_getrandom!(unsupported_getrandom);
+fn unsupported_getrandom(_dest: &mut [u8]) -> Result<(), getrandom::Error> {
+    Err(getrandom::Error::UNSUPPORTED)
+}
+
+mod dkim;
+
 #[derive(Clone, GraphValue)]
 #[graph(crate = "packr_guest::composite_abi")]
 pub struct HandlerState {
     pub router_id: String,
+    pub dkim_private_key_pem: String,
 }
 
 pack_types! {
@@ -44,7 +55,7 @@ pack_types! {
         }
     }
     exports {
-        theater:simple/actor.init: func(state: value, router-id: string) -> result<handler-state, string>,
+        theater:simple/actor.init: func(state: value, router-id: string, dkim-private-key-pem: string) -> result<handler-state, string>,
         theater:simple/tcp-client.handle-connection-transfer: func(state: handler-state, connection-id: string) -> result<handler-state, string>,
     }
 }
@@ -71,8 +82,18 @@ fn tcp_close(connection_id: String) -> Result<(), String>;
 fn rpc_call(actor_id: String, function: String, params: Value, options: Value) -> Value;
 
 #[export(name = "theater:simple/actor.init")]
-fn init(_state: Value, router_id: String) -> Result<(HandlerState, ()), String> {
-    Ok((HandlerState { router_id }, ()))
+fn init(
+    _state: Value,
+    router_id: String,
+    dkim_private_key_pem: String,
+) -> Result<(HandlerState, ()), String> {
+    Ok((
+        HandlerState {
+            router_id,
+            dkim_private_key_pem,
+        },
+        (),
+    ))
 }
 
 #[export(name = "theater:simple/tcp-client.handle-connection-transfer")]
@@ -82,7 +103,7 @@ fn handle_connection_transfer(
 ) -> Result<(HandlerState, ()), String> {
     let request = tcp_receive(connection_id.clone(), 65536).unwrap_or_default();
 
-    let response = route(&request, &state.router_id);
+    let response = route(&request, &state.router_id, &state.dkim_private_key_pem);
 
     if let Err(e) = tcp_send(connection_id.clone(), response) {
         log(format!("[inbox-api] send failed: {}", e));
@@ -97,7 +118,7 @@ fn handle_connection_transfer(
 // Routing
 // ============================================================================
 
-fn route(request: &[u8], router_id: &str) -> Vec<u8> {
+fn route(request: &[u8], router_id: &str, dkim_private_key_pem: &str) -> Vec<u8> {
     let request_str = match core::str::from_utf8(request) {
         Ok(s) => s,
         Err(_) => return http_response(400, "application/json", br#"{"error":"non-utf8 request"}"#.to_vec()),
@@ -163,7 +184,7 @@ fn route(request: &[u8], router_id: &str) -> Vec<u8> {
             }
             ("GET", "inbox") => handle_inbox(query, &mailbox_id),
             ("POST", "messages") => handle_post_message(request_str, &mailbox_id),
-            ("POST", "send") => handle_send(request_str, &address),
+            ("POST", "send") => handle_send(request_str, &address, dkim_private_key_pem),
             _ => http_response(404, "application/json", br#"{"error":"not found"}"#.to_vec()),
         };
     }
@@ -318,7 +339,7 @@ fn handle_post_message(request_str: &str, mailbox_id: &str) -> Vec<u8> {
 /// message in their own mailbox they should Bcc themselves, which goes
 /// through the same SMTP code path as any external recipient — including
 /// loopback when the address is on this server's domain.
-fn handle_send(request_str: &str, from: &str) -> Vec<u8> {
+fn handle_send(request_str: &str, from: &str, dkim_private_key_pem: &str) -> Vec<u8> {
     let body = match request_str.find("\r\n\r\n") {
         Some(i) => &request_str[i + 4..],
         None => return http_response(400, "application/json", br#"{"error":"missing body"}"#.to_vec()),
@@ -338,7 +359,7 @@ fn handle_send(request_str: &str, from: &str) -> Vec<u8> {
         return http_response(400, "application/json", br#"{"error":"to is required"}"#.to_vec());
     }
 
-    if let Err(e) = smtp_deliver(&smtp_server, from, &to, &subject, &msg_body) {
+    if let Err(e) = smtp_deliver(&smtp_server, from, &to, &subject, &msg_body, dkim_private_key_pem) {
         log(format!("[inbox-api] smtp deliver failed: {}", e));
         let body = format!(r#"{{"error":"smtp deliver failed: {}"}}"#, json_escape(&e));
         return http_response(502, "application/json", body.into_bytes());
@@ -358,6 +379,7 @@ fn smtp_deliver(
     to: &str,
     subject: &str,
     body: &str,
+    dkim_private_key_pem: &str,
 ) -> Result<(), String> {
     let conn = tcp_connect(server_addr.to_string())
         .map_err(|e| format!("connect to {} failed: {}", server_addr, e))?;
@@ -368,7 +390,7 @@ fn smtp_deliver(
         e
     })?;
 
-    let result = smtp_session(&conn, from, to, subject, body);
+    let result = smtp_session(&conn, from, to, subject, body, dkim_private_key_pem);
     let _ = tcp_close(conn);
     result
 }
@@ -379,28 +401,55 @@ fn smtp_session(
     to: &str,
     subject: &str,
     body: &str,
+    dkim_private_key_pem: &str,
 ) -> Result<(), String> {
     smtp_command(conn, "EHLO inbox.local\r\n", 250)?;
     smtp_command(conn, &format!("MAIL FROM:<{}>\r\n", from), 250)?;
     smtp_command(conn, &format!("RCPT TO:<{}>\r\n", to), 250)?;
     smtp_command(conn, "DATA\r\n", 354)?;
 
-    // Headers + body, terminated by lone "." line.
+    // Build the headers (without DKIM-Signature yet) + body. DKIM signs the
+    // resulting RFC822 message; the signature header gets prepended.
+    let mut headers = String::new();
+    headers.push_str(&format!("From: {}\r\n", from));
+    headers.push_str(&format!("To: {}\r\n", to));
+    headers.push_str(&format!("Subject: {}\r\n", subject));
+    headers.push_str("MIME-Version: 1.0\r\n");
+    headers.push_str("Content-Type: text/plain; charset=utf-8\r\n");
+
+    // Normalize body to CRLF line endings — DKIM canonicalization assumes that.
+    let mut body_crlf = String::new();
+    for line in body.split('\n') {
+        body_crlf.push_str(line.trim_end_matches('\r'));
+        body_crlf.push_str("\r\n");
+    }
+
+    let dkim_signature = dkim::sign_message(
+        dkim_private_key_pem,
+        dkim::SELECTOR,
+        dkim::DOMAIN,
+        &["from", "to", "subject"],
+        &headers,
+        body_crlf.as_bytes(),
+    )?;
+
     let mut data = String::new();
-    data.push_str(&format!("From: {}\r\n", from));
-    data.push_str(&format!("To: {}\r\n", to));
-    data.push_str(&format!("Subject: {}\r\n", subject));
-    data.push_str("MIME-Version: 1.0\r\n");
-    data.push_str("Content-Type: text/plain; charset=utf-8\r\n");
+    data.push_str(&dkim_signature);
+    data.push_str(&headers);
     data.push_str("\r\n");
     // Dot-stuff: any line starting with "." gets prefixed with another ".".
-    for line in body.split('\n') {
-        let line = line.trim_end_matches('\r');
+    for line in body_crlf.split("\r\n") {
         if line.starts_with('.') {
             data.push('.');
         }
         data.push_str(line);
         data.push_str("\r\n");
+    }
+    // body_crlf ends with "\r\n" so the loop above already emits a trailing
+    // blank line; one more for the "." terminator below.
+    // Trim the duplicated trailing CRLF that the empty split-produced item caused:
+    if data.ends_with("\r\n\r\n\r\n") {
+        data.truncate(data.len() - 2);
     }
     data.push_str(".\r\n");
 
