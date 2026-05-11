@@ -163,7 +163,7 @@ fn route(request: &[u8], router_id: &str) -> Vec<u8> {
             }
             ("GET", "inbox") => handle_inbox(query, &mailbox_id),
             ("POST", "messages") => handle_post_message(request_str, &mailbox_id),
-            ("POST", "send") => handle_send(request_str, &mailbox_id, &address),
+            ("POST", "send") => handle_send(request_str, &address),
             _ => http_response(404, "application/json", br#"{"error":"not found"}"#.to_vec()),
         };
     }
@@ -310,11 +310,15 @@ fn handle_post_message(request_str: &str, mailbox_id: &str) -> Vec<u8> {
     http_response(201, "application/json", json.into_bytes())
 }
 
-/// `POST /v1/mailboxes/<addr>/send` — deliver a message via SMTP and
-/// record it in the sender's mailbox. The sender (`from`) is the address
-/// in the URL path; the body provides `to`, `subject`, `body`, and an
-/// optional `smtp_server` override.
-fn handle_send(request_str: &str, mailbox_id: &str, from: &str) -> Vec<u8> {
+/// `POST /v1/mailboxes/<addr>/send` — deliver a message via SMTP. The
+/// sender (`from`) is the address in the URL path; the body provides
+/// `to`, `subject`, `body`, and an optional `smtp_server` override.
+///
+/// Sender-copy is *not* implicitly recorded. If the sender wants the
+/// message in their own mailbox they should Bcc themselves, which goes
+/// through the same SMTP code path as any external recipient — including
+/// loopback when the address is on this server's domain.
+fn handle_send(request_str: &str, from: &str) -> Vec<u8> {
     let body = match request_str.find("\r\n\r\n") {
         Some(i) => &request_str[i + 4..],
         None => return http_response(400, "application/json", br#"{"error":"missing body"}"#.to_vec()),
@@ -327,32 +331,18 @@ fn handle_send(request_str: &str, mailbox_id: &str, from: &str) -> Vec<u8> {
     let msg_body = get("body");
     let smtp_server = {
         let s = get("smtp_server");
-        if s.is_empty() { String::from("localhost:1025") } else { s }
+        if s.is_empty() { String::from("localhost:25") } else { s }
     };
-    let from = from.to_string();
 
     if to.is_empty() {
         return http_response(400, "application/json", br#"{"error":"to is required"}"#.to_vec());
     }
 
-    if let Err(e) = smtp_deliver(&smtp_server, &from, &to, &subject, &msg_body) {
+    if let Err(e) = smtp_deliver(&smtp_server, from, &to, &subject, &msg_body) {
         log(format!("[inbox-api] smtp deliver failed: {}", e));
         let body = format!(r#"{{"error":"smtp deliver failed: {}"}}"#, json_escape(&e));
         return http_response(502, "application/json", body.into_bytes());
     }
-
-    // Record the sent message in our own mailbox so the sender has a copy.
-    let _ = rpc_call(
-        mailbox_id.to_string(),
-        String::from("theater:inbox/mailbox.put-message"),
-        Value::Tuple(alloc::vec![
-            Value::String(from),
-            Value::String(to),
-            Value::String(subject),
-            Value::String(msg_body),
-        ]),
-        Value::Tuple(alloc::vec![]),
-    );
 
     http_response(200, "application/json", br#"{"status":"sent"}"#.to_vec())
 }

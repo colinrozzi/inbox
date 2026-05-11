@@ -61,7 +61,7 @@ fn supervisor_spawn(
 #[import(module = "theater:simple/rpc", name = "call")]
 fn rpc_call(actor_id: String, function: String, params: Value, options: Value) -> Value;
 
-const LISTEN_ADDR: &str = "0.0.0.0:1025";
+const LISTEN_ADDR: &str = "0.0.0.0:25";
 const SMTP_HANDLER_MANIFEST: &str = "/home/colin/work/actors/inbox/smtp-handler/manifest.toml";
 
 #[export(name = "theater:simple/actor.init")]

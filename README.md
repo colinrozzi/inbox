@@ -14,8 +14,12 @@ GET  /v1/mailboxes                          → list registered addresses
 GET  /v1/mailboxes/<addr>/inbox?since=<n>   → list messages with id ≥ n
 POST /v1/mailboxes/<addr>/messages          → direct insert (testing/admin)
                                               body: {"from","to","subject","body"}
-POST /v1/mailboxes/<addr>/send              → SMTP-deliver from <addr>; records
-                                              a sender-copy in <addr>'s inbox.
+POST /v1/mailboxes/<addr>/send              → SMTP-deliver from <addr>. No
+                                              sender-copy is recorded; Bcc
+                                              yourself if you want one (it
+                                              travels the same SMTP path,
+                                              looping back when the address
+                                              is on this server's domain).
                                               body: {"to","subject","body",
                                                      "smtp_server":"..."  // optional}
 ```
@@ -26,9 +30,9 @@ The cursor design assumes agents poll: agents remember the `next_cursor` from th
 
 ## SMTP
 
-Inbound SMTP listens on `:1025` (smtp-acceptor + smtp-handler). External senders deliver mail via standard SMTP; messages land in the same mailbox the API serves.
+Inbound SMTP listens on `:25` (smtp-acceptor + smtp-handler). External senders deliver mail via standard SMTP; messages land in the same mailbox the API serves.
 
-Outbound SMTP is done synchronously from the api-handler via the `theater:simple/tcp` handler — it connects to whatever address the request specifies (default `localhost:1025`). Real-world deployments would use a relay like Postmark/SES instead of direct delivery.
+Outbound SMTP is done synchronously from the api-handler via the `theater:simple/tcp` handler — it connects to whatever address the request specifies (default `localhost:25`). Real-world deployments would use a relay like Postmark/SES instead of direct delivery.
 
 
 ## Architecture
