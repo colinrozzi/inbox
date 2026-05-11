@@ -8,3 +8,4 @@ crate-type = ["cdylib"]
 
 [dependencies]
 packr-guest = { version = "0.5.5", features = ["derive"] }
+base64 = { version = "0.22", default-features = false, features = ["alloc"] }

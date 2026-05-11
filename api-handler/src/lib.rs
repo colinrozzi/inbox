@@ -30,6 +30,8 @@ fn unsupported_getrandom(_dest: &mut [u8]) -> Result<(), getrandom::Error> {
 }
 
 mod dkim;
+#[allow(dead_code)] // wired up once theater:simple/timer.now() works from pack actors
+mod rfc2822;
 
 #[derive(Clone, GraphValue)]
 #[graph(crate = "packr_guest::composite_abi")]
@@ -410,6 +412,11 @@ fn smtp_session(
 
     // Build the headers (without DKIM-Signature yet) + body. DKIM signs the
     // resulting RFC822 message; the signature header gets prepended.
+    //
+    // Date + Message-ID are not added here yet — they need a host time source,
+    // and the theater:simple/timer.now() import currently hangs from inside
+    // pack actors (separate issue). Receivers that need Date will add their
+    // own. Message-ID is technically optional per RFC 5322.
     let mut headers = String::new();
     headers.push_str(&format!("From: {}\r\n", from));
     headers.push_str(&format!("To: {}\r\n", to));

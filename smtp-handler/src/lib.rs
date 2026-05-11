@@ -268,33 +268,198 @@ fn read_data_block(conn: &str) -> Result<String, String> {
     }
 }
 
-/// Pull `Subject:` out and return (subject, body). Body starts after the
-/// blank line that ends the header section.
+/// Parse the RFC 822 message: pull out `Subject`, find the content-type, and
+/// extract a clean body. For `multipart/*` messages the first `text/plain`
+/// part wins; for plain messages the whole post-header section is the body.
+/// Handles `quoted-printable` and `base64` Content-Transfer-Encoding.
 fn parse_headers_and_body(raw: &str) -> (String, String) {
-    let mut subject = String::new();
     let mut header_end = 0usize;
-    let mut in_headers = true;
+    let mut subject = String::new();
+    let mut content_type = String::new();
+    let mut content_encoding = String::new();
+    let mut last_header_name: Option<String> = None;
+
     for line in raw.split_inclusive('\n') {
-        if in_headers {
-            let stripped = line.trim_end();
-            if stripped.is_empty() {
-                in_headers = false;
-                header_end += line.len();
-                continue;
-            }
-            if let Some(rest) = stripped.strip_prefix("Subject:")
-                .or_else(|| stripped.strip_prefix("subject:"))
-                .or_else(|| stripped.strip_prefix("SUBJECT:"))
-            {
-                subject = rest.trim().to_string();
-            }
+        let stripped = line.trim_end_matches(|c| c == '\n' || c == '\r');
+        if stripped.is_empty() {
             header_end += line.len();
-        } else {
             break;
         }
+        // Header folding: a continuation line starts with WSP and belongs to
+        // the previous header's value.
+        if (line.starts_with(' ') || line.starts_with('\t')) && last_header_name.is_some() {
+            match last_header_name.as_deref() {
+                Some(n) if n.eq_ignore_ascii_case("subject") => {
+                    subject.push(' ');
+                    subject.push_str(stripped.trim());
+                }
+                Some(n) if n.eq_ignore_ascii_case("content-type") => {
+                    content_type.push(' ');
+                    content_type.push_str(stripped.trim());
+                }
+                Some(n) if n.eq_ignore_ascii_case("content-transfer-encoding") => {
+                    content_encoding.push(' ');
+                    content_encoding.push_str(stripped.trim());
+                }
+                _ => {}
+            }
+            header_end += line.len();
+            continue;
+        }
+        if let Some(colon) = stripped.find(':') {
+            let name = stripped[..colon].trim().to_string();
+            let value = stripped[colon + 1..].trim().to_string();
+            if name.eq_ignore_ascii_case("subject") {
+                subject = value;
+            } else if name.eq_ignore_ascii_case("content-type") {
+                content_type = value;
+            } else if name.eq_ignore_ascii_case("content-transfer-encoding") {
+                content_encoding = value;
+            }
+            last_header_name = Some(name);
+        }
+        header_end += line.len();
     }
-    let body = raw.get(header_end..).unwrap_or("").trim_end().to_string();
+
+    let body_raw = raw.get(header_end..).unwrap_or("");
+    let body = if let Some(boundary) = multipart_boundary(&content_type) {
+        extract_text_plain(body_raw, &boundary).unwrap_or_else(|| body_raw.trim_end().to_string())
+    } else {
+        decode_transfer_encoding(body_raw, &content_encoding)
+            .trim_end()
+            .to_string()
+    };
     (subject, body)
+}
+
+/// If `Content-Type: multipart/...; boundary=...`, return the boundary value.
+fn multipart_boundary(content_type: &str) -> Option<String> {
+    let lower = content_type.to_lowercase();
+    if !lower.starts_with("multipart/") {
+        return None;
+    }
+    // Find boundary= (case-insensitive). Value may be quoted.
+    let needle = "boundary=";
+    let idx = lower.find(needle)?;
+    let rest = &content_type[idx + needle.len()..];
+    let value = if let Some(stripped) = rest.strip_prefix('"') {
+        let end = stripped.find('"')?;
+        stripped[..end].to_string()
+    } else {
+        rest.split(|c: char| c == ';' || c.is_whitespace())
+            .next()
+            .unwrap_or("")
+            .to_string()
+    };
+    if value.is_empty() {
+        None
+    } else {
+        Some(value)
+    }
+}
+
+/// Walk parts separated by `--boundary` and return the first `text/plain`
+/// part's decoded body.
+fn extract_text_plain(body_raw: &str, boundary: &str) -> Option<String> {
+    let delim = format!("--{}", boundary);
+    let parts: Vec<&str> = body_raw.split(delim.as_str()).collect();
+    // First chunk is the preamble (before the first boundary); skip it.
+    // Last chunk is the epilogue (after `--boundary--`); skip it.
+    for part in parts.iter().skip(1) {
+        let part = part.trim_start_matches('\r').trim_start_matches('\n');
+        if part.starts_with("--") {
+            continue; // closing boundary
+        }
+        // Each part has its own headers + blank line + body.
+        let blank = part.find("\r\n\r\n").or_else(|| part.find("\n\n"));
+        if let Some(b) = blank {
+            let part_headers = &part[..b];
+            let sep_len = if part[b..].starts_with("\r\n\r\n") { 4 } else { 2 };
+            let part_body = &part[b + sep_len..];
+
+            let mut ct = String::new();
+            let mut cte = String::new();
+            for line in part_headers.split('\n') {
+                let stripped = line.trim_end_matches(|c| c == '\r' || c == '\n');
+                if let Some(colon) = stripped.find(':') {
+                    let name = stripped[..colon].trim();
+                    let value = stripped[colon + 1..].trim();
+                    if name.eq_ignore_ascii_case("content-type") {
+                        ct = value.to_string();
+                    } else if name.eq_ignore_ascii_case("content-transfer-encoding") {
+                        cte = value.to_string();
+                    }
+                }
+            }
+
+            if ct.to_lowercase().starts_with("text/plain") {
+                return Some(decode_transfer_encoding(part_body, &cte).trim_end().to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Decode a body fragment by its Content-Transfer-Encoding.
+fn decode_transfer_encoding(body: &str, encoding: &str) -> String {
+    match encoding.trim().to_lowercase().as_str() {
+        "" | "7bit" | "8bit" | "binary" => body.to_string(),
+        "quoted-printable" => decode_quoted_printable(body),
+        "base64" => decode_base64_text(body),
+        _ => body.to_string(),
+    }
+}
+
+/// Decode `=XX` hex escapes and soft line breaks (`=\r\n` or `=\n`).
+fn decode_quoted_printable(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'=' {
+            // Soft break.
+            if i + 1 < bytes.len() && bytes[i + 1] == b'\n' {
+                i += 2;
+                continue;
+            }
+            if i + 2 < bytes.len() && bytes[i + 1] == b'\r' && bytes[i + 2] == b'\n' {
+                i += 3;
+                continue;
+            }
+            // =XX hex.
+            if i + 2 < bytes.len() {
+                let hi = hex_nibble(bytes[i + 1]);
+                let lo = hex_nibble(bytes[i + 2]);
+                if let (Some(h), Some(l)) = (hi, lo) {
+                    out.push(h * 16 + l);
+                    i += 3;
+                    continue;
+                }
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8(out).unwrap_or_default()
+}
+
+fn hex_nibble(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// Decode a base64 body (stripping CR/LF/WS first).
+fn decode_base64_text(input: &str) -> String {
+    use base64::engine::{general_purpose::STANDARD as B64, Engine as _};
+    let cleaned: String = input.chars().filter(|c| !c.is_whitespace()).collect();
+    match B64.decode(cleaned.as_bytes()) {
+        Ok(bytes) => String::from_utf8(bytes).unwrap_or_default(),
+        Err(_) => input.to_string(),
+    }
 }
 
 // ============================================================================
