@@ -81,23 +81,37 @@ const SMTP_ACCEPTOR_MANIFEST: &str = "/home/colin/work/actors/inbox/smtp-accepto
 
 const STORE_ID: &str = "inbox";
 const DKIM_KEY_LABEL: &str = "dkim-key";
+const BEARER_TOKEN_LABEL: &str = "api-bearer-token";
 
 #[export(name = "theater:simple/actor.init")]
 fn init(state: Value) -> Result<(AcceptorState, ()), String> {
     log(String::from("[inbox-acceptor] init"));
 
-    // initial_state in the manifest carries the DKIM private key (PEM).
-    // We write it into the shared store under label `dkim-key` so api-handler
-    // children can read it on their own init without us shipping the whole
-    // PEM through every spawn's RPC params.
-    let dkim_private_key_pem = match state {
+    // initial_state format: first line is the API bearer token, the rest is
+    // the DKIM private key (PEM). Both go into the shared store under
+    // stable labels so api-handler children can fetch them on demand.
+    let raw = match state {
         Value::String(s) if !s.is_empty() => s,
         _ => {
             return Err(String::from(
-                "acceptor needs initial_state = \"<DKIM private key PEM>\" in manifest",
+                "acceptor needs initial_state = \"<bearer-token>\\n<DKIM PEM>\" in manifest",
             ))
         }
     };
+    let (bearer_token, dkim_private_key_pem) = match raw.split_once('\n') {
+        Some((t, rest)) if !t.is_empty() => (t.to_string(), rest.to_string()),
+        _ => {
+            return Err(String::from(
+                "initial_state must be: <bearer-token>\\n<DKIM PEM>",
+            ))
+        }
+    };
+    store_store_at_label(
+        String::from(STORE_ID),
+        String::from(BEARER_TOKEN_LABEL),
+        bearer_token.into_bytes(),
+    )
+    .map_err(|e| format!("persist bearer token failed: {}", e))?;
     store_store_at_label(
         String::from(STORE_ID),
         String::from(DKIM_KEY_LABEL),

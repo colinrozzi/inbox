@@ -161,6 +161,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "inbox-cli"
+version = "0.1.0"
+dependencies = [
+ "packr-guest",
+]
+
+[[package]]
 name = "inbox-mailbox"
 version = "0.1.0"
 dependencies = [

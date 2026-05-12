@@ -1,0 +1,12 @@
+name = "inbox-cli"
+version = "0.1.0"
+package = "/home/colin/work/actors/inbox/target/wasm32-unknown-unknown/release/inbox_cli.wasm"
+
+[[handler]]
+type = "runtime"
+
+[[handler]]
+type = "tcp"
+
+[[handler]]
+type = "terminal"

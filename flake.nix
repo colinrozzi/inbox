@@ -60,6 +60,7 @@
             mkdir -p $out
             cp target/wasm32-unknown-unknown/release/inbox_acceptor.wasm $out/
             cp target/wasm32-unknown-unknown/release/inbox_api_handler.wasm $out/
+            cp target/wasm32-unknown-unknown/release/inbox_cli.wasm $out/
             cp target/wasm32-unknown-unknown/release/inbox_mailbox.wasm $out/
             cp target/wasm32-unknown-unknown/release/inbox_mailbox_router.wasm $out/
             cp target/wasm32-unknown-unknown/release/inbox_smtp_acceptor.wasm $out/

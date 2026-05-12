@@ -38,6 +38,7 @@ mod rfc2822;
 pub struct HandlerState {
     pub router_id: String,
     pub dkim_private_key_pem: String,
+    pub bearer_token: String,
 }
 
 pack_types! {
@@ -95,23 +96,26 @@ fn store_get_by_label(store_id: String, label: String) -> Result<Option<String>,
 
 const STORE_ID: &str = "inbox";
 const DKIM_KEY_LABEL: &str = "dkim-key";
+const BEARER_TOKEN_LABEL: &str = "api-bearer-token";
 
-fn load_dkim_key() -> Result<String, String> {
-    let content_ref = store_get_by_label(String::from(STORE_ID), String::from(DKIM_KEY_LABEL))
-        .map_err(|e| format!("dkim-key lookup failed: {}", e))?
-        .ok_or_else(|| String::from("dkim-key label not set (acceptor should have written it)"))?;
+fn load_label_as_string(label: &str) -> Result<String, String> {
+    let content_ref = store_get_by_label(String::from(STORE_ID), String::from(label))
+        .map_err(|e| format!("{} lookup failed: {}", label, e))?
+        .ok_or_else(|| format!("{} label not set (acceptor should have written it)", label))?;
     let bytes = store_get(String::from(STORE_ID), content_ref)
-        .map_err(|e| format!("dkim-key get failed: {}", e))?;
-    String::from_utf8(bytes).map_err(|_| String::from("dkim-key is not valid UTF-8"))
+        .map_err(|e| format!("{} get failed: {}", label, e))?;
+    String::from_utf8(bytes).map_err(|_| format!("{} is not valid UTF-8", label))
 }
 
 #[export(name = "theater:simple/actor.init")]
 fn init(_state: Value, router_id: String) -> Result<(HandlerState, ()), String> {
-    let dkim_private_key_pem = load_dkim_key()?;
+    let dkim_private_key_pem = load_label_as_string(DKIM_KEY_LABEL)?;
+    let bearer_token = load_label_as_string(BEARER_TOKEN_LABEL)?;
     Ok((
         HandlerState {
             router_id,
             dkim_private_key_pem,
+            bearer_token,
         },
         (),
     ))
@@ -124,7 +128,12 @@ fn handle_connection_transfer(
 ) -> Result<(HandlerState, ()), String> {
     let request = tcp_receive(connection_id.clone(), 65536).unwrap_or_default();
 
-    let response = route(&request, &state.router_id, &state.dkim_private_key_pem);
+    let response = route(
+        &request,
+        &state.router_id,
+        &state.dkim_private_key_pem,
+        &state.bearer_token,
+    );
 
     if let Err(e) = tcp_send(connection_id.clone(), response) {
         log(format!("[inbox-api] send failed: {}", e));
@@ -139,11 +148,20 @@ fn handle_connection_transfer(
 // Routing
 // ============================================================================
 
-fn route(request: &[u8], router_id: &str, dkim_private_key_pem: &str) -> Vec<u8> {
+fn route(
+    request: &[u8],
+    router_id: &str,
+    dkim_private_key_pem: &str,
+    bearer_token: &str,
+) -> Vec<u8> {
     let request_str = match core::str::from_utf8(request) {
         Ok(s) => s,
         Err(_) => return http_response(400, "application/json", br#"{"error":"non-utf8 request"}"#.to_vec()),
     };
+
+    if extract_bearer(request_str) != Some(bearer_token) {
+        return http_response(401, "application/json", br#"{"error":"unauthorized"}"#.to_vec());
+    }
 
     let first_line = request_str.lines().next().unwrap_or("");
     let mut parts = first_line.split(' ');
@@ -567,11 +585,33 @@ fn unwrap_rpc_result(value: Value) -> Option<Value> {
     }
 }
 
+/// Extract the bearer token from `Authorization: Bearer <token>`. Header
+/// name match is case-insensitive; the "Bearer " prefix is case-insensitive;
+/// the token itself is verbatim.
+fn extract_bearer(request_str: &str) -> Option<&str> {
+    let headers_end = request_str.find("\r\n\r\n")?;
+    let headers = &request_str[..headers_end];
+    for line in headers.split("\r\n") {
+        let Some(colon) = line.find(':') else { continue }; // request-line has no colon
+        if !line[..colon].eq_ignore_ascii_case("authorization") {
+            continue;
+        }
+        let value = line[colon + 1..].trim_start();
+        let lower = value.to_ascii_lowercase();
+        if let Some(rest) = lower.strip_prefix("bearer ") {
+            let prefix_len = value.len() - rest.len();
+            return Some(value[prefix_len..].trim());
+        }
+    }
+    None
+}
+
 fn http_response(status: u16, content_type: &str, body: Vec<u8>) -> Vec<u8> {
     let status_text = match status {
         200 => "OK",
         201 => "Created",
         400 => "Bad Request",
+        401 => "Unauthorized",
         404 => "Not Found",
         500 => "Internal Server Error",
         _ => "OK",

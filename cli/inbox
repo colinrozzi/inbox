@@ -1,0 +1,160 @@
+#!/usr/bin/env bash
+# inbox — ergonomic client to the inbox at mail.colinrozzi.com.
+#
+# Runs locally; talks directly to the mail server's HTTP API over the
+# real internet using a bearer token. No SSH.
+#
+# Configuration:
+#   INBOX_API      hostname:port of the API (default: mail.colinrozzi.com:8080)
+#   INBOX_TOKEN    bearer token; required
+#                  (alternative: ~/.config/inbox/token, single line)
+#   INBOX_THEATER  path to the theater binary
+#                  (default: alongside this script, or `theater` on PATH)
+#   INBOX_WASM     path to inbox_cli.wasm
+#                  (default: ./result/inbox_cli.wasm next to the repo)
+
+set -euo pipefail
+
+here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+repo=$(cd "$here/.." && pwd)
+
+INBOX_API=${INBOX_API:-mail.colinrozzi.com:8080}
+
+if [ -z "${INBOX_TOKEN:-}" ] && [ -f "$HOME/.config/inbox/token" ]; then
+  INBOX_TOKEN=$(< "$HOME/.config/inbox/token")
+fi
+if [ -z "${INBOX_TOKEN:-}" ]; then
+  echo "inbox: set INBOX_TOKEN or write ~/.config/inbox/token" >&2
+  exit 2
+fi
+
+INBOX_THEATER=${INBOX_THEATER:-$repo/result-theater/bin/theater}
+if [ ! -x "$INBOX_THEATER" ]; then
+  if command -v theater >/dev/null 2>&1; then
+    INBOX_THEATER=$(command -v theater)
+  else
+    echo "inbox: theater binary not found; set INBOX_THEATER" >&2
+    exit 2
+  fi
+fi
+
+INBOX_WASM=${INBOX_WASM:-$repo/result/inbox_cli.wasm}
+if [ ! -f "$INBOX_WASM" ]; then
+  echo "inbox: $INBOX_WASM not found; run 'nix build' in $repo" >&2
+  exit 2
+fi
+
+usage() {
+  cat >&2 <<EOF
+usage: inbox <cmd> [args...]
+
+commands:
+  list                                       list registered addresses
+  new <addr>                                 register an address
+  lookup <addr>                              look up an address
+  read <addr> [--since N]                    read a mailbox
+  send <from> --to T [--subject S] [--body B] [--smtp HOST:PORT]
+                                             send a message
+EOF
+  exit 1
+}
+
+[ $# -lt 1 ] && usage
+cmd=$1; shift
+
+# Escape a string for JSON. Uses awk because jq isn't always available.
+json_escape() {
+  awk 'BEGIN {
+    while ((getline line < "/dev/stdin") > 0) {
+      if (NR > 1) printf "\\n"
+      gsub(/\\/, "\\\\", line)
+      gsub(/"/, "\\\"", line)
+      gsub(/\t/, "\\t", line)
+      gsub(/\r/, "\\r", line)
+      printf "%s", line
+    }
+  }' <<<"$1"
+}
+
+# Build the initial_state JSON. Fields are flat strings; numbers passed as strings too.
+build_state() {
+  local cmd=$1; shift
+  local args=("\"cmd\":\"$cmd\"")
+  args+=("\"api\":\"$(json_escape "$INBOX_API")\"")
+  args+=("\"token\":\"$(json_escape "$INBOX_TOKEN")\"")
+  while [ $# -gt 0 ]; do
+    local key=$1 val=$2; shift 2
+    args+=("\"$key\":\"$(json_escape "$val")\"")
+  done
+  local IFS=,
+  printf '{%s}' "${args[*]}"
+}
+
+# Parse subcommand args, build the state JSON.
+case "$cmd" in
+  list)
+    state=$(build_state list)
+    ;;
+  new)
+    [ $# -lt 1 ] && usage
+    state=$(build_state new address "$1")
+    ;;
+  lookup)
+    [ $# -lt 1 ] && usage
+    state=$(build_state lookup address "$1")
+    ;;
+  read)
+    [ $# -lt 1 ] && usage
+    addr=$1; shift
+    since=0
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --since) since=$2; shift 2 ;;
+        *) usage ;;
+      esac
+    done
+    state=$(build_state read address "$addr" since "$since")
+    ;;
+  send)
+    [ $# -lt 1 ] && usage
+    from=$1; shift
+    to= subject= body= smtp=
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --to) to=$2; shift 2 ;;
+        --subject) subject=$2; shift 2 ;;
+        --body) body=$2; shift 2 ;;
+        --smtp) smtp=$2; shift 2 ;;
+        *) usage ;;
+      esac
+    done
+    [ -z "$to" ] && { echo "send: --to required" >&2; exit 2; }
+    args=(address "$from" to "$to" subject "$subject" body "$body")
+    [ -n "$smtp" ] && args+=(smtp_server "$smtp")
+    state=$(build_state send "${args[@]}")
+    ;;
+  *)
+    usage
+    ;;
+esac
+
+# Write a temp manifest with the state embedded, then run theater.
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+cat > "$tmp/manifest.toml" <<EOF
+name = "inbox-cli"
+version = "0.1.0"
+package = "$INBOX_WASM"
+initial_state = """$state"""
+
+[[handler]]
+type = "runtime"
+
+[[handler]]
+type = "tcp"
+
+[[handler]]
+type = "terminal"
+EOF
+
+exec "$INBOX_THEATER" start "$tmp/manifest.toml"
