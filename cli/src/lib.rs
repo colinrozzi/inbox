@@ -120,7 +120,7 @@ struct Request {
 fn parse_request(s: &str) -> Result<Request, String> {
     let mut req = Request {
         cmd: String::new(),
-        api: String::from("mail.colinrozzi.com:8080"),
+        api: String::from("mail.colinrozzi.com:443"),
         token: String::new(),
         address: None,
         to: None,
@@ -349,6 +349,11 @@ fn default_smtp_for(to: &str) -> String {
 }
 
 /// Talk HTTP/1.1 to `req.api` and return the response body.
+///
+/// Reads headers until `\r\n\r\n`, parses `Content-Length`, then reads exactly
+/// that many body bytes — so we don't depend on the peer doing a graceful TLS
+/// close (rustls is strict about unclean shutdowns, but the actual HTTP/1.1
+/// semantics let us stop reading once we have the body).
 fn http(req: &Request, method: &str, path: &str, body: Option<&str>) -> Result<String, String> {
     let conn = tcp_connect(req.api.clone()).map_err(|e| format!("connect to {}: {}", req.api, e))?;
     let mut http_req = format!(
@@ -367,18 +372,76 @@ fn http(req: &Request, method: &str, path: &str, body: Option<&str>) -> Result<S
     tcp_send(conn.clone(), http_req.into_bytes()).map_err(|e| format!("send: {}", e))?;
 
     let mut all = Vec::new();
+    let mut body_start: Option<usize> = None;
+    let mut content_length: Option<usize> = None;
+
     loop {
-        let chunk = tcp_receive(conn.clone(), 65536).map_err(|e| format!("recv: {}", e))?;
+        // Stop conditions:
+        // - we know body_start and content_length and have everything
+        // - peer closed (chunk empty) — accept what we have
+        if let (Some(hs), Some(cl)) = (body_start, content_length) {
+            if all.len() >= hs + cl {
+                break;
+            }
+        }
+
+        let chunk = match tcp_receive(conn.clone(), 65536) {
+            Ok(c) => c,
+            Err(e) => {
+                // Best effort — if we already have headers+body, return that.
+                if let (Some(hs), Some(cl)) = (body_start, content_length) {
+                    if all.len() >= hs + cl {
+                        break;
+                    }
+                }
+                return Err(format!("recv: {}", e));
+            }
+        };
         if chunk.is_empty() {
             break;
         }
         all.extend_from_slice(&chunk);
+
+        // Re-scan for end-of-headers + Content-Length on each pass.
+        if body_start.is_none() {
+            if let Some(idx) = find_subseq(&all, b"\r\n\r\n") {
+                body_start = Some(idx + 4);
+                let header_str = core::str::from_utf8(&all[..idx]).unwrap_or("");
+                for line in header_str.split("\r\n") {
+                    if let Some((name, value)) = line.split_once(':') {
+                        if name.trim().eq_ignore_ascii_case("content-length") {
+                            if let Ok(n) = value.trim().parse::<usize>() {
+                                content_length = Some(n);
+                            }
+                        }
+                    }
+                }
+                if content_length.is_none() {
+                    // No length given — read until peer closes.
+                    content_length = Some(usize::MAX);
+                }
+            }
+        }
     }
+
     let _ = tcp_close(conn);
 
     let text = String::from_utf8(all).map_err(|_| String::from("non-utf8 response"))?;
-    let body_start = text.find("\r\n\r\n").map(|i| i + 4).unwrap_or(0);
-    Ok(text[body_start..].to_string())
+    let start = body_start.unwrap_or_else(|| text.find("\r\n\r\n").map(|i| i + 4).unwrap_or(0));
+    let end = match content_length {
+        Some(n) if n != usize::MAX => start + n.min(text.len() - start),
+        _ => text.len(),
+    };
+    Ok(text[start..end].to_string())
+}
+
+fn find_subseq(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || needle.len() > haystack.len() {
+        return None;
+    }
+    haystack
+        .windows(needle.len())
+        .position(|w| w == needle)
 }
 
 // ============================================================================

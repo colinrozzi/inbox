@@ -8,5 +8,8 @@ type = "runtime"
 [[handler]]
 type = "tcp"
 
+[handler.client_tls]
+enabled = true
+
 [[handler]]
 type = "terminal"

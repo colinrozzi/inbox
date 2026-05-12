@@ -73,7 +73,7 @@ fn store_store_at_label(store_id: String, label: String, content: Vec<u8>) -> Re
 #[import(module = "theater:simple/rpc", name = "call")]
 fn rpc_call(actor_id: String, function: String, params: Value, options: Value) -> Value;
 
-const LISTEN_ADDR: &str = "0.0.0.0:8080";
+const LISTEN_ADDR: &str = "0.0.0.0:443";
 const API_HANDLER_MANIFEST: &str = "/home/colin/work/actors/inbox/api-handler/manifest.toml";
 const MAILBOX_MANIFEST: &str = "/home/colin/work/actors/inbox/mailbox/manifest.toml";
 const ROUTER_MANIFEST: &str = "/home/colin/work/actors/inbox/mailbox-router/manifest.toml";

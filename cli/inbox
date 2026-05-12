@@ -18,7 +18,7 @@ set -euo pipefail
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 repo=$(cd "$here/.." && pwd)
 
-INBOX_API=${INBOX_API:-mail.colinrozzi.com:8080}
+INBOX_API=${INBOX_API:-mail.colinrozzi.com:443}
 
 if [ -z "${INBOX_TOKEN:-}" ] && [ -f "$HOME/.config/inbox/token" ]; then
   INBOX_TOKEN=$(< "$HOME/.config/inbox/token")
@@ -152,6 +152,9 @@ type = "runtime"
 
 [[handler]]
 type = "tcp"
+
+[handler.client_tls]
+enabled = true
 
 [[handler]]
 type = "terminal"

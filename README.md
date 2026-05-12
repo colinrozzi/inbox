@@ -1,6 +1,6 @@
 # inbox
 
-An agent-first email service built on [Theater](https://github.com/colinrozzi/theater). Agents talk to their mailbox over a small JSON HTTP API designed for how AI agents actually work (stateless, polling, cursor-based). Real internet email goes in and out via standard SMTP — DKIM-signed on the way out, MIME-parsed on the way in. Mailbox + router state persists to disk via the theater store handler. The HTTP API is bearer-token-authed so it's safe to talk to over the open internet, and there's a small theater-actor-based CLI that does exactly that. The reference deployment lives at `mail.colinrozzi.com`; see `RUNBOOK.md` for how to set up your own.
+An agent-first email service built on [Theater](https://github.com/colinrozzi/theater). Agents talk to their mailbox over a small JSON HTTPS API designed for how AI agents actually work (stateless, polling, cursor-based). Real internet email goes in and out via standard SMTP — DKIM-signed on the way out, MIME-parsed on the way in. Mailbox + router state persists to disk via the theater store handler. The HTTPS API uses TLS (theater's `server_tls` config + a Let's Encrypt cert) and a bearer token; there's a small theater-actor-based CLI that talks to it over the open internet. The reference deployment lives at `mail.colinrozzi.com`; see `RUNBOOK.md` for how to set up your own.
 
 ## API
 
@@ -155,12 +155,14 @@ For a real deployment (real domain, real internet mail, systemd, GC roots), see 
 - [x] Cascade-resistant acceptors (a single failed connection doesn't kill the process)
 - [x] systemd unit + nix GC roots (survives reboot, won't be garbage-collected)
 - [x] Bearer-token auth on every HTTP route (single deployment-wide token for now)
-- [x] Theater-actor-based CLI (`cli/inbox`) — local theater talks to the API over real-internet HTTP with the token
+- [x] Theater-actor-based CLI (`cli/inbox`) — local theater talks to the API over real-internet HTTPS with the token
+- [x] TLS on the HTTPS API via theater's `server_tls` (Let's Encrypt cert for `mail.<domain>`)
 - [ ] Date + Message-ID headers on outbound (blocked on `theater:simple/timer.now()` from pack actors)
 - [ ] api-handler pool (or single long-lived api-handler) — connections currently fail under burst load
 - [ ] Users + per-user subdomains (e.g. `colin.agents.example.com`)
 - [ ] Per-mailbox tokens (currently one shared token authorizes every route)
-- [ ] STARTTLS on inbound + outbound (and HTTPS on the API — token over plain HTTP is fine for trial, not for production)
+- [ ] STARTTLS on SMTP (inbound :25 + outbound to receiving MX)
+- [ ] Theater-side: graceful TLS shutdown on `tcp.close` (currently the CLI works around it by stopping at Content-Length)
 - [ ] Threads (group messages by `In-Reply-To` chain, expose `thread_id`)
 - [ ] Async outbound delivery (relay actor instead of synchronous from api-handler)
 - [ ] DKIM verification on inbound (currently only signs outbound; verified-sender flag)
