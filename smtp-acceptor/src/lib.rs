@@ -6,7 +6,7 @@
 extern crate alloc;
 
 use alloc::format;
-use alloc::string::String;
+use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use packr_guest::{export, import, pack_types, GraphValue, Value, ValueType};
 
@@ -31,6 +31,7 @@ pack_types! {
         }
         theater:simple/supervisor {
             spawn: func(manifest: string, init-bytes: option<list<u8>>, wasm-bytes: option<list<u8>>) -> result<string, string>,
+            stop-child: func(child-id: string) -> result<_, string>,
         }
         theater:simple/rpc {
             call: func(actor-id: string, function: string, params: value, options: value) -> value,
@@ -57,6 +58,9 @@ fn supervisor_spawn(
     init_bytes: Option<Vec<u8>>,
     wasm_bytes: Option<Vec<u8>>,
 ) -> Result<String, String>;
+
+#[import(module = "theater:simple/supervisor", name = "stop-child")]
+fn supervisor_stop_child(child_id: String) -> Result<(), String>;
 
 #[import(module = "theater:simple/rpc", name = "call")]
 fn rpc_call(actor_id: String, function: String, params: Value, options: Value) -> Value;
@@ -90,10 +94,22 @@ fn handle_connection(
     state: SmtpAcceptorState,
     connection_id: String,
 ) -> Result<(SmtpAcceptorState, ()), String> {
+    // Always-Ok: see the acceptor for context. A connection error must
+    // not kill the smtp listener.
+    if let Err(e) = try_handle_connection(&state, &connection_id) {
+        log(format!(
+            "[inbox-smtp-acceptor] handle-connection failed (conn={}): {}",
+            connection_id, e
+        ));
+    }
+    let _ = ValueType::Bool; // suppress unused
+    Ok((state, ()))
+}
+
+fn try_handle_connection(state: &SmtpAcceptorState, connection_id: &str) -> Result<(), String> {
     let handler_id = supervisor_spawn(state.smtp_handler_manifest.clone(), None, None)
         .map_err(|e| format!("spawn smtp-handler failed: {}", e))?;
 
-    // Pass router_id to the handler via init params.
     let init_params = Value::Tuple(alloc::vec![Value::String(state.router_id.clone())]);
     let _ = rpc_call(
         handler_id.clone(),
@@ -102,9 +118,9 @@ fn handle_connection(
         Value::Tuple(alloc::vec![]),
     );
 
-    tcp_transfer(connection_id, handler_id).map_err(|e| format!("transfer failed: {}", e))?;
-
-    // Suppress dead_code warning for ValueType import used only when adding optional fields.
-    let _ = ValueType::Bool;
-    Ok((state, ()))
+    if let Err(e) = tcp_transfer(connection_id.to_string(), handler_id.clone()) {
+        let _ = supervisor_stop_child(handler_id);
+        return Err(format!("transfer failed: {}", e));
+    }
+    Ok(())
 }

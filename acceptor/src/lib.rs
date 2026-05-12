@@ -8,7 +8,7 @@
 extern crate alloc;
 
 use alloc::format;
-use alloc::string::String;
+use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use packr_guest::{export, import, pack_types, GraphValue, Value, ValueType};
 
@@ -36,6 +36,7 @@ pack_types! {
         }
         theater:simple/supervisor {
             spawn: func(manifest: string, init-bytes: option<list<u8>>, wasm-bytes: option<list<u8>>) -> result<string, string>,
+            stop-child: func(child-id: string) -> result<_, string>,
         }
         theater:simple/rpc {
             call: func(actor-id: string, function: string, params: value, options: value) -> value,
@@ -62,6 +63,9 @@ fn supervisor_spawn(
     init_bytes: Option<Vec<u8>>,
     wasm_bytes: Option<Vec<u8>>,
 ) -> Result<String, String>;
+
+#[import(module = "theater:simple/supervisor", name = "stop-child")]
+fn supervisor_stop_child(child_id: String) -> Result<(), String>;
 
 #[import(module = "theater:simple/rpc", name = "call")]
 fn rpc_call(actor_id: String, function: String, params: Value, options: Value) -> Value;
@@ -141,6 +145,21 @@ fn handle_connection(
     state: AcceptorState,
     connection_id: String,
 ) -> Result<(AcceptorState, ()), String> {
+    // Always return Ok regardless of what happens inside. A single failing
+    // connection (e.g. client closed before we could transfer — theater
+    // returns "Connection not found" for that) must not kill the acceptor:
+    // if it does, theater treats the whole supervision tree as failed and
+    // the process exits. Log + clean up + carry on.
+    if let Err(e) = try_handle_connection(&state, &connection_id) {
+        log(format!(
+            "[inbox-acceptor] handle-connection failed (conn={}): {}",
+            connection_id, e
+        ));
+    }
+    Ok((state, ()))
+}
+
+fn try_handle_connection(state: &AcceptorState, connection_id: &str) -> Result<(), String> {
     let handler_id = supervisor_spawn(state.api_handler_manifest.clone(), None, None)
         .map_err(|e| format!("spawn api-handler failed: {}", e))?;
 
@@ -156,7 +175,11 @@ fn handle_connection(
         Value::Tuple(alloc::vec![]),
     );
 
-    tcp_transfer(connection_id, handler_id).map_err(|e| format!("transfer failed: {}", e))?;
-
-    Ok((state, ()))
+    if let Err(e) = tcp_transfer(connection_id.to_string(), handler_id.clone()) {
+        // Transfer failed — the api-handler is sitting there with no
+        // connection to handle. Stop it so we don't leak actors.
+        let _ = supervisor_stop_child(handler_id);
+        return Err(format!("transfer failed: {}", e));
+    }
+    Ok(())
 }
