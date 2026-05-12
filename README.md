@@ -1,15 +1,14 @@
 # inbox
 
-An agent-first email service built on [Theater](https://github.com/colinrozzi/theater). The interface is HTTPS — agents talk to their mailbox over a small JSON API, designed to fit how AI agents actually work (stateless, polling, cursor-based).
+An agent-first email service built on [Theater](https://github.com/colinrozzi/theater). Agents talk to their mailbox over a small JSON HTTP API designed for how AI agents actually work (stateless, polling, cursor-based). Real internet email goes in and out via standard SMTP — DKIM-signed on the way out, MIME-parsed on the way in. Live at `colin@colinrozzi.com`.
 
-This is the seed: three actors, an HTTP/JSON API, no SMTP yet. Real email will land in this same mailbox once we add an SMTP gateway.
-
-## API (current)
+## API
 
 ```
 POST /v1/mailboxes                          → register a new address (explicit)
                                               body: {"address":"agent@your.domain"}
 GET  /v1/mailboxes                          → list registered addresses
+GET  /v1/mailboxes/<addr>                   → look up an address (returns mailbox_id)
 
 GET  /v1/mailboxes/<addr>/inbox?since=<n>   → list messages with id ≥ n
 POST /v1/mailboxes/<addr>/messages          → direct insert (testing/admin)
@@ -30,19 +29,20 @@ The cursor design assumes agents poll: agents remember the `next_cursor` from th
 
 ## SMTP
 
-Inbound SMTP listens on `:25` (smtp-acceptor + smtp-handler). External senders deliver mail via standard SMTP; messages land in the same mailbox the API serves.
+**Inbound** on `:25`. The smtp-acceptor + smtp-handler implement an RFC 5321 server-side state machine: `EHLO`, `MAIL FROM`, `RCPT TO`, `DATA`. Unknown recipients are rejected with `550` at RCPT TO time (the handler asks the router whether the address is registered). On `DATA`, the message body is parsed for MIME — for `multipart/*` messages the first `text/plain` part is extracted; `quoted-printable` and `base64` transfer encodings are decoded. The clean text body is stored in each recipient's mailbox.
 
-Outbound SMTP is done synchronously from the api-handler via the `theater:simple/tcp` handler — it connects to whatever address the request specifies (default `localhost:25`). Real-world deployments would use a relay like Postmark/SES instead of direct delivery.
-
+**Outbound** is done synchronously from the api-handler via the `theater:simple/tcp` handler. The api-handler builds the RFC 822 message, prepends a DKIM-Signature header (rsa-sha256, relaxed/relaxed canonicalization, selector `default`, domain configured per-deployment), and talks raw SMTP to whatever server the request specifies (default `localhost:25`). Production-grade deployments would point this at a relay (Postmark, SES, etc.) instead of speaking direct-to-MX, but direct-to-MX works fine once the operational basics are in place — see `RUNBOOK.md`.
 
 ## Architecture
 
 ```
 acceptor                              (singleton, listens on :8080)
+  │  reads its DKIM private key from manifest initial_state
   │  on startup: spawns mailbox-router + smtp-acceptor
   │
   │  on each TCP connect:
-  │    spawn api-handler, init with router_id, transfer connection
+  │    spawn api-handler, init with (router_id, dkim_private_key_pem),
+  │    transfer connection
   │
   ├── mailbox-router                  (singleton, holds address → mailbox map)
   │     register(address) -> mailbox_id   (spawns a fresh mailbox actor)
@@ -54,47 +54,69 @@ acceptor                              (singleton, listens on :8080)
   │     put-message(from, to, subject, body) -> id
   │
   ├── api-handler                     (one per HTTP connection, ephemeral)
-  │     receives HTTP, looks up mailbox via router, RPCs the right mailbox
+  │     receives HTTP, routes, RPCs the right mailbox.
+  │     /send signs outbound with DKIM before transmitting.
   │
-  ├── smtp-acceptor                   (singleton, listens on :1025)
+  ├── smtp-acceptor                   (singleton, listens on :25)
   │     on each TCP connect:
   │       spawn smtp-handler, init with router_id, transfer connection
   │
   └── smtp-handler                    (one per SMTP connection, ephemeral)
         SMTP server-side state machine; RCPT TO checks the router (rejects
-        unknown recipients with 550); on DATA, RPCs put-message on each
-        recipient's mailbox.
+        unknown recipients with 550); on DATA parses MIME and RPCs
+        put-message on each recipient's mailbox.
 ```
 
 Each connection-handling actor is single-shot — handles one connection then shuts down. Long-lived actors (acceptor, router, mailboxes, smtp-acceptor) don't get tied up by misbehaving connections.
 
-## Running
+## Running locally
 
 ```sh
+# Build the wasms (or `nix build`).
 cargo build --release --target wasm32-unknown-unknown
+
+# Generate a throwaway DKIM key for local testing:
+openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out /tmp/dkim.pem
+# Then put the PEM contents in acceptor/manifest.toml's initial_state:
+#   initial_state = """\
+#   -----BEGIN PRIVATE KEY-----
+#   ...
+#   -----END PRIVATE KEY-----
+#   """
+
 theater start acceptor/manifest.toml
 
-# in another shell:
-curl http://localhost:8080/v1/inbox
+# In another shell:
 curl -X POST -H 'Content-Type: application/json' \
-  -d '{"from":"alice","to":"bob","subject":"hi","body":"hello"}' \
-  http://localhost:8080/v1/messages
-curl 'http://localhost:8080/v1/inbox?since=1'
+  -d '{"address":"alice@example.com"}' \
+  http://localhost:8080/v1/mailboxes
+
+curl 'http://localhost:8080/v1/mailboxes/alice%40example.com/inbox?since=0'
+
+curl -X POST -H 'Content-Type: application/json' \
+  -d '{"to":"alice@example.com","subject":"hi","body":"loop test","smtp_server":"localhost:25"}' \
+  http://localhost:8080/v1/mailboxes/alice%40example.com/send
 ```
+
+For a real deployment (real domain, real internet mail), see `RUNBOOK.md`.
 
 ## Roadmap
 
 - [x] HTTPS-style JSON API (acceptor + api-handler + mailbox)
 - [x] SMTP outbound (`POST /v1/mailboxes/<addr>/send` connects to remote SMTP server)
-- [x] SMTP inbound (`smtp-acceptor` + `smtp-handler` on `:1025`)
+- [x] SMTP inbound (`smtp-acceptor` + `smtp-handler` on `:25`)
 - [x] Multi-mailbox via `mailbox-router` actor (one mailbox actor per address)
+- [x] DKIM signing on outbound (`default._domainkey.<domain>`)
+- [x] MIME body parsing on inbound (text/plain extraction; quoted-printable + base64)
+- [x] Real-internet deployment (see `RUNBOOK.md`)
+- [ ] Date + Message-ID headers on outbound (blocked on `theater:simple/timer.now()` from pack actors)
+- [ ] Mailbox persistence across theater restarts (currently in-memory)
 - [ ] Users + per-user subdomains (e.g. `colin.agents.example.com`)
 - [ ] Auth (Bearer tokens scoped per mailbox / per user)
 - [ ] Threads (group messages by `In-Reply-To` chain, expose `thread_id`)
 - [ ] Async outbound delivery (relay actor instead of synchronous from api-handler)
-- [ ] Verified-sender flag (DKIM check on inbound)
-- [ ] TLS termination at the TCP handler
-- [ ] Deploy story
+- [ ] DKIM verification on inbound (currently only signs outbound; verified-sender flag)
+- [ ] STARTTLS support (inbound + outbound)
 
 ## License
 

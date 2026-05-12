@@ -4,3 +4,8 @@ package = "/home/colin/work/actors/inbox/target/wasm32-unknown-unknown/release/i
 
 [[handler]]
 type = "runtime"
+
+[[handler]]
+type = "store"
+base_path = "/var/lib/inbox/store"
+store_id = "inbox"

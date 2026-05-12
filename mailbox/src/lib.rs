@@ -1,9 +1,10 @@
-//! Inbox mailbox actor: long-lived singleton holding messages.
+//! Inbox mailbox actor: long-lived, one-per-address holder of messages.
 //!
-//! For the MVP this is a single inbox. Multi-tenancy comes later.
-//!
-//! State is the message log. `id` is just the index into the log so
-//! `since=<id>` cursor reads are trivial.
+//! State (messages) is persisted to `theater:simple/store` under the label
+//! `mailbox:<address>`. On init the actor restores from that label if
+//! present; on every `put-message` it writes the whole new state back.
+//! The address is passed in at init time by the router so the actor knows
+//! which label to use.
 
 #![no_std]
 extern crate alloc;
@@ -11,9 +12,11 @@ extern crate alloc;
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
-use packr_guest::{export, import, pack_types, GraphValue, Value};
+use packr_guest::{decode, encode, export, import, pack_types, GraphValue, Value};
 
 packr_guest::setup_guest!();
+
+const STORE_ID: &str = "inbox";
 
 #[derive(Clone, GraphValue)]
 #[graph(crate = "packr_guest::composite_abi")]
@@ -29,6 +32,8 @@ pub struct Message {
 #[derive(Clone, GraphValue)]
 #[graph(crate = "packr_guest::composite_abi")]
 pub struct MailboxState {
+    /// The email address this mailbox is for; used as the store label suffix.
+    pub address: String,
     pub messages: Vec<Message>,
 }
 
@@ -44,9 +49,14 @@ pack_types! {
         theater:simple/runtime {
             log: func(msg: string),
         }
+        theater:simple/store {
+            get: func(store-id: string, content-ref: string) -> result<list<u8>, string>,
+            get-by-label: func(store-id: string, label: string) -> result<option<string>, string>,
+            store-at-label: func(store-id: string, label: string, content: list<u8>) -> result<string, string>,
+        }
     }
     exports {
-        theater:simple/actor.init: func(state: value) -> result<mailbox-state, string>,
+        theater:simple/actor.init: func(state: value, address: string) -> result<mailbox-state, string>,
         theater:inbox/mailbox.list-since: func(state: mailbox-state, cursor: u64) -> result<tuple<mailbox-state, inbox-page>, string>,
         theater:inbox/mailbox.put-message: func(state: mailbox-state, from: string, to: string, subject: string, body: string) -> result<tuple<mailbox-state, u64>, string>,
     }
@@ -55,10 +65,54 @@ pack_types! {
 #[import(module = "theater:simple/runtime", name = "log")]
 fn log(msg: String);
 
+#[import(module = "theater:simple/store", name = "get")]
+fn store_get(store_id: String, content_ref: String) -> Result<Vec<u8>, String>;
+
+#[import(module = "theater:simple/store", name = "get-by-label")]
+fn store_get_by_label(store_id: String, label: String) -> Result<Option<String>, String>;
+
+#[import(module = "theater:simple/store", name = "store-at-label")]
+fn store_store_at_label(store_id: String, label: String, content: Vec<u8>) -> Result<String, String>;
+
+fn label_for(address: &str) -> String {
+    let mut s = String::from("mailbox:");
+    s.push_str(address);
+    s
+}
+
+fn load_state(address: &str) -> Option<MailboxState> {
+    let label = label_for(address);
+    let content_ref = store_get_by_label(STORE_ID.into(), label).ok()??;
+    let bytes = store_get(STORE_ID.into(), content_ref).ok()?;
+    let value = decode(&bytes).ok()?;
+    MailboxState::try_from(value).ok()
+}
+
+fn save_state(state: &MailboxState) {
+    let label = label_for(&state.address);
+    let value: Value = state.clone().into();
+    match encode(&value) {
+        Ok(bytes) => {
+            if let Err(e) = store_store_at_label(STORE_ID.into(), label, bytes) {
+                log(format!("[inbox-mailbox] persist failed: {}", e));
+            }
+        }
+        Err(e) => log(format!("[inbox-mailbox] encode failed: {:?}", e)),
+    }
+}
+
 #[export(name = "theater:simple/actor.init")]
-fn init(_state: Value) -> Result<(MailboxState, ()), String> {
-    log(String::from("[inbox-mailbox] init"));
-    Ok((MailboxState { messages: Vec::new() }, ()))
+fn init(_state: Value, address: String) -> Result<(MailboxState, ()), String> {
+    let state = load_state(&address).unwrap_or_else(|| MailboxState {
+        address: address.clone(),
+        messages: Vec::new(),
+    });
+    log(format!(
+        "[inbox-mailbox] init {} ({} messages)",
+        address,
+        state.messages.len()
+    ));
+    Ok((state, ()))
 }
 
 #[export(name = "theater:inbox/mailbox.list-since")]
@@ -92,9 +146,10 @@ fn put_message(
         to,
         subject,
         body,
-        received_at: 0, // TODO: wire up clock import
+        received_at: 0, // TODO: wire up clock import once theater timer.now() works from pack actors
     };
-    log(format!("[inbox-mailbox] stored message id={}", id));
     state.messages.push(msg);
+    log(format!("[inbox-mailbox] stored message id={} for {}", id, state.address));
+    save_state(&state);
     Ok((state, id))
 }
