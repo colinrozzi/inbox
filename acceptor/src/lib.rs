@@ -20,9 +20,6 @@ pub struct AcceptorState {
     pub listener_id: String,
     pub router_id: String,
     pub api_handler_manifest: String,
-    /// PEM-encoded RSA private key used by api-handler children to DKIM-sign
-    /// outbound mail. Comes from the acceptor manifest's `initial_state`.
-    pub dkim_private_key_pem: String,
 }
 
 pack_types! {
@@ -40,6 +37,9 @@ pack_types! {
         }
         theater:simple/rpc {
             call: func(actor-id: string, function: string, params: value, options: value) -> value,
+        }
+        theater:simple/store {
+            store-at-label: func(store-id: string, label: string, content: list<u8>) -> result<string, string>,
         }
     }
     exports {
@@ -67,6 +67,9 @@ fn supervisor_spawn(
 #[import(module = "theater:simple/supervisor", name = "stop-child")]
 fn supervisor_stop_child(child_id: String) -> Result<(), String>;
 
+#[import(module = "theater:simple/store", name = "store-at-label")]
+fn store_store_at_label(store_id: String, label: String, content: Vec<u8>) -> Result<String, String>;
+
 #[import(module = "theater:simple/rpc", name = "call")]
 fn rpc_call(actor_id: String, function: String, params: Value, options: Value) -> Value;
 
@@ -76,11 +79,17 @@ const MAILBOX_MANIFEST: &str = "/home/colin/work/actors/inbox/mailbox/manifest.t
 const ROUTER_MANIFEST: &str = "/home/colin/work/actors/inbox/mailbox-router/manifest.toml";
 const SMTP_ACCEPTOR_MANIFEST: &str = "/home/colin/work/actors/inbox/smtp-acceptor/manifest.toml";
 
+const STORE_ID: &str = "inbox";
+const DKIM_KEY_LABEL: &str = "dkim-key";
+
 #[export(name = "theater:simple/actor.init")]
 fn init(state: Value) -> Result<(AcceptorState, ()), String> {
     log(String::from("[inbox-acceptor] init"));
 
     // initial_state in the manifest carries the DKIM private key (PEM).
+    // We write it into the shared store under label `dkim-key` so api-handler
+    // children can read it on their own init without us shipping the whole
+    // PEM through every spawn's RPC params.
     let dkim_private_key_pem = match state {
         Value::String(s) if !s.is_empty() => s,
         _ => {
@@ -89,6 +98,12 @@ fn init(state: Value) -> Result<(AcceptorState, ()), String> {
             ))
         }
     };
+    store_store_at_label(
+        String::from(STORE_ID),
+        String::from(DKIM_KEY_LABEL),
+        dkim_private_key_pem.into_bytes(),
+    )
+    .map_err(|e| format!("persist dkim key failed: {}", e))?;
 
     // Spawn the mailbox-router. It owns the address → mailbox-actor mapping
     // and spawns mailbox actors on demand.
@@ -134,7 +149,6 @@ fn init(state: Value) -> Result<(AcceptorState, ()), String> {
             listener_id,
             router_id,
             api_handler_manifest: String::from(API_HANDLER_MANIFEST),
-            dkim_private_key_pem,
         },
         (),
     ))
@@ -163,11 +177,8 @@ fn try_handle_connection(state: &AcceptorState, connection_id: &str) -> Result<(
     let handler_id = supervisor_spawn(state.api_handler_manifest.clone(), None, None)
         .map_err(|e| format!("spawn api-handler failed: {}", e))?;
 
-    // Pass router_id and DKIM key to the handler via init params.
-    let init_params = Value::Tuple(alloc::vec![
-        Value::String(state.router_id.clone()),
-        Value::String(state.dkim_private_key_pem.clone()),
-    ]);
+    // Just router_id — api-handler loads the DKIM key from the store itself.
+    let init_params = Value::Tuple(alloc::vec![Value::String(state.router_id.clone())]);
     let _ = rpc_call(
         handler_id.clone(),
         String::from("theater:simple/actor.init"),

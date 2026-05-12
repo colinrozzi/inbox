@@ -10,3 +10,8 @@ type = "tcp"
 
 [[handler]]
 type = "rpc"
+
+[[handler]]
+type = "store"
+base_path = "/var/lib/inbox/store"
+store_id = "inbox"

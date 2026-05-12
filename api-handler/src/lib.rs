@@ -55,9 +55,13 @@ pack_types! {
         theater:simple/rpc {
             call: func(actor-id: string, function: string, params: value, options: value) -> value,
         }
+        theater:simple/store {
+            get: func(store-id: string, content-ref: string) -> result<list<u8>, string>,
+            get-by-label: func(store-id: string, label: string) -> result<option<string>, string>,
+        }
     }
     exports {
-        theater:simple/actor.init: func(state: value, router-id: string, dkim-private-key-pem: string) -> result<handler-state, string>,
+        theater:simple/actor.init: func(state: value, router-id: string) -> result<handler-state, string>,
         theater:simple/tcp-client.handle-connection-transfer: func(state: handler-state, connection-id: string) -> result<handler-state, string>,
     }
 }
@@ -83,12 +87,27 @@ fn tcp_close(connection_id: String) -> Result<(), String>;
 #[import(module = "theater:simple/rpc", name = "call")]
 fn rpc_call(actor_id: String, function: String, params: Value, options: Value) -> Value;
 
+#[import(module = "theater:simple/store", name = "get")]
+fn store_get(store_id: String, content_ref: String) -> Result<Vec<u8>, String>;
+
+#[import(module = "theater:simple/store", name = "get-by-label")]
+fn store_get_by_label(store_id: String, label: String) -> Result<Option<String>, String>;
+
+const STORE_ID: &str = "inbox";
+const DKIM_KEY_LABEL: &str = "dkim-key";
+
+fn load_dkim_key() -> Result<String, String> {
+    let content_ref = store_get_by_label(String::from(STORE_ID), String::from(DKIM_KEY_LABEL))
+        .map_err(|e| format!("dkim-key lookup failed: {}", e))?
+        .ok_or_else(|| String::from("dkim-key label not set (acceptor should have written it)"))?;
+    let bytes = store_get(String::from(STORE_ID), content_ref)
+        .map_err(|e| format!("dkim-key get failed: {}", e))?;
+    String::from_utf8(bytes).map_err(|_| String::from("dkim-key is not valid UTF-8"))
+}
+
 #[export(name = "theater:simple/actor.init")]
-fn init(
-    _state: Value,
-    router_id: String,
-    dkim_private_key_pem: String,
-) -> Result<(HandlerState, ()), String> {
+fn init(_state: Value, router_id: String) -> Result<(HandlerState, ()), String> {
+    let dkim_private_key_pem = load_dkim_key()?;
     Ok((
         HandlerState {
             router_id,
