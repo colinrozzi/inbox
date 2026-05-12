@@ -1,6 +1,6 @@
 # inbox
 
-An agent-first email service built on [Theater](https://github.com/colinrozzi/theater). Agents talk to their mailbox over a small JSON HTTP API designed for how AI agents actually work (stateless, polling, cursor-based). Real internet email goes in and out via standard SMTP — DKIM-signed on the way out, MIME-parsed on the way in. Mailbox + router state persists to disk via the theater store handler. The reference deployment lives at `mail.colinrozzi.com`; see `RUNBOOK.md` for how to set up your own.
+An agent-first email service built on [Theater](https://github.com/colinrozzi/theater). Agents talk to their mailbox over a small JSON HTTP API designed for how AI agents actually work (stateless, polling, cursor-based). Real internet email goes in and out via standard SMTP — DKIM-signed on the way out, MIME-parsed on the way in. Mailbox + router state persists to disk via the theater store handler. The HTTP API is bearer-token-authed so it's safe to talk to over the open internet, and there's a small theater-actor-based CLI that does exactly that. The reference deployment lives at `mail.colinrozzi.com`; see `RUNBOOK.md` for how to set up your own.
 
 ## API
 
@@ -25,6 +25,8 @@ POST /v1/mailboxes/<addr>/send              → SMTP-deliver from <addr>. No
 
 The address in the URL path must be percent-encoded (`@` → `%40`).
 
+Every route requires `Authorization: Bearer <token>`; missing or wrong returns `401`. The token is configured once on the deploy side (acceptor reads it from `initial_state` and writes it to the store under `api-bearer-token`); clients read it from `~/.config/inbox/token` or `$INBOX_TOKEN`.
+
 The cursor design assumes agents poll: agents remember the `next_cursor` from the last fetch and pass it as `since=` next time.
 
 ## SMTP
@@ -37,25 +39,29 @@ The cursor design assumes agents poll: agents remember the `next_cursor` from th
 
 ```
 acceptor                              (singleton, listens on :8080)
-  │  reads its DKIM private key from manifest initial_state
+  │  reads <bearer-token>\n<DKIM PEM> from manifest initial_state and
+  │  writes both to the shared store under `api-bearer-token` and `dkim-key`
   │  on startup: spawns mailbox-router + smtp-acceptor
   │
   │  on each TCP connect:
-  │    spawn api-handler, init with (router_id, dkim_private_key_pem),
-  │    transfer connection
+  │    spawn api-handler, init with router_id, transfer connection
   │
   ├── mailbox-router                  (singleton, holds address → mailbox map)
   │     register(address) -> mailbox_id   (spawns a fresh mailbox actor)
   │     lookup(address) -> option<mailbox_id>
   │     list() -> list<binding>
+  │     persists bindings to `router-bindings`; eagerly re-spawns
+  │     mailbox actors on restart from the saved list
   │
   ├── mailbox                         (one per registered address)
   │     list-since(cursor) -> page
   │     put-message(from, to, subject, body) -> id
+  │     persists state to `mailbox:<address>` on every put
   │
   ├── api-handler                     (one per HTTP connection, ephemeral)
-  │     receives HTTP, routes, RPCs the right mailbox.
-  │     /send signs outbound with DKIM before transmitting.
+  │     loads the bearer token + DKIM key from the store at init;
+  │     checks Authorization on every request, 401 on mismatch;
+  │     /send signs outbound with DKIM before transmitting
   │
   ├── smtp-acceptor                   (singleton, listens on :25)
   │     on each TCP connect:
@@ -65,20 +71,59 @@ acceptor                              (singleton, listens on :8080)
         SMTP server-side state machine; RCPT TO checks the router (rejects
         unknown recipients with 550); on DATA parses MIME and RPCs
         put-message on each recipient's mailbox.
+
+cli                                   (one-shot, runs locally)
+  │  reads a JSON command from manifest initial_state, tcp-connects to
+  │  mail.<your domain>:8080 with Authorization: Bearer <token>, writes
+  │  formatted output via theater:simple/terminal.write-stdout, shuts down
+  └── built in the same workspace and shipped in the same nix output
 ```
 
 Each connection-handling actor is single-shot — handles one connection then shuts down. Long-lived actors (acceptor, router, mailboxes, smtp-acceptor) don't get tied up by misbehaving connections.
 
-## Running locally
+## CLI
+
+The `cli/` workspace member is a one-shot theater actor wrapped by a bash script. It builds in the same `nix build` as the server actors:
 
 ```sh
-# Build the wasms (or `nix build`).
-cargo build --release --target wasm32-unknown-unknown
+nix build .#default     # produces result/inbox_cli.wasm alongside the rest
+```
 
-# Generate a throwaway DKIM key for local testing:
+Configure once:
+
+```sh
+export INBOX_API=mail.yourdomain.com:8080      # or whatever your deploy uses
+mkdir -p ~/.config/inbox && cp /path/to/token ~/.config/inbox/token
+```
+
+Then:
+
+```sh
+./cli/inbox list
+./cli/inbox new alice@yourdomain.com
+./cli/inbox lookup alice@yourdomain.com
+./cli/inbox read alice@yourdomain.com [--since N]
+./cli/inbox send alice@yourdomain.com --to bob@example.com \
+                  --subject "hi" --body "hello"
+```
+
+The wrapper generates a temp manifest with your args embedded in `initial_state` and runs `theater start` against the local theater binary at `result-theater/bin/theater`. Output goes to stdout via the `theater:simple/terminal` host functions.
+
+## Running locally (full server)
+
+```sh
+# Build the wasms.
+nix build .#default
+
+# Generate a throwaway DKIM key:
 openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out /tmp/dkim.pem
-# Then put the PEM contents in acceptor/manifest.toml's initial_state:
+
+# Pick a bearer token (any opaque string):
+openssl rand -hex 32
+
+# Put both in acceptor/manifest.toml's initial_state:
 #   initial_state = """\
+#   <bearer-token>
 #   -----BEGIN PRIVATE KEY-----
 #   ...
 #   -----END PRIVATE KEY-----
@@ -86,19 +131,15 @@ openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out /tmp/dkim.pem
 
 theater start acceptor/manifest.toml
 
-# In another shell:
-curl -X POST -H 'Content-Type: application/json' \
-  -d '{"address":"alice@example.com"}' \
-  http://localhost:8080/v1/mailboxes
-
-curl 'http://localhost:8080/v1/mailboxes/alice%40example.com/inbox?since=0'
-
-curl -X POST -H 'Content-Type: application/json' \
-  -d '{"to":"alice@example.com","subject":"hi","body":"loop test","smtp_server":"localhost:25"}' \
-  http://localhost:8080/v1/mailboxes/alice%40example.com/send
+# In another shell — every request needs Authorization: Bearer <token>
+TOKEN=<the token you generated>
+curl -H "Authorization: Bearer $TOKEN" \
+     -X POST -H 'Content-Type: application/json' \
+     -d '{"address":"alice@example.com"}' \
+     http://localhost:8080/v1/mailboxes
 ```
 
-For a real deployment (real domain, real internet mail), see `RUNBOOK.md`.
+For a real deployment (real domain, real internet mail, systemd, GC roots), see `RUNBOOK.md`.
 
 ## Roadmap
 
@@ -113,14 +154,16 @@ For a real deployment (real domain, real internet mail), see `RUNBOOK.md`.
 - [x] DKIM private key delivered via the shared store, not per-spawn init params
 - [x] Cascade-resistant acceptors (a single failed connection doesn't kill the process)
 - [x] systemd unit + nix GC roots (survives reboot, won't be garbage-collected)
+- [x] Bearer-token auth on every HTTP route (single deployment-wide token for now)
+- [x] Theater-actor-based CLI (`cli/inbox`) — local theater talks to the API over real-internet HTTP with the token
 - [ ] Date + Message-ID headers on outbound (blocked on `theater:simple/timer.now()` from pack actors)
 - [ ] api-handler pool (or single long-lived api-handler) — connections currently fail under burst load
 - [ ] Users + per-user subdomains (e.g. `colin.agents.example.com`)
-- [ ] Auth (Bearer tokens scoped per mailbox / per user)
+- [ ] Per-mailbox tokens (currently one shared token authorizes every route)
+- [ ] STARTTLS on inbound + outbound (and HTTPS on the API — token over plain HTTP is fine for trial, not for production)
 - [ ] Threads (group messages by `In-Reply-To` chain, expose `thread_id`)
 - [ ] Async outbound delivery (relay actor instead of synchronous from api-handler)
 - [ ] DKIM verification on inbound (currently only signs outbound; verified-sender flag)
-- [ ] STARTTLS support (inbound + outbound)
 
 ## License
 
