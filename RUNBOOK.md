@@ -66,7 +66,26 @@ sed -n '/-----BEGIN PUBLIC KEY-----/,/-----END PUBLIC KEY-----/p' public.pem \
 
 Put that into your `default._domainkey` TXT as `v=DKIM1; k=rsa; p=<key>`. Most DNS UIs auto-chunk the long string across DKIM-compatible TXT-string segments.
 
-## 4. Build
+## 4. Bearer token
+
+The HTTP API is bearer-token-authed; without it, every route returns `401`. Generate a token once on the deploy host:
+
+```sh
+openssl rand -hex 32 > /etc/inbox/api-token
+chmod 600 /etc/inbox/api-token
+```
+
+This token gets embedded in the acceptor manifest's `initial_state` (next step) and copied to each client machine that wants to talk to the API. On a client:
+
+```sh
+mkdir -p ~/.config/inbox
+scp your-vps:/etc/inbox/api-token ~/.config/inbox/token
+chmod 600 ~/.config/inbox/token
+```
+
+The CLI looks at `$INBOX_TOKEN` first, then `~/.config/inbox/token`. Curl from anywhere is `-H "Authorization: Bearer $(cat ~/.config/inbox/token)"`.
+
+## 5. Build
 
 Locally (recommended — the VPS may not have enough disk for a full rust build):
 
@@ -82,9 +101,9 @@ Note the store paths — you'll wire them into the deployment manifests.
 
 If you don't use nix: `cargo build --release --target wasm32-unknown-unknown`, scp the six `.wasm` files plus a theater binary up to the VPS.
 
-## 5. Deployment manifests
+## 6. Deployment manifests
 
-The actor sources hardcode manifest paths under `/home/colin/work/actors/inbox/...`. On the deployment host, lay out the same directory structure and give each manifest the right `package = <nix-store-path>/inbox_<name>.wasm` line. The acceptor manifest also needs an `initial_state` field carrying the DKIM private key.
+The actor sources hardcode manifest paths under `/home/colin/work/actors/inbox/...`. On the deployment host, lay out the same directory structure and give each manifest the right `package = <nix-store-path>/inbox_<name>.wasm` line. The acceptor manifest also needs an `initial_state` field with the bearer token on the first line and the DKIM private key after it.
 
 A working acceptor manifest looks like:
 
@@ -94,6 +113,7 @@ version = "0.1.0"
 package = "/nix/store/XXXX-inbox-0.1.0/inbox_acceptor.wasm"
 
 initial_state = """\
+<bearer-token>
 -----BEGIN PRIVATE KEY-----
 MIIEvQIB...
 ...
@@ -111,9 +131,14 @@ type = "supervisor"
 
 [[handler]]
 type = "rpc"
+
+[[handler]]
+type = "store"
+base_path = "/var/lib/inbox/store"
+store_id = "inbox"
 ```
 
-The other five manifests (api-handler, mailbox, mailbox-router, smtp-acceptor, smtp-handler) just need `package = ...` updated to the same nix-store path — no `initial_state`. See the canonical manifests in each actor's directory.
+The mailbox, mailbox-router, and api-handler manifests also need the `store` handler entry (same `base_path` and `store_id`). The other manifests just need `package = ...` updated to the same nix-store path. See the canonical manifests in each actor's directory.
 
 A small script that updates package paths to the new build:
 
@@ -132,7 +157,7 @@ for d in acceptor api-handler mailbox mailbox-router smtp-acceptor smtp-handler;
 done
 ```
 
-## 6. State directories + GC roots
+## 7. State directories + GC roots
 
 The inbox uses a disk-backed store for mailbox state, the DKIM key, and the router's address→mailbox map:
 
@@ -148,7 +173,7 @@ $NIX --add-root /var/lib/inbox/gc-roots/theater --indirect --realise /nix/store/
 $NIX --add-root /var/lib/inbox/gc-roots/inbox   --indirect --realise /nix/store/XXXX-inbox-0.1.0
 ```
 
-## 7. systemd unit
+## 8. systemd unit
 
 ```ini
 # /etc/systemd/system/inbox.service
@@ -184,27 +209,47 @@ ss -tlnp | grep -E ':(8080|25)\b'
 
 The systemd unit references the GC-rooted symlink rather than a direct `/nix/store/...` path. When you deploy a new build, point the symlink at the new store path (`ln -snf .../new-theater /var/lib/inbox/gc-roots/theater`) and `systemctl restart inbox`.
 
-## 8. Smoke tests
+## 9. Smoke tests
+
+Every route needs `Authorization: Bearer <token>`. Set up a shell shortcut:
+
+```sh
+TOKEN=$(cat /etc/inbox/api-token)        # on the deploy host
+# (or: TOKEN=$(cat ~/.config/inbox/token) from a client machine,
+#  pointing at https://mail.<yourdomain>:8080 instead of localhost)
+
+H="Authorization: Bearer $TOKEN"
+```
+
+Then:
 
 ```sh
 # Register an address
-curl -X POST -H 'Content-Type: application/json' \
+curl -H "$H" -X POST -H 'Content-Type: application/json' \
   -d '{"address":"colin@colinrozzi.com"}' \
   http://localhost:8080/v1/mailboxes
 
 # Look it up
-curl 'http://localhost:8080/v1/mailboxes/colin%40colinrozzi.com'
+curl -H "$H" 'http://localhost:8080/v1/mailboxes/colin%40colinrozzi.com'
 
 # Send to a real recipient (gmail-smtp-in is gmail's MX)
-curl -X POST -H 'Content-Type: application/json' \
+curl -H "$H" -X POST -H 'Content-Type: application/json' \
   -d '{"to":"you@gmail.com","subject":"hello","body":"hi from inbox","smtp_server":"gmail-smtp-in.l.google.com:25"}' \
   'http://localhost:8080/v1/mailboxes/colin%40colinrozzi.com/send'
 
 # Reply from gmail, then read the inbox
-curl 'http://localhost:8080/v1/mailboxes/colin%40colinrozzi.com/inbox?since=0'
+curl -H "$H" 'http://localhost:8080/v1/mailboxes/colin%40colinrozzi.com/inbox?since=0'
 ```
 
-## 9. Common failure modes
+Or use the CLI from any client machine with `~/.config/inbox/token`:
+
+```sh
+INBOX_API=mail.colinrozzi.com:8080 ./cli/inbox list
+INBOX_API=mail.colinrozzi.com:8080 ./cli/inbox send colin@colinrozzi.com \
+  --to you@gmail.com --subject hello --body "hi from inbox"
+```
+
+## 10. Common failure modes
 
 | Symptom | Cause | Fix |
 |---|---|---|
@@ -214,10 +259,12 @@ curl 'http://localhost:8080/v1/mailboxes/colin%40colinrozzi.com/inbox?since=0'
 | DKIM verifier rejects | Mismatched key between `private.pem` and DNS TXT, or canonicalization differs | Re-extract public from the deployed private; `dig +short txt default._domainkey.<domain>` and compare |
 | `Timeout waiting for actor runtime ... (10s)` after a failed send | api-handler shutdown stalls; subsequent sends queue up | Restart theater for now (see also TODOs in the inbox README) |
 | `now()` hangs from a pack actor | `theater:simple/timer.now()` doesn't wire up for spawned pack actors | Don't depend on it; receivers will add `Date` if absent |
+| Every request returns `{"error":"unauthorized"}` | Bearer token missing, doesn't match, or has trailing newline from a heredoc | `cat /etc/inbox/api-token` and compare to the token in `acceptor/manifest.toml` `initial_state`. `openssl rand -hex 32` output has a trailing newline — strip it. |
 
-## 10. Pending hardening
+## 11. Pending hardening
 
-- HTTP `:8080` is open to the internet with no auth on the JSON API. Either firewall it to localhost + tunnel via SSH for now, or put Caddy in front with TLS + basic auth.
+- The bearer token flies in cleartext over plain HTTP. Fine for a trial deployment; for production add TLS (Caddy on `:443` → `:8080`, or theater's own TLS support if you're feeling adventurous).
+- One shared token authorizes every route. Per-mailbox tokens (and per-mailbox owners) are the obvious next step.
 - DMARC is `p=none`. Bump to `quarantine` or `reject` once you've seen a few days of clean aggregate reports in the rua mailbox.
 - Under heavy concurrent load (>10–20 requests in a burst), individual TCP connections can fail with `Connection not found` — the acceptor logs each one and keeps running, but those requests are lost. Root cause is per-connection wasm-spawn cost serializing through one accept loop; fixes are an api-handler pool or a single long-lived api-handler.
 - Theater's `timer.now()` doesn't currently work from pack actors, so outbound mail has no `Date` or `Message-ID` header; receivers add `Date` for us. Untracked theater bug.
