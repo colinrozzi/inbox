@@ -132,24 +132,59 @@ for d in acceptor api-handler mailbox mailbox-router smtp-acceptor smtp-handler;
 done
 ```
 
-## 6. Start theater
+## 6. State directories + GC roots
 
-Currently the reference deployment runs theater in a `tmux` session as a stopgap until there's a systemd unit:
+The inbox uses a disk-backed store for mailbox state, the DKIM key, and the router's address→mailbox map:
 
 ```sh
-tmux new-session -d -s theater \
-  "/nix/store/XXXX-theater-0.3.9/bin/theater start /home/colin/work/actors/inbox/acceptor/manifest.toml > /var/log/inbox/theater.log 2>&1"
+mkdir -p /var/lib/inbox/store /var/lib/inbox/gc-roots /var/log/inbox
 ```
 
-Verify it's listening:
+Pin the running build's nix store paths so `nix-collect-garbage` can't yank them out from under the live process:
 
 ```sh
+NIX=/nix/var/nix/profiles/default/bin/nix-store
+$NIX --add-root /var/lib/inbox/gc-roots/theater --indirect --realise /nix/store/XXXX-theater-0.3.9
+$NIX --add-root /var/lib/inbox/gc-roots/inbox   --indirect --realise /nix/store/XXXX-inbox-0.1.0
+```
+
+## 7. systemd unit
+
+```ini
+# /etc/systemd/system/inbox.service
+[Unit]
+Description=Theater inbox actor system
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/var/lib/inbox/gc-roots/theater/bin/theater start /home/colin/work/actors/inbox/acceptor/manifest.toml
+WorkingDirectory=/var/lib/inbox
+Restart=on-failure
+RestartSec=5
+StandardOutput=append:/var/log/inbox/theater.log
+StandardError=append:/var/log/inbox/theater.log
+LimitNOFILE=65536
+# Runs as root because the smtp-acceptor binds privileged :25.
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Enable and start:
+
+```sh
+systemctl daemon-reload
+systemctl enable --now inbox.service
 ss -tlnp | grep -E ':(8080|25)\b'
 # 0.0.0.0:8080  ← HTTP API
 # 0.0.0.0:25    ← inbound SMTP
 ```
 
-## 7. Smoke tests
+The systemd unit references the GC-rooted symlink rather than a direct `/nix/store/...` path. When you deploy a new build, point the symlink at the new store path (`ln -snf .../new-theater /var/lib/inbox/gc-roots/theater`) and `systemctl restart inbox`.
+
+## 8. Smoke tests
 
 ```sh
 # Register an address
@@ -169,7 +204,7 @@ curl -X POST -H 'Content-Type: application/json' \
 curl 'http://localhost:8080/v1/mailboxes/colin%40colinrozzi.com/inbox?since=0'
 ```
 
-## 8. Common failure modes
+## 9. Common failure modes
 
 | Symptom | Cause | Fix |
 |---|---|---|
@@ -180,9 +215,9 @@ curl 'http://localhost:8080/v1/mailboxes/colin%40colinrozzi.com/inbox?since=0'
 | `Timeout waiting for actor runtime ... (10s)` after a failed send | api-handler shutdown stalls; subsequent sends queue up | Restart theater for now (see also TODOs in the inbox README) |
 | `now()` hangs from a pack actor | `theater:simple/timer.now()` doesn't wire up for spawned pack actors | Don't depend on it; receivers will add `Date` if absent |
 
-## 9. Pending hardening
+## 10. Pending hardening
 
-- No systemd unit yet → reboot loses the deployment. Track in inbox README roadmap.
 - HTTP `:8080` is open to the internet with no auth on the JSON API. Either firewall it to localhost + tunnel via SSH for now, or put Caddy in front with TLS + basic auth.
-- Mailbox state is in-memory; restart loses messages. Theater's chain log captures them but isn't auto-replayed.
 - DMARC is `p=none`. Bump to `quarantine` or `reject` once you've seen a few days of clean aggregate reports in the rua mailbox.
+- Under heavy concurrent load (>10–20 requests in a burst), individual TCP connections can fail with `Connection not found` — the acceptor logs each one and keeps running, but those requests are lost. Root cause is per-connection wasm-spawn cost serializing through one accept loop; fixes are an api-handler pool or a single long-lived api-handler.
+- Theater's `timer.now()` doesn't currently work from pack actors, so outbound mail has no `Date` or `Message-ID` header; receivers add `Date` for us. Untracked theater bug.

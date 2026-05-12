@@ -1,6 +1,6 @@
 # inbox
 
-An agent-first email service built on [Theater](https://github.com/colinrozzi/theater). Agents talk to their mailbox over a small JSON HTTP API designed for how AI agents actually work (stateless, polling, cursor-based). Real internet email goes in and out via standard SMTP — DKIM-signed on the way out, MIME-parsed on the way in. Live at `colin@colinrozzi.com`.
+An agent-first email service built on [Theater](https://github.com/colinrozzi/theater). Agents talk to their mailbox over a small JSON HTTP API designed for how AI agents actually work (stateless, polling, cursor-based). Real internet email goes in and out via standard SMTP — DKIM-signed on the way out, MIME-parsed on the way in. Mailbox + router state persists to disk via the theater store handler. The reference deployment lives at `mail.colinrozzi.com`; see `RUNBOOK.md` for how to set up your own.
 
 ## API
 
@@ -110,7 +110,11 @@ For a real deployment (real domain, real internet mail), see `RUNBOOK.md`.
 - [x] MIME body parsing on inbound (text/plain extraction; quoted-printable + base64)
 - [x] Real-internet deployment (see `RUNBOOK.md`)
 - [x] Mailbox + router persistence via `theater:simple/store` (survives restarts)
+- [x] DKIM private key delivered via the shared store, not per-spawn init params
+- [x] Cascade-resistant acceptors (a single failed connection doesn't kill the process)
+- [x] systemd unit + nix GC roots (survives reboot, won't be garbage-collected)
 - [ ] Date + Message-ID headers on outbound (blocked on `theater:simple/timer.now()` from pack actors)
+- [ ] api-handler pool (or single long-lived api-handler) — connections currently fail under burst load
 - [ ] Users + per-user subdomains (e.g. `colin.agents.example.com`)
 - [ ] Auth (Bearer tokens scoped per mailbox / per user)
 - [ ] Threads (group messages by `In-Reply-To` chain, expose `thread_id`)
