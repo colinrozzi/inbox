@@ -51,6 +51,7 @@ pack_types! {
             receive: func(connection-id: string, max-bytes: u32) -> result<list<u8>, string>,
             send: func(connection-id: string, data: list<u8>) -> result<u64, string>,
             close: func(connection-id: string) -> result<_, string>,
+            upgrade-to-tls-client: func(connection-id: string, server-name: string) -> result<_, string>,
         }
         theater:simple/rpc {
             call: func(actor-id: string, function: string, params: value, options: value) -> value,
@@ -86,6 +87,9 @@ fn tcp_send(connection_id: String, data: Vec<u8>) -> Result<u64, String>;
 
 #[import(module = "theater:simple/tcp", name = "close")]
 fn tcp_close(connection_id: String) -> Result<(), String>;
+
+#[import(module = "theater:simple/tcp", name = "upgrade-to-tls-client")]
+fn tcp_upgrade_to_tls_client(connection_id: String, server_name: String) -> Result<(), String>;
 
 #[import(module = "theater:simple/rpc", name = "call")]
 fn rpc_call(actor_id: String, function: String, params: Value, options: Value) -> Value;
@@ -543,6 +547,7 @@ fn smtp_deliver(
 
     let result = smtp_session(
         &conn,
+        server_addr,
         from,
         rcpt_to,
         header_to,
@@ -557,6 +562,7 @@ fn smtp_deliver(
 
 fn smtp_session(
     conn: &str,
+    server_addr: &str,
     from: &str,
     rcpt_to: &[String],
     header_to: &[String],
@@ -565,7 +571,20 @@ fn smtp_session(
     body: &str,
     dkim_private_key_pem: &str,
 ) -> Result<(), String> {
-    smtp_command(conn, "EHLO inbox.local\r\n", 250)?;
+    let ehlo_resp = smtp_command_get_body(conn, "EHLO inbox.local\r\n", 250)?;
+
+    // Opportunistic STARTTLS: if the server advertises it, upgrade the
+    // connection before exchanging mail. RFC 3207 requires re-issuing
+    // EHLO over the encrypted channel.
+    if smtp_caps_have(&ehlo_resp, "STARTTLS") {
+        let server_name = server_addr.split(':').next().unwrap_or(server_addr).to_string();
+        smtp_command(conn, "STARTTLS\r\n", 220)?;
+        tcp_upgrade_to_tls_client(conn.to_string(), server_name.clone())
+            .map_err(|e| format!("starttls upgrade to {}: {}", server_name, e))?;
+        log(format!("[inbox-api] STARTTLS upgrade ok to {}", server_name));
+        smtp_command(conn, "EHLO inbox.local\r\n", 250)?;
+    }
+
     smtp_command(conn, &format!("MAIL FROM:<{}>\r\n", from), 250)?;
     for rcpt in rcpt_to {
         smtp_command(conn, &format!("RCPT TO:<{}>\r\n", rcpt), 250)?;
@@ -640,6 +659,12 @@ fn smtp_session(
 }
 
 fn smtp_command(conn: &str, line: &str, expected: u16) -> Result<(), String> {
+    smtp_command_get_body(conn, line, expected).map(|_| ())
+}
+
+/// Like `smtp_command` but returns the full server response text. EHLO
+/// uses this to scan capabilities (STARTTLS, etc.).
+fn smtp_command_get_body(conn: &str, line: &str, expected: u16) -> Result<String, String> {
     tcp_send(conn.to_string(), line.as_bytes().to_vec())
         .map_err(|e| format!("send {:?} failed: {}", line.trim(), e))?;
     smtp_expect(conn, expected)
@@ -647,8 +672,9 @@ fn smtp_command(conn: &str, line: &str, expected: u16) -> Result<(), String> {
 
 /// Read until we see a complete SMTP reply, then assert the code matches.
 /// SMTP replies are one or more lines: "NNN-..." for continuation,
-/// "NNN ..." (space) for the final line.
-fn smtp_expect(conn: &str, expected: u16) -> Result<(), String> {
+/// "NNN ..." (space) for the final line. Returns the full response text
+/// so callers like EHLO can scan it for capability advertisements.
+fn smtp_expect(conn: &str, expected: u16) -> Result<String, String> {
     let mut buf = Vec::new();
     loop {
         let chunk = tcp_receive(conn.to_string(), 4096)
@@ -665,14 +691,35 @@ fn smtp_expect(conn: &str, expected: u16) -> Result<(), String> {
                 let code = parse_smtp_code(&buf[last_line_start..]).ok_or_else(|| {
                     String::from("invalid SMTP reply (no 3-digit code on final line)")
                 })?;
+                let text = core::str::from_utf8(&buf)
+                    .map_err(|_| String::from("non-utf8 SMTP reply"))?
+                    .to_string();
                 if code != expected {
-                    let text = core::str::from_utf8(&buf).unwrap_or("");
                     return Err(format!("expected {}, got {}: {}", expected, code, text.trim()));
                 }
-                return Ok(());
+                return Ok(text);
             }
         }
     }
+}
+
+/// True if the EHLO multi-line response advertises `cap`. Tolerant of
+/// whitespace; matches the capability token in `250-CAP ...` or `250 CAP`.
+fn smtp_caps_have(resp: &str, cap: &str) -> bool {
+    for line in resp.split("\r\n") {
+        let trimmed = line.trim();
+        // Lines look like "250-FOO" or "250 FOO ..." — strip "250-" or "250 "
+        let payload = if trimmed.len() >= 4 {
+            &trimmed[4..]
+        } else {
+            continue;
+        };
+        let token = payload.split_whitespace().next().unwrap_or("");
+        if token.eq_ignore_ascii_case(cap) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Find the start index of the last line in `buf`. A "line" ends with CRLF.
