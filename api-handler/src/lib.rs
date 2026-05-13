@@ -378,12 +378,20 @@ fn handle_post_message(request_str: &str, mailbox_id: &str) -> Vec<u8> {
 /// `POST /v1/mailboxes/<addr>/send` — deliver a message via SMTP. The
 /// sender (`from`) is the address in the URL path; the body provides
 /// `to`, optional `cc` + `bcc`, `subject`, `body`, and an optional
-/// `smtp_server` override. `to`, `cc`, `bcc` may each be a JSON array
+/// `smtp_server` fallback. `to`, `cc`, `bcc` may each be a JSON array
 /// of addresses; `to` also accepts a bare string for back-compat.
 ///
-/// All recipients (to + cc + bcc) are issued as RCPT TO commands. The
-/// To and Cc headers are written into the message; Bcc deliberately is
-/// not, so blind-cc recipients aren't visible to other recipients.
+/// Recipients are routed per-domain: each is resolved via the built-in
+/// domain map (see `resolve_smtp_server`); recipients sharing a server
+/// are batched into one SMTP transaction. `smtp_server` from the body
+/// is the fallback only for domains the map doesn't know. The To and
+/// Cc headers in each transaction show the *full* lists (so recipients
+/// see who else got the message); Bcc is never written.
+///
+/// Per-domain transactions mean partial success is observable. Response
+/// shape: `{status, delivered:[...], failed:[{recipient,error}]}`.
+/// HTTP 200 if at least one address was delivered (status `sent` or
+/// `partial`); 502 if all failed.
 ///
 /// Sender-copy is *not* implicitly recorded. If the sender wants the
 /// message in their own mailbox they should Bcc themselves, which goes
@@ -402,44 +410,124 @@ fn handle_send(request_str: &str, from: &str, dkim_private_key_pem: &str) -> Vec
     let bcc_list = parse_string_or_array(body, "bcc");
     let subject = get("subject");
     let msg_body = get("body");
-    let smtp_server = {
+    let fallback_server = {
         let s = get("smtp_server");
-        if s.is_empty() { String::from("localhost:25") } else { s }
+        if s.is_empty() { None } else { Some(s) }
     };
 
     if to_list.is_empty() {
         return http_response(400, "application/json", br#"{"error":"to is required"}"#.to_vec());
     }
 
-    if let Err(e) = smtp_deliver(
-        &smtp_server,
-        from,
-        &to_list,
-        &cc_list,
-        &bcc_list,
-        &subject,
-        &msg_body,
-        dkim_private_key_pem,
-    ) {
-        log(format!("[inbox-api] smtp deliver failed: {}", e));
-        let body = format!(r#"{{"error":"smtp deliver failed: {}"}}"#, json_escape(&e));
-        return http_response(502, "application/json", body.into_bytes());
+    // Group every recipient by the SMTP server that should handle it.
+    // Unresolvable recipients (no domain match, no fallback) go straight
+    // into the `failed` list — we still attempt the others.
+    let mut groups: Vec<(String, Vec<String>)> = Vec::new();
+    let mut delivered: Vec<String> = Vec::new();
+    let mut failed: Vec<(String, String)> = Vec::new();
+    for rcpt in to_list.iter().chain(cc_list.iter()).chain(bcc_list.iter()) {
+        match resolve_smtp_server(rcpt, fallback_server.as_deref()) {
+            Some(server) => match groups.iter_mut().find(|(s, _)| s == &server) {
+                Some((_, list)) => list.push(rcpt.clone()),
+                None => groups.push((server, alloc::vec![rcpt.clone()])),
+            },
+            None => failed.push((
+                rcpt.clone(),
+                format!("no smtp server for domain (and no smtp_server fallback)"),
+            )),
+        }
     }
 
-    http_response(200, "application/json", br#"{"status":"sent"}"#.to_vec())
+    for (server, group_rcpts) in &groups {
+        match smtp_deliver(
+            server,
+            from,
+            group_rcpts,
+            &to_list,
+            &cc_list,
+            &subject,
+            &msg_body,
+            dkim_private_key_pem,
+        ) {
+            Ok(()) => delivered.extend(group_rcpts.iter().cloned()),
+            Err(e) => {
+                log(format!(
+                    "[inbox-api] smtp deliver to {} failed: {}",
+                    server, e
+                ));
+                for r in group_rcpts {
+                    failed.push((r.clone(), e.clone()));
+                }
+            }
+        }
+    }
+
+    let status = if failed.is_empty() {
+        "sent"
+    } else if delivered.is_empty() {
+        "failed"
+    } else {
+        "partial"
+    };
+
+    let delivered_json = json_array_of_strings(&delivered);
+    let failed_json = {
+        let parts: Vec<String> = failed
+            .iter()
+            .map(|(r, e)| {
+                format!(
+                    r#"{{"recipient":"{}","error":"{}"}}"#,
+                    json_escape(r),
+                    json_escape(e)
+                )
+            })
+            .collect();
+        format!("[{}]", parts.join(","))
+    };
+    let body = format!(
+        r#"{{"status":"{}","delivered":{},"failed":{}}}"#,
+        status, delivered_json, failed_json
+    );
+    let http_status = if delivered.is_empty() { 502 } else { 200 };
+    http_response(http_status, "application/json", body.into_bytes())
+}
+
+/// Map a recipient address to the SMTP server we should deliver to.
+/// Known domains are hardcoded; unknown domains fall through to the
+/// caller-supplied fallback (the body's `smtp_server` field). Real MX
+/// lookup is a separate follow-up.
+fn resolve_smtp_server(addr: &str, fallback: Option<&str>) -> Option<String> {
+    let domain = addr.rsplit('@').next().unwrap_or("");
+    match domain {
+        "colinrozzi.com" => Some(String::from("localhost:25")),
+        "gmail.com" => Some(String::from("gmail-smtp-in.l.google.com:25")),
+        _ => fallback.map(String::from),
+    }
+}
+
+fn json_array_of_strings(items: &[String]) -> String {
+    let parts: Vec<String> = items
+        .iter()
+        .map(|s| format!(r#""{}""#, json_escape(s)))
+        .collect();
+    format!("[{}]", parts.join(","))
 }
 
 // ============================================================================
 // SMTP client
 // ============================================================================
 
-/// Talk SMTP to `server_addr` and deliver one message.
+/// Talk SMTP to `server_addr` and deliver one message to `rcpt_to`.
+/// `header_to`/`header_cc` are the *full* recipient lists for the
+/// outgoing visible headers — they're the same for every per-domain
+/// transaction so a message split across servers presents identical
+/// To/Cc headers to all recipients.
 fn smtp_deliver(
     server_addr: &str,
     from: &str,
-    to_list: &[String],
-    cc_list: &[String],
-    bcc_list: &[String],
+    rcpt_to: &[String],
+    header_to: &[String],
+    header_cc: &[String],
     subject: &str,
     body: &str,
     dkim_private_key_pem: &str,
@@ -456,9 +544,9 @@ fn smtp_deliver(
     let result = smtp_session(
         &conn,
         from,
-        to_list,
-        cc_list,
-        bcc_list,
+        rcpt_to,
+        header_to,
+        header_cc,
         subject,
         body,
         dkim_private_key_pem,
@@ -470,16 +558,16 @@ fn smtp_deliver(
 fn smtp_session(
     conn: &str,
     from: &str,
-    to_list: &[String],
-    cc_list: &[String],
-    bcc_list: &[String],
+    rcpt_to: &[String],
+    header_to: &[String],
+    header_cc: &[String],
     subject: &str,
     body: &str,
     dkim_private_key_pem: &str,
 ) -> Result<(), String> {
     smtp_command(conn, "EHLO inbox.local\r\n", 250)?;
     smtp_command(conn, &format!("MAIL FROM:<{}>\r\n", from), 250)?;
-    for rcpt in to_list.iter().chain(cc_list.iter()).chain(bcc_list.iter()) {
+    for rcpt in rcpt_to {
         smtp_command(conn, &format!("RCPT TO:<{}>\r\n", rcpt), 250)?;
     }
     smtp_command(conn, "DATA\r\n", 354)?;
@@ -491,9 +579,9 @@ fn smtp_session(
     let message_id = format!("{}.{}@{}", now_ms, from_local, dkim::DOMAIN);
     let mut headers = String::new();
     headers.push_str(&format!("From: {}\r\n", from));
-    headers.push_str(&format!("To: {}\r\n", to_list.join(", ")));
-    if !cc_list.is_empty() {
-        headers.push_str(&format!("Cc: {}\r\n", cc_list.join(", ")));
+    headers.push_str(&format!("To: {}\r\n", header_to.join(", ")));
+    if !header_cc.is_empty() {
+        headers.push_str(&format!("Cc: {}\r\n", header_cc.join(", ")));
     }
     headers.push_str(&format!("Subject: {}\r\n", subject));
     headers.push_str(&format!("Date: {}\r\n", rfc2822::format_date(now_ms)));
@@ -508,7 +596,7 @@ fn smtp_session(
         body_crlf.push_str("\r\n");
     }
 
-    let signed_headers: &[&str] = if cc_list.is_empty() {
+    let signed_headers: &[&str] = if header_cc.is_empty() {
         &["from", "to", "subject", "date", "message-id"]
     } else {
         &["from", "to", "cc", "subject", "date", "message-id"]
