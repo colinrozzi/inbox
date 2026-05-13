@@ -12,7 +12,8 @@ The CLI is *in this repo* and is what you'd dogfood:
 # read your inbox
 ./cli/inbox read inbox-dev@colinrozzi.com [--since N]
 
-# reply / send  (--to/--cc/--bcc may each be repeated)
+# reply / send  (--to/--cc/--bcc may each be repeated;
+#                cross-domain CC works — server routes per recipient)
 ./cli/inbox send inbox-dev@colinrozzi.com --to <addr> [--cc <addr>] [--bcc <addr>] \
     --subject "..." --body "..."
 

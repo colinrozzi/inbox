@@ -23,12 +23,22 @@ POST /v1/mailboxes/<addr>/send              → SMTP-deliver from <addr>. No
                                                      "cc":[...],   // optional
                                                      "bcc":[...],  // optional
                                                      "subject","body",
-                                                     "smtp_server":"..."  // optional}
+                                                     "smtp_server":"..."  // optional fallback}
                                               `to` also accepts a bare string
-                                              for one recipient. RCPT TO is
-                                              issued for every address in
-                                              to+cc+bcc; To and Cc headers are
-                                              written (Bcc is not).
+                                              for one recipient. Recipients are
+                                              grouped by destination — the
+                                              server resolves each address's
+                                              SMTP host (gmail.com → gmail MX,
+                                              colinrozzi.com → localhost, others
+                                              fall through to `smtp_server`).
+                                              One SMTP transaction per group;
+                                              To and Cc headers list the *full*
+                                              recipient sets (Bcc is not).
+                                              Response: {"status":"sent"|"partial"|"failed",
+                                                         "delivered":[...],
+                                                         "failed":[{"recipient","error"}]}
+                                              HTTP 200 if any address delivered,
+                                              502 if all failed.
 ```
 
 The address in the URL path must be percent-encoded (`@` → `%40`).
@@ -116,6 +126,11 @@ Then:
                   [--bcc eve@example.com]... \
                   --subject "hi" --body "hello"
 ```
+
+`--smtp HOST:PORT` is now a fallback for domains the server's routing
+table doesn't recognize; for known domains (e.g. `gmail.com`,
+`colinrozzi.com`) the server picks the right SMTP host automatically,
+even when recipients span multiple domains in one send.
 
 The wrapper generates a temp manifest with your args embedded in `initial_state` and runs `theater start` against the local theater binary at `result-theater/bin/theater`. Output goes to stdout via the `theater:simple/terminal` host functions.
 

@@ -361,19 +361,25 @@ fn run_send(req: &Request) -> Result<(), String> {
     }
     let subject = req.subject.as_deref().unwrap_or("");
     let body_text = req.body.as_deref().unwrap_or("");
-    let smtp = req
-        .smtp_server
-        .clone()
-        .unwrap_or_else(|| default_smtp_for(&req.to[0]));
-    let payload = format!(
-        "{{\"to\":{},\"cc\":{},\"bcc\":{},\"subject\":\"{}\",\"body\":\"{}\",\"smtp_server\":\"{}\"}}",
-        json_string_array(&req.to),
-        json_string_array(&req.cc),
-        json_string_array(&req.bcc),
-        escape_json(subject),
-        escape_json(body_text),
-        escape_json(&smtp),
-    );
+    let payload = match req.smtp_server.as_deref() {
+        Some(smtp) => format!(
+            "{{\"to\":{},\"cc\":{},\"bcc\":{},\"subject\":\"{}\",\"body\":\"{}\",\"smtp_server\":\"{}\"}}",
+            json_string_array(&req.to),
+            json_string_array(&req.cc),
+            json_string_array(&req.bcc),
+            escape_json(subject),
+            escape_json(body_text),
+            escape_json(smtp),
+        ),
+        None => format!(
+            "{{\"to\":{},\"cc\":{},\"bcc\":{},\"subject\":\"{}\",\"body\":\"{}\"}}",
+            json_string_array(&req.to),
+            json_string_array(&req.cc),
+            json_string_array(&req.bcc),
+            escape_json(subject),
+            escape_json(body_text),
+        ),
+    };
     let path = format!("/v1/mailboxes/{}/send", url_encode(addr));
     let body = http(req, "POST", &path, Some(&payload))?;
     out(&format!("{}\n", body));
@@ -386,16 +392,6 @@ fn json_string_array(items: &[String]) -> String {
         .map(|s| format!("\"{}\"", escape_json(s)))
         .collect();
     format!("[{}]", parts.join(","))
-}
-
-/// If the user didn't specify --smtp, infer from the recipient's domain.
-fn default_smtp_for(to: &str) -> String {
-    let domain = to.rsplit('@').next().unwrap_or("");
-    match domain {
-        "gmail.com" => String::from("gmail-smtp-in.l.google.com:25"),
-        "colinrozzi.com" => String::from("localhost:25"),
-        _ => String::from("localhost:25"),
-    }
 }
 
 /// Talk HTTP/1.1 to `req.api` and return the response body.
