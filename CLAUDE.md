@@ -187,6 +187,8 @@ To pick up new theater work:
 nix flake update theater
 ```
 
+**Always run this before a deploy-bound `nix build`** (and commit the lock change), even when you don't think theater has changed. The flake URL is a moving branch ref (`release-<date>`); the lock freezes one snapshot, but the upstream branch keeps advancing. Rebuilding against a stale lock can silently produce a binary *older* than what's running in prod — breaking runtime features that weren't in your lock's snapshot. Skip only if you're intentionally pinning.
+
 If Theater needs a fix you can't make locally (e.g. you need a new host function), email `theater-dev@colinrozzi.com` with the request and move on. When they reply with a PR/release, bump the flake input, rebuild, redeploy.
 
 ## Memory & context
