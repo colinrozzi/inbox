@@ -30,7 +30,6 @@ fn unsupported_getrandom(_dest: &mut [u8]) -> Result<(), getrandom::Error> {
 }
 
 mod dkim;
-#[allow(dead_code)] // wired up once theater:simple/timer.now() works from pack actors
 mod rfc2822;
 
 #[derive(Clone, GraphValue)]
@@ -59,6 +58,9 @@ pack_types! {
         theater:simple/store {
             get: func(store-id: string, content-ref: string) -> result<list<u8>, string>,
             get-by-label: func(store-id: string, label: string) -> result<option<string>, string>,
+        }
+        theater:simple/timer {
+            now: func() -> u64,
         }
     }
     exports {
@@ -93,6 +95,9 @@ fn store_get(store_id: String, content_ref: String) -> Result<Vec<u8>, String>;
 
 #[import(module = "theater:simple/store", name = "get-by-label")]
 fn store_get_by_label(store_id: String, label: String) -> Result<Option<String>, String>;
+
+#[import(module = "theater:simple/timer", name = "now")]
+fn timer_now() -> u64;
 
 const STORE_ID: &str = "inbox";
 const DKIM_KEY_LABEL: &str = "dkim-key";
@@ -481,11 +486,9 @@ fn smtp_session(
 
     // Build the headers (without DKIM-Signature yet) + body. DKIM signs the
     // resulting RFC822 message; the signature header gets prepended.
-    //
-    // Date + Message-ID are not added here yet — they need a host time source,
-    // and the theater:simple/timer.now() import currently hangs from inside
-    // pack actors (separate issue). Receivers that need Date will add their
-    // own. Message-ID is technically optional per RFC 5322.
+    let now_ms = timer_now();
+    let from_local = from.split('@').next().unwrap_or("inbox");
+    let message_id = format!("{}.{}@{}", now_ms, from_local, dkim::DOMAIN);
     let mut headers = String::new();
     headers.push_str(&format!("From: {}\r\n", from));
     headers.push_str(&format!("To: {}\r\n", to_list.join(", ")));
@@ -493,6 +496,8 @@ fn smtp_session(
         headers.push_str(&format!("Cc: {}\r\n", cc_list.join(", ")));
     }
     headers.push_str(&format!("Subject: {}\r\n", subject));
+    headers.push_str(&format!("Date: {}\r\n", rfc2822::format_date(now_ms)));
+    headers.push_str(&format!("Message-ID: <{}>\r\n", message_id));
     headers.push_str("MIME-Version: 1.0\r\n");
     headers.push_str("Content-Type: text/plain; charset=utf-8\r\n");
 
@@ -504,9 +509,9 @@ fn smtp_session(
     }
 
     let signed_headers: &[&str] = if cc_list.is_empty() {
-        &["from", "to", "subject"]
+        &["from", "to", "subject", "date", "message-id"]
     } else {
-        &["from", "to", "cc", "subject"]
+        &["from", "to", "cc", "subject", "date", "message-id"]
     };
 
     let dkim_signature = dkim::sign_message(
