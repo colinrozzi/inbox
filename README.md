@@ -19,8 +19,16 @@ POST /v1/mailboxes/<addr>/send              → SMTP-deliver from <addr>. No
                                               travels the same SMTP path,
                                               looping back when the address
                                               is on this server's domain).
-                                              body: {"to","subject","body",
+                                              body: {"to":[...],
+                                                     "cc":[...],   // optional
+                                                     "bcc":[...],  // optional
+                                                     "subject","body",
                                                      "smtp_server":"..."  // optional}
+                                              `to` also accepts a bare string
+                                              for one recipient. RCPT TO is
+                                              issued for every address in
+                                              to+cc+bcc; To and Cc headers are
+                                              written (Bcc is not).
 ```
 
 The address in the URL path must be percent-encoded (`@` → `%40`).
@@ -104,6 +112,8 @@ Then:
 ./cli/inbox lookup alice@yourdomain.com
 ./cli/inbox read alice@yourdomain.com [--since N]
 ./cli/inbox send alice@yourdomain.com --to bob@example.com \
+                  [--to carol@example.com]... [--cc dan@example.com]... \
+                  [--bcc eve@example.com]... \
                   --subject "hi" --body "hello"
 ```
 

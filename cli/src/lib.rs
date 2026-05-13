@@ -108,7 +108,9 @@ struct Request {
     token: String,
     // Subset of fields we look up by name; not every cmd uses every field.
     address: Option<String>,
-    to: Option<String>,
+    to: Vec<String>,
+    cc: Vec<String>,
+    bcc: Vec<String>,
     subject: Option<String>,
     body: Option<String>,
     smtp_server: Option<String>,
@@ -123,7 +125,9 @@ fn parse_request(s: &str) -> Result<Request, String> {
         api: String::from("mail.colinrozzi.com:443"),
         token: String::new(),
         address: None,
-        to: None,
+        to: Vec::new(),
+        cc: Vec::new(),
+        bcc: Vec::new(),
         subject: None,
         body: None,
         smtp_server: None,
@@ -135,7 +139,9 @@ fn parse_request(s: &str) -> Result<Request, String> {
             "api" => req.api = v.as_str().to_string(),
             "token" => req.token = v.as_str().to_string(),
             "address" => req.address = Some(v.as_str().to_string()),
-            "to" => req.to = Some(v.as_str().to_string()),
+            "to" => req.to = v.as_list(),
+            "cc" => req.cc = v.as_list(),
+            "bcc" => req.bcc = v.as_list(),
             "subject" => req.subject = Some(v.as_str().to_string()),
             "body" => req.body = Some(v.as_str().to_string()),
             "smtp_server" => req.smtp_server = Some(v.as_str().to_string()),
@@ -185,12 +191,21 @@ fn parse_json_object(s: &str) -> Result<Vec<(String, JsonScalar)>, String> {
 
 enum JsonScalar {
     Str(String),
+    List(Vec<String>),
 }
 
 impl JsonScalar {
     fn as_str(&self) -> &str {
         match self {
             JsonScalar::Str(s) => s.as_str(),
+            JsonScalar::List(_) => "",
+        }
+    }
+    fn as_list(&self) -> Vec<String> {
+        match self {
+            JsonScalar::Str(s) if !s.is_empty() => alloc::vec![s.clone()],
+            JsonScalar::Str(_) => Vec::new(),
+            JsonScalar::List(items) => items.clone(),
         }
     }
 }
@@ -259,6 +274,29 @@ fn parse_value(b: &[u8], i: usize) -> Result<(JsonScalar, usize), String> {
                 .to_string();
             Ok((JsonScalar::Str(n), j))
         }
+        b'[' => {
+            // Flat array of strings — our only non-scalar value shape.
+            let mut items = Vec::new();
+            let mut j = i + 1;
+            loop {
+                j = skip_ws(b, j);
+                if j >= b.len() {
+                    return Err(String::from("unterminated array"));
+                }
+                if b[j] == b']' {
+                    return Ok((JsonScalar::List(items), j + 1));
+                }
+                if b[j] != b'"' {
+                    return Err(format!("expected '\"' in array at byte {}", j));
+                }
+                let (s, k) = parse_string(b, j)?;
+                items.push(s);
+                j = skip_ws(b, k);
+                if j < b.len() && b[j] == b',' {
+                    j += 1;
+                }
+            }
+        }
         _ => Err(format!("unexpected byte {} at {}", b[i], i)),
     }
 }
@@ -318,16 +356,20 @@ fn run_read(req: &Request) -> Result<(), String> {
 
 fn run_send(req: &Request) -> Result<(), String> {
     let addr = req.address.as_ref().ok_or("send: --address (from) required")?;
-    let to = req.to.as_ref().ok_or("send: --to required")?;
+    if req.to.is_empty() {
+        return Err(String::from("send: at least one --to required"));
+    }
     let subject = req.subject.as_deref().unwrap_or("");
     let body_text = req.body.as_deref().unwrap_or("");
     let smtp = req
         .smtp_server
         .clone()
-        .unwrap_or_else(|| default_smtp_for(to));
+        .unwrap_or_else(|| default_smtp_for(&req.to[0]));
     let payload = format!(
-        "{{\"to\":\"{}\",\"subject\":\"{}\",\"body\":\"{}\",\"smtp_server\":\"{}\"}}",
-        escape_json(to),
+        "{{\"to\":{},\"cc\":{},\"bcc\":{},\"subject\":\"{}\",\"body\":\"{}\",\"smtp_server\":\"{}\"}}",
+        json_string_array(&req.to),
+        json_string_array(&req.cc),
+        json_string_array(&req.bcc),
         escape_json(subject),
         escape_json(body_text),
         escape_json(&smtp),
@@ -336,6 +378,14 @@ fn run_send(req: &Request) -> Result<(), String> {
     let body = http(req, "POST", &path, Some(&payload))?;
     out(&format!("{}\n", body));
     Ok(())
+}
+
+fn json_string_array(items: &[String]) -> String {
+    let parts: Vec<String> = items
+        .iter()
+        .map(|s| format!("\"{}\"", escape_json(s)))
+        .collect();
+    format!("[{}]", parts.join(","))
 }
 
 /// If the user didn't specify --smtp, infer from the recipient's domain.
