@@ -372,7 +372,13 @@ fn handle_post_message(request_str: &str, mailbox_id: &str) -> Vec<u8> {
 
 /// `POST /v1/mailboxes/<addr>/send` — deliver a message via SMTP. The
 /// sender (`from`) is the address in the URL path; the body provides
-/// `to`, `subject`, `body`, and an optional `smtp_server` override.
+/// `to`, optional `cc` + `bcc`, `subject`, `body`, and an optional
+/// `smtp_server` override. `to`, `cc`, `bcc` may each be a JSON array
+/// of addresses; `to` also accepts a bare string for back-compat.
+///
+/// All recipients (to + cc + bcc) are issued as RCPT TO commands. The
+/// To and Cc headers are written into the message; Bcc deliberately is
+/// not, so blind-cc recipients aren't visible to other recipients.
 ///
 /// Sender-copy is *not* implicitly recorded. If the sender wants the
 /// message in their own mailbox they should Bcc themselves, which goes
@@ -386,7 +392,9 @@ fn handle_send(request_str: &str, from: &str, dkim_private_key_pem: &str) -> Vec
 
     let parsed = parse_simple_json_object(body);
     let get = |k: &str| parsed.iter().find(|(kk, _)| kk == k).map(|(_, v)| v.clone()).unwrap_or_default();
-    let to = get("to");
+    let to_list = parse_string_or_array(body, "to");
+    let cc_list = parse_string_or_array(body, "cc");
+    let bcc_list = parse_string_or_array(body, "bcc");
     let subject = get("subject");
     let msg_body = get("body");
     let smtp_server = {
@@ -394,11 +402,20 @@ fn handle_send(request_str: &str, from: &str, dkim_private_key_pem: &str) -> Vec
         if s.is_empty() { String::from("localhost:25") } else { s }
     };
 
-    if to.is_empty() {
+    if to_list.is_empty() {
         return http_response(400, "application/json", br#"{"error":"to is required"}"#.to_vec());
     }
 
-    if let Err(e) = smtp_deliver(&smtp_server, from, &to, &subject, &msg_body, dkim_private_key_pem) {
+    if let Err(e) = smtp_deliver(
+        &smtp_server,
+        from,
+        &to_list,
+        &cc_list,
+        &bcc_list,
+        &subject,
+        &msg_body,
+        dkim_private_key_pem,
+    ) {
         log(format!("[inbox-api] smtp deliver failed: {}", e));
         let body = format!(r#"{{"error":"smtp deliver failed: {}"}}"#, json_escape(&e));
         return http_response(502, "application/json", body.into_bytes());
@@ -415,7 +432,9 @@ fn handle_send(request_str: &str, from: &str, dkim_private_key_pem: &str) -> Vec
 fn smtp_deliver(
     server_addr: &str,
     from: &str,
-    to: &str,
+    to_list: &[String],
+    cc_list: &[String],
+    bcc_list: &[String],
     subject: &str,
     body: &str,
     dkim_private_key_pem: &str,
@@ -429,7 +448,16 @@ fn smtp_deliver(
         e
     })?;
 
-    let result = smtp_session(&conn, from, to, subject, body, dkim_private_key_pem);
+    let result = smtp_session(
+        &conn,
+        from,
+        to_list,
+        cc_list,
+        bcc_list,
+        subject,
+        body,
+        dkim_private_key_pem,
+    );
     let _ = tcp_close(conn);
     result
 }
@@ -437,14 +465,18 @@ fn smtp_deliver(
 fn smtp_session(
     conn: &str,
     from: &str,
-    to: &str,
+    to_list: &[String],
+    cc_list: &[String],
+    bcc_list: &[String],
     subject: &str,
     body: &str,
     dkim_private_key_pem: &str,
 ) -> Result<(), String> {
     smtp_command(conn, "EHLO inbox.local\r\n", 250)?;
     smtp_command(conn, &format!("MAIL FROM:<{}>\r\n", from), 250)?;
-    smtp_command(conn, &format!("RCPT TO:<{}>\r\n", to), 250)?;
+    for rcpt in to_list.iter().chain(cc_list.iter()).chain(bcc_list.iter()) {
+        smtp_command(conn, &format!("RCPT TO:<{}>\r\n", rcpt), 250)?;
+    }
     smtp_command(conn, "DATA\r\n", 354)?;
 
     // Build the headers (without DKIM-Signature yet) + body. DKIM signs the
@@ -456,7 +488,10 @@ fn smtp_session(
     // own. Message-ID is technically optional per RFC 5322.
     let mut headers = String::new();
     headers.push_str(&format!("From: {}\r\n", from));
-    headers.push_str(&format!("To: {}\r\n", to));
+    headers.push_str(&format!("To: {}\r\n", to_list.join(", ")));
+    if !cc_list.is_empty() {
+        headers.push_str(&format!("Cc: {}\r\n", cc_list.join(", ")));
+    }
     headers.push_str(&format!("Subject: {}\r\n", subject));
     headers.push_str("MIME-Version: 1.0\r\n");
     headers.push_str("Content-Type: text/plain; charset=utf-8\r\n");
@@ -468,11 +503,17 @@ fn smtp_session(
         body_crlf.push_str("\r\n");
     }
 
+    let signed_headers: &[&str] = if cc_list.is_empty() {
+        &["from", "to", "subject"]
+    } else {
+        &["from", "to", "cc", "subject"]
+    };
+
     let dkim_signature = dkim::sign_message(
         dkim_private_key_pem,
         dkim::SELECTOR,
         dkim::DOMAIN,
-        &["from", "to", "subject"],
+        signed_headers,
         &headers,
         body_crlf.as_bytes(),
     )?;
@@ -723,6 +764,91 @@ fn json_escape(s: &str) -> String {
     out
 }
 
+/// Find `"<key>":` in `s` and parse its value as a list of strings.
+/// Accepts either a bare string (returns a single-element vec) or a
+/// JSON array of strings. Returns an empty vec if the key is missing
+/// or the value is not a recognized shape. Companion to
+/// `parse_simple_json_object`, which only handles flat string values.
+fn parse_string_or_array(s: &str, key: &str) -> Vec<String> {
+    let needle = format!(r#""{}":"#, key);
+    let Some(i) = s.find(&needle) else { return Vec::new() };
+    let after = s[i + needle.len()..].trim_start();
+    let bytes = after.as_bytes();
+    if bytes.is_empty() {
+        return Vec::new();
+    }
+    match bytes[0] {
+        b'"' => {
+            let mut item = Vec::new();
+            let mut j = 1;
+            while j < bytes.len() && bytes[j] != b'"' {
+                if bytes[j] == b'\\' && j + 1 < bytes.len() {
+                    let esc = match bytes[j + 1] {
+                        b'"' => b'"',
+                        b'\\' => b'\\',
+                        b'n' => b'\n',
+                        b'r' => b'\r',
+                        b't' => b'\t',
+                        other => other,
+                    };
+                    item.push(esc);
+                    j += 2;
+                } else {
+                    item.push(bytes[j]);
+                    j += 1;
+                }
+            }
+            let s = String::from_utf8(item).unwrap_or_default();
+            if s.is_empty() { Vec::new() } else { alloc::vec![s] }
+        }
+        b'[' => {
+            let mut out: Vec<String> = Vec::new();
+            let mut j = 1;
+            loop {
+                while j < bytes.len()
+                    && matches!(bytes[j], b' ' | b'\t' | b'\n' | b'\r' | b',')
+                {
+                    j += 1;
+                }
+                if j >= bytes.len() || bytes[j] == b']' {
+                    return out;
+                }
+                if bytes[j] != b'"' {
+                    return out;
+                }
+                j += 1;
+                let mut item = Vec::new();
+                while j < bytes.len() && bytes[j] != b'"' {
+                    if bytes[j] == b'\\' && j + 1 < bytes.len() {
+                        let esc = match bytes[j + 1] {
+                            b'"' => b'"',
+                            b'\\' => b'\\',
+                            b'n' => b'\n',
+                            b'r' => b'\r',
+                            b't' => b'\t',
+                            other => other,
+                        };
+                        item.push(esc);
+                        j += 2;
+                    } else {
+                        item.push(bytes[j]);
+                        j += 1;
+                    }
+                }
+                if j < bytes.len() {
+                    j += 1;
+                }
+                if let Ok(s) = String::from_utf8(item) {
+                    if !s.is_empty() {
+                        out.push(s);
+                    }
+                }
+            }
+        }
+        _ => Vec::new(),
+    }
+}
+
 /// Minimal JSON parser: flat object with string values only.
 /// Returns Vec<(key, value)> in source order. Unrecognized syntax → empty Vec.
 fn parse_simple_json_object(s: &str) -> Vec<(String, String)> {
@@ -767,7 +893,44 @@ fn parse_simple_json_object(s: &str) -> Vec<(String, String)> {
         while i < chars.len() && chars[i].is_whitespace() {
             i += 1;
         }
-        if i >= chars.len() || chars[i] != '"' {
+        if i >= chars.len() {
+            return out;
+        }
+        // Skip non-string values (e.g. JSON arrays) — those are parsed
+        // out of band by helpers like `parse_string_or_array`. We still
+        // want to keep parsing later keys.
+        if chars[i] == '[' {
+            let mut depth = 1;
+            i += 1;
+            while i < chars.len() && depth > 0 {
+                match chars[i] {
+                    '[' => {
+                        depth += 1;
+                        i += 1;
+                    }
+                    ']' => {
+                        depth -= 1;
+                        i += 1;
+                    }
+                    '"' => {
+                        i += 1;
+                        while i < chars.len() && chars[i] != '"' {
+                            if chars[i] == '\\' && i + 1 < chars.len() {
+                                i += 2;
+                            } else {
+                                i += 1;
+                            }
+                        }
+                        if i < chars.len() {
+                            i += 1;
+                        }
+                    }
+                    _ => i += 1,
+                }
+            }
+            continue;
+        }
+        if chars[i] != '"' {
             return out;
         }
         i += 1;

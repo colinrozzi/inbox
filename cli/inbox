@@ -53,8 +53,10 @@ commands:
   new <addr>                                 register an address
   lookup <addr>                              look up an address
   read <addr> [--since N]                    read a mailbox
-  send <from> --to T [--subject S] [--body B] [--smtp HOST:PORT]
-                                             send a message
+  send <from> --to T [--to T2 ...] [--cc C ...] [--bcc B ...]
+                [--subject S] [--body B] [--smtp HOST:PORT]
+                                             send a message; --to/--cc/--bcc
+                                             may each be repeated
 EOF
   exit 1
 }
@@ -76,7 +78,8 @@ json_escape() {
   }' <<<"$1"
 }
 
-# Build the initial_state JSON. Fields are flat strings; numbers passed as strings too.
+# Build the initial_state JSON. Default: each value is JSON-string-encoded.
+# Keys prefixed `raw:` use the value verbatim (already-JSON, e.g. an array).
 build_state() {
   local cmd=$1; shift
   local args=("\"cmd\":\"$cmd\"")
@@ -84,10 +87,25 @@ build_state() {
   args+=("\"token\":\"$(json_escape "$INBOX_TOKEN")\"")
   while [ $# -gt 0 ]; do
     local key=$1 val=$2; shift 2
-    args+=("\"$key\":\"$(json_escape "$val")\"")
+    if [[ "$key" == raw:* ]]; then
+      args+=("\"${key#raw:}\":$val")
+    else
+      args+=("\"$key\":\"$(json_escape "$val")\"")
+    fi
   done
   local IFS=,
   printf '{%s}' "${args[*]}"
+}
+
+# Build a JSON array of strings from positional args. Empty → "[]".
+json_array() {
+  local out="[" sep=""
+  local v
+  for v in "$@"; do
+    out+="${sep}\"$(json_escape "$v")\""
+    sep=","
+  done
+  printf '%s]' "$out"
 }
 
 # Parse subcommand args, build the state JSON.
@@ -118,18 +136,25 @@ case "$cmd" in
   send)
     [ $# -lt 1 ] && usage
     from=$1; shift
-    to= subject= body= smtp=
+    to=() cc=() bcc=()
+    subject= body= smtp=
     while [ $# -gt 0 ]; do
       case "$1" in
-        --to) to=$2; shift 2 ;;
+        --to) to+=("$2"); shift 2 ;;
+        --cc) cc+=("$2"); shift 2 ;;
+        --bcc) bcc+=("$2"); shift 2 ;;
         --subject) subject=$2; shift 2 ;;
         --body) body=$2; shift 2 ;;
         --smtp) smtp=$2; shift 2 ;;
         *) usage ;;
       esac
     done
-    [ -z "$to" ] && { echo "send: --to required" >&2; exit 2; }
-    args=(address "$from" to "$to" subject "$subject" body "$body")
+    [ ${#to[@]} -lt 1 ] && { echo "send: at least one --to required" >&2; exit 2; }
+    to_json=$(json_array "${to[@]}")
+    cc_json=$(json_array ${cc[@]+"${cc[@]}"})
+    bcc_json=$(json_array ${bcc[@]+"${bcc[@]}"})
+    args=(address "$from" raw:to "$to_json" raw:cc "$cc_json" raw:bcc "$bcc_json"
+          subject "$subject" body "$body")
     [ -n "$smtp" ] && args+=(smtp_server "$smtp")
     state=$(build_state send "${args[@]}")
     ;;
