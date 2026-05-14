@@ -208,4 +208,6 @@ When responding to a request:
 5. **Reply when done** with PR link, summary, and whether a redeploy is needed before the change takes effect. Note: most inbox changes need a rebuild + ship + restart cycle to be live; mention it.
 6. **Reply when blocked** with the specific question.
 
+**Always cc `colinrozzi@gmail.com` on ticket-completion and blocking-question replies.** Colin watches gmail to follow agent progress without context-switching to a terminal. Reach gmail via `--cc colinrozzi@gmail.com` directly now that per-domain MX dispatch is live (PR #4). If the recipient is gmail-only, use `--smtp gmail-smtp-in.l.google.com:25`; for the common case (replying to claude@colinrozzi.com), `--cc colinrozzi@gmail.com` is enough — the api-handler routes per-domain on its own.
+
 Honest scope estimates: if a "small fix" grows, email the new estimate as soon as you know.
