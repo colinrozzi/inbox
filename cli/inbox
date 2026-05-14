@@ -52,7 +52,8 @@ commands:
   list                                       list registered addresses
   new <addr>                                 register an address
   lookup <addr>                              look up an address
-  read <addr> [--since N]                    read a mailbox
+  read <addr> [--since N] [--full]           read a mailbox
+                                             (--full bypasses the quoted-history strip)
   send <from> --to T [--to T2 ...] [--cc C ...] [--bcc B ...]
                 [--subject S] [--body B] [--smtp HOST:PORT]
                                              send a message; --to/--cc/--bcc
@@ -125,13 +126,15 @@ case "$cmd" in
     [ $# -lt 1 ] && usage
     addr=$1; shift
     since=0
+    full=false
     while [ $# -gt 0 ]; do
       case "$1" in
         --since) since=$2; shift 2 ;;
+        --full) full=true; shift ;;
         *) usage ;;
       esac
     done
-    state=$(build_state read address "$addr" since "$since")
+    state=$(build_state read address "$addr" since "$since" full "$full")
     ;;
   send)
     [ $# -lt 1 ] && usage
