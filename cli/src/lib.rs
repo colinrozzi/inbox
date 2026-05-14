@@ -115,6 +115,7 @@ struct Request {
     body: Option<String>,
     smtp_server: Option<String>,
     since: Option<u64>,
+    full: bool,
 }
 
 /// Parse a JSON object like {"cmd":"read","address":"claude@..."}.
@@ -132,6 +133,7 @@ fn parse_request(s: &str) -> Result<Request, String> {
         body: None,
         smtp_server: None,
         since: None,
+        full: false,
     };
     for (k, v) in parse_json_object(s)? {
         match k.as_str() {
@@ -146,6 +148,7 @@ fn parse_request(s: &str) -> Result<Request, String> {
             "body" => req.body = Some(v.as_str().to_string()),
             "smtp_server" => req.smtp_server = Some(v.as_str().to_string()),
             "since" => req.since = v.as_str().parse::<u64>().ok(),
+            "full" => req.full = v.as_str() == "true",
             _ => {}
         }
     }
@@ -350,7 +353,7 @@ fn run_read(req: &Request) -> Result<(), String> {
     let since = req.since.unwrap_or(0);
     let path = format!("/v1/mailboxes/{}/inbox?since={}", url_encode(addr), since);
     let body = http(req, "GET", &path, None)?;
-    print_messages(&body);
+    print_messages(&body, req.full);
     Ok(())
 }
 
@@ -502,7 +505,7 @@ fn err(s: &str) {
     let _ = write_stderr(s.as_bytes().to_vec());
 }
 
-fn print_messages(json: &str) {
+fn print_messages(json: &str, full: bool) {
     // Find each "messages":[ ... ] block; emit one entry per message.
     let msgs = extract_array(json, "messages");
     for m in &msgs {
@@ -515,17 +518,61 @@ fn print_messages(json: &str) {
             "id={}  from={}  to={}  subject={:?}\n",
             id, from, to, subj
         ));
-        for line in body.split('\n').take(20) {
+        let display: &str = if full {
+            &body
+        } else {
+            strip_quoted_history(&body)
+        };
+        let lines_seen = display.split('\n').count();
+        for line in display.split('\n').take(20) {
             out(&format!("      {}\n", line));
         }
-        let total = body.split('\n').count();
-        if total > 20 {
-            out(&format!("      ... ({} more lines)\n", total - 20));
+        if lines_seen > 20 {
+            out(&format!("      ... ({} more lines)\n", lines_seen - 20));
+        }
+        if !full && display.len() < body.len() {
+            out("      [quoted history hidden; --full to show]\n");
         }
         out("\n");
     }
     let next = pluck_number(json, "next_cursor");
     out(&format!("next_cursor={}  count={}\n", next, msgs.len()));
+}
+
+/// Return the visible portion of a reply body, stripping the quoted
+/// history block that gmail / outlook append below the new content.
+/// Conservative: only strips when a recognizable separator is matched.
+///   - Gmail: a line starting with "On " and ending with " wrote:"
+///   - Outlook: a line whose content is exactly "-----Original Message-----"
+/// Trailing whitespace/blank lines are trimmed after stripping. Returns
+/// the input unchanged if no separator is found.
+fn strip_quoted_history(body: &str) -> &str {
+    let mut offset = 0usize;
+    let mut cut_at: Option<usize> = None;
+    for line in body.split('\n') {
+        let trimmed = line.trim_end_matches('\r').trim();
+        if is_gmail_attribution(trimmed) || is_outlook_separator(trimmed) {
+            cut_at = Some(offset);
+            break;
+        }
+        // +1 accounts for the '\n' that split() consumed (only correct
+        // when there's a following segment; if this is the last segment
+        // we won't read past it).
+        offset += line.len() + 1;
+    }
+    let end = match cut_at {
+        Some(i) => i,
+        None => return body,
+    };
+    body[..end].trim_end_matches(|c: char| c == '\n' || c == '\r' || c == ' ' || c == '\t')
+}
+
+fn is_gmail_attribution(line: &str) -> bool {
+    line.starts_with("On ") && line.ends_with(" wrote:")
+}
+
+fn is_outlook_separator(line: &str) -> bool {
+    line.eq_ignore_ascii_case("-----Original Message-----")
 }
 
 /// Find `"key":"..."` and return the unescaped contents. Tolerant about
