@@ -54,6 +54,9 @@ pack_types! {
             get-by-label: func(store-id: string, label: string) -> result<option<string>, string>,
             store-at-label: func(store-id: string, label: string, content: list<u8>) -> result<string, string>,
         }
+        theater:simple/timer {
+            now: func() -> u64,
+        }
     }
     exports {
         theater:simple/actor.init: func(state: value, address: string) -> result<mailbox-state, string>,
@@ -73,6 +76,9 @@ fn store_get_by_label(store_id: String, label: String) -> Result<Option<String>,
 
 #[import(module = "theater:simple/store", name = "store-at-label")]
 fn store_store_at_label(store_id: String, label: String, content: Vec<u8>) -> Result<String, String>;
+
+#[import(module = "theater:simple/timer", name = "now")]
+fn timer_now() -> u64;
 
 fn label_for(address: &str) -> String {
     let mut s = String::from("mailbox:");
@@ -146,7 +152,7 @@ fn put_message(
         to,
         subject,
         body,
-        received_at: 0, // TODO: wire up clock import once theater timer.now() works from pack actors
+        received_at: timer_now(),
     };
     state.messages.push(msg);
     log(format!("[inbox-mailbox] stored message id={} for {}", id, state.address));
