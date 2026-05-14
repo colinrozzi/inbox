@@ -18,6 +18,7 @@ use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use packr_guest::{export, import, pack_types, GraphValue, Value};
+use serde::{Deserialize, Serialize};
 
 packr_guest::setup_guest!();
 
@@ -107,6 +108,139 @@ const STORE_ID: &str = "inbox";
 const DKIM_KEY_LABEL: &str = "dkim-key";
 const BEARER_TOKEN_LABEL: &str = "api-bearer-token";
 
+// ============================================================================
+// API request/response types — all JSON shapes the handler reads or writes.
+// ============================================================================
+
+#[derive(Deserialize)]
+struct NewMailboxRequest {
+    address: String,
+}
+
+#[derive(Serialize)]
+struct MailboxInfo {
+    address: String,
+    mailbox_id: String,
+}
+
+#[derive(Serialize)]
+struct MailboxList {
+    mailboxes: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct PutMessageRequest {
+    from: String,
+    to: String,
+    #[serde(default)]
+    subject: String,
+    #[serde(default)]
+    body: String,
+}
+
+#[derive(Serialize)]
+struct MessageStored {
+    id: u64,
+}
+
+#[derive(Deserialize)]
+struct SendRequest {
+    #[serde(default, deserialize_with = "deserialize_string_or_list")]
+    to: Vec<String>,
+    #[serde(default)]
+    cc: Vec<String>,
+    #[serde(default)]
+    bcc: Vec<String>,
+    #[serde(default)]
+    subject: String,
+    #[serde(default)]
+    body: String,
+    #[serde(default)]
+    smtp_server: Option<String>,
+}
+
+/// `to` accepts either a single string or a list of strings, per the
+/// back-compat clause introduced in PR #1. Empty string -> empty list.
+fn deserialize_string_or_list<'de, D>(d: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Either {
+        String(String),
+        List(Vec<String>),
+    }
+    match Option::<Either>::deserialize(d)? {
+        None => Ok(Vec::new()),
+        Some(Either::String(s)) if s.is_empty() => Ok(Vec::new()),
+        Some(Either::String(s)) => Ok(alloc::vec![s]),
+        Some(Either::List(l)) => Ok(l),
+    }
+}
+
+#[derive(Serialize)]
+struct SendResponse {
+    status: &'static str,
+    delivered: Vec<String>,
+    failed: Vec<FailedRecipient>,
+}
+
+#[derive(Serialize)]
+struct FailedRecipient {
+    recipient: String,
+    error: String,
+}
+
+#[derive(Serialize)]
+struct InboxMessage {
+    id: u64,
+    from: String,
+    to: String,
+    subject: String,
+    body: String,
+    received_at: u64,
+}
+
+#[derive(Serialize)]
+struct InboxPageJson {
+    messages: Vec<InboxMessage>,
+    next_cursor: u64,
+}
+
+#[derive(Serialize)]
+struct ErrorBody<'a> {
+    error: &'a str,
+}
+
+/// 400/4xx/5xx response with `{"error": ...}`.
+fn error_response(status: u16, error: &str) -> Vec<u8> {
+    let body = serde_json::to_vec(&ErrorBody { error })
+        .unwrap_or_else(|_| br#"{"error":"serialization failed"}"#.to_vec());
+    http_response(status, "application/json", body)
+}
+
+/// Serialize `value` and return a successful HTTP response, or fall
+/// back to a 500 if serialization fails (shouldn't happen for our types).
+fn json_response<T: Serialize>(status: u16, value: &T) -> Vec<u8> {
+    match serde_json::to_vec(value) {
+        Ok(body) => http_response(status, "application/json", body),
+        Err(e) => error_response(500, &format!("response serialization failed: {}", e)),
+    }
+}
+
+/// Pull the JSON body out of an HTTP request string and deserialize it
+/// into `T`. Returns an HTTP response (400) on either step's failure;
+/// callers `?`-propagate that as the final response.
+fn parse_body<T: serde::de::DeserializeOwned>(request_str: &str) -> Result<T, Vec<u8>> {
+    let body = match request_str.find("\r\n\r\n") {
+        Some(i) => &request_str[i + 4..],
+        None => return Err(error_response(400, "missing body")),
+    };
+    serde_json::from_str::<T>(body)
+        .map_err(|e| error_response(400, &format!("invalid request body: {}", e)))
+}
+
 fn load_label_as_string(label: &str) -> Result<String, String> {
     let content_ref = store_get_by_label(String::from(STORE_ID), String::from(label))
         .map_err(|e| format!("{} lookup failed: {}", label, e))?
@@ -165,11 +299,11 @@ fn route(
 ) -> Vec<u8> {
     let request_str = match core::str::from_utf8(request) {
         Ok(s) => s,
-        Err(_) => return http_response(400, "application/json", br#"{"error":"non-utf8 request"}"#.to_vec()),
+        Err(_) => return error_response(400, "non-utf8 request"),
     };
 
     if extract_bearer(request_str) != Some(bearer_token) {
-        return http_response(401, "application/json", br#"{"error":"unauthorized"}"#.to_vec());
+        return error_response(401, "unauthorized");
     }
 
     let first_line = request_str.lines().next().unwrap_or("");
@@ -203,72 +337,56 @@ fn route(
         // Resolve the address → mailbox id via the router.
         let mailbox_id = match resolve_mailbox(router_id, &address) {
             Ok(Some(id)) => id,
-            Ok(None) => {
-                return http_response(
-                    404,
-                    "application/json",
-                    format!(r#"{{"error":"unknown address: {}"}}"#, json_escape(&address))
-                        .into_bytes(),
-                );
-            }
-            Err(e) => {
-                return http_response(
-                    500,
-                    "application/json",
-                    format!(r#"{{"error":"router rpc failed: {}"}}"#, json_escape(&e))
-                        .into_bytes(),
-                );
-            }
+            Ok(None) => return error_response(404, &format!("unknown address: {}", address)),
+            Err(e) => return error_response(500, &format!("router rpc failed: {}", e)),
         };
 
         return match (method, sub) {
-            ("GET", "") => {
-                let body = format!(
-                    r#"{{"address":"{}","mailbox_id":"{}"}}"#,
-                    json_escape(&address),
-                    json_escape(&mailbox_id)
-                );
-                http_response(200, "application/json", body.into_bytes())
-            }
+            ("GET", "") => json_response(
+                200,
+                &MailboxInfo {
+                    address,
+                    mailbox_id,
+                },
+            ),
             ("GET", "inbox") => handle_inbox(query, &mailbox_id),
             ("POST", "messages") => handle_post_message(request_str, &mailbox_id),
             ("POST", "send") => handle_send(request_str, &address, dkim_private_key_pem),
-            _ => http_response(404, "application/json", br#"{"error":"not found"}"#.to_vec()),
+            _ => error_response(404, "not found"),
         };
     }
 
-    http_response(404, "application/json", br#"{"error":"not found"}"#.to_vec())
+    error_response(404, "not found")
 }
 
 /// `POST /v1/mailboxes` — register a new address.
 fn handle_register_mailbox(request_str: &str, router_id: &str) -> Vec<u8> {
-    let body = match request_str.find("\r\n\r\n") {
-        Some(i) => &request_str[i + 4..],
-        None => return http_response(400, "application/json", br#"{"error":"missing body"}"#.to_vec()),
+    let req: NewMailboxRequest = match parse_body(request_str) {
+        Ok(r) => r,
+        Err(resp) => return resp,
     };
-    let parsed = parse_simple_json_object(body);
-    let address = parsed.iter().find(|(k, _)| k == "address").map(|(_, v)| v.clone()).unwrap_or_default();
-    if address.is_empty() {
-        return http_response(400, "application/json", br#"{"error":"address is required"}"#.to_vec());
+    if req.address.is_empty() {
+        return error_response(400, "address is required");
     }
 
     let result = rpc_call(
         router_id.to_string(),
         String::from("theater:inbox/router.register"),
-        Value::Tuple(alloc::vec![Value::String(address.clone())]),
+        Value::Tuple(alloc::vec![Value::String(req.address.clone())]),
         Value::Tuple(alloc::vec![]),
     );
     let mailbox_id = match unwrap_rpc_result(result) {
         Some(Value::String(id)) => id,
-        _ => return http_response(500, "application/json", br#"{"error":"router rpc failed"}"#.to_vec()),
+        _ => return error_response(500, "router rpc failed"),
     };
 
-    let body = format!(
-        r#"{{"address":"{}","mailbox_id":"{}"}}"#,
-        json_escape(&address),
-        json_escape(&mailbox_id)
-    );
-    http_response(201, "application/json", body.into_bytes())
+    json_response(
+        201,
+        &MailboxInfo {
+            address: req.address,
+            mailbox_id,
+        },
+    )
 }
 
 /// `GET /v1/mailboxes` — list all registered addresses.
@@ -281,24 +399,26 @@ fn handle_list_mailboxes(router_id: &str) -> Vec<u8> {
     );
     let bindings = match unwrap_rpc_result(result) {
         Some(Value::List { items, .. }) => items,
-        _ => return http_response(500, "application/json", br#"{"error":"router rpc failed"}"#.to_vec()),
+        _ => return error_response(500, "router rpc failed"),
     };
-    let parts: Vec<String> = bindings
+    let mailboxes: Vec<String> = bindings
         .iter()
         .map(|b| match b {
-            Value::Record { fields, .. } => {
-                let addr = fields
-                    .iter()
-                    .find(|(k, _)| k == "address")
-                    .and_then(|(_, v)| if let Value::String(s) = v { Some(s.clone()) } else { None })
-                    .unwrap_or_default();
-                format!(r#""{}""#, json_escape(&addr))
-            }
-            _ => String::from(r#""""#),
+            Value::Record { fields, .. } => fields
+                .iter()
+                .find(|(k, _)| k == "address")
+                .and_then(|(_, v)| {
+                    if let Value::String(s) = v {
+                        Some(s.clone())
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or_default(),
+            _ => String::new(),
         })
         .collect();
-    let body = format!(r#"{{"mailboxes":[{}]}}"#, parts.join(","));
-    http_response(200, "application/json", body.into_bytes())
+    json_response(200, &MailboxList { mailboxes })
 }
 
 /// Look up a mailbox actor ID by address through the router.
@@ -335,48 +455,38 @@ fn handle_inbox(query: &str, mailbox_id: &str) -> Vec<u8> {
 
     let page = match unwrap_rpc_result(result) {
         Some(p) => p,
-        None => return http_response(500, "application/json", br#"{"error":"mailbox rpc failed"}"#.to_vec()),
+        None => return error_response(500, "mailbox rpc failed"),
     };
-    let json = inbox_page_to_json(&page);
-    http_response(200, "application/json", json.into_bytes())
+    json_response(200, &page_value_to_json(&page))
 }
 
 fn handle_post_message(request_str: &str, mailbox_id: &str) -> Vec<u8> {
-    let body = match request_str.find("\r\n\r\n") {
-        Some(i) => &request_str[i + 4..],
-        None => return http_response(400, "application/json", br#"{"error":"missing body"}"#.to_vec()),
+    let req: PutMessageRequest = match parse_body(request_str) {
+        Ok(r) => r,
+        Err(resp) => return resp,
     };
-
-    // Tiny JSON object parser — supports flat string-valued objects only.
-    let parsed = parse_simple_json_object(body);
-    let from = parsed.iter().find(|(k, _)| k == "from").map(|(_, v)| v.clone()).unwrap_or_default();
-    let to = parsed.iter().find(|(k, _)| k == "to").map(|(_, v)| v.clone()).unwrap_or_default();
-    let subject = parsed.iter().find(|(k, _)| k == "subject").map(|(_, v)| v.clone()).unwrap_or_default();
-    let msg_body = parsed.iter().find(|(k, _)| k == "body").map(|(_, v)| v.clone()).unwrap_or_default();
-
-    if from.is_empty() || to.is_empty() {
-        return http_response(400, "application/json", br#"{"error":"from and to are required"}"#.to_vec());
+    if req.from.is_empty() || req.to.is_empty() {
+        return error_response(400, "from and to are required");
     }
 
     let result = rpc_call(
         mailbox_id.to_string(),
         String::from("theater:inbox/mailbox.put-message"),
         Value::Tuple(alloc::vec![
-            Value::String(from),
-            Value::String(to),
-            Value::String(subject),
-            Value::String(msg_body),
+            Value::String(req.from),
+            Value::String(req.to),
+            Value::String(req.subject),
+            Value::String(req.body),
         ]),
         Value::Tuple(alloc::vec![]),
     );
 
     let id = match unwrap_rpc_result(result) {
         Some(Value::U64(n)) => n,
-        _ => return http_response(500, "application/json", br#"{"error":"mailbox rpc failed"}"#.to_vec()),
+        _ => return error_response(500, "mailbox rpc failed"),
     };
 
-    let json = format!(r#"{{"id":{}}}"#, id);
-    http_response(201, "application/json", json.into_bytes())
+    json_response(201, &MessageStored { id })
 }
 
 /// `POST /v1/mailboxes/<addr>/send` — deliver a message via SMTP. The
@@ -402,43 +512,32 @@ fn handle_post_message(request_str: &str, mailbox_id: &str) -> Vec<u8> {
 /// through the same SMTP code path as any external recipient — including
 /// loopback when the address is on this server's domain.
 fn handle_send(request_str: &str, from: &str, dkim_private_key_pem: &str) -> Vec<u8> {
-    let body = match request_str.find("\r\n\r\n") {
-        Some(i) => &request_str[i + 4..],
-        None => return http_response(400, "application/json", br#"{"error":"missing body"}"#.to_vec()),
+    let req: SendRequest = match parse_body(request_str) {
+        Ok(r) => r,
+        Err(resp) => return resp,
     };
 
-    let parsed = parse_simple_json_object(body);
-    let get = |k: &str| parsed.iter().find(|(kk, _)| kk == k).map(|(_, v)| v.clone()).unwrap_or_default();
-    let to_list = parse_string_or_array(body, "to");
-    let cc_list = parse_string_or_array(body, "cc");
-    let bcc_list = parse_string_or_array(body, "bcc");
-    let subject = get("subject");
-    let msg_body = get("body");
-    let fallback_server = {
-        let s = get("smtp_server");
-        if s.is_empty() { None } else { Some(s) }
-    };
-
-    if to_list.is_empty() {
-        return http_response(400, "application/json", br#"{"error":"to is required"}"#.to_vec());
+    if req.to.is_empty() {
+        return error_response(400, "to is required");
     }
 
     // Group every recipient by the SMTP server that should handle it.
     // Unresolvable recipients (no domain match, no fallback) go straight
     // into the `failed` list — we still attempt the others.
+    let fallback_server = req.smtp_server.as_deref();
     let mut groups: Vec<(String, Vec<String>)> = Vec::new();
     let mut delivered: Vec<String> = Vec::new();
-    let mut failed: Vec<(String, String)> = Vec::new();
-    for rcpt in to_list.iter().chain(cc_list.iter()).chain(bcc_list.iter()) {
-        match resolve_smtp_server(rcpt, fallback_server.as_deref()) {
+    let mut failed: Vec<FailedRecipient> = Vec::new();
+    for rcpt in req.to.iter().chain(req.cc.iter()).chain(req.bcc.iter()) {
+        match resolve_smtp_server(rcpt, fallback_server) {
             Some(server) => match groups.iter_mut().find(|(s, _)| s == &server) {
                 Some((_, list)) => list.push(rcpt.clone()),
                 None => groups.push((server, alloc::vec![rcpt.clone()])),
             },
-            None => failed.push((
-                rcpt.clone(),
-                format!("no smtp server for domain (and no smtp_server fallback)"),
-            )),
+            None => failed.push(FailedRecipient {
+                recipient: rcpt.clone(),
+                error: String::from("no smtp server for domain (and no smtp_server fallback)"),
+            }),
         }
     }
 
@@ -447,10 +546,10 @@ fn handle_send(request_str: &str, from: &str, dkim_private_key_pem: &str) -> Vec
             server,
             from,
             group_rcpts,
-            &to_list,
-            &cc_list,
-            &subject,
-            &msg_body,
+            &req.to,
+            &req.cc,
+            &req.subject,
+            &req.body,
             dkim_private_key_pem,
         ) {
             Ok(()) => delivered.extend(group_rcpts.iter().cloned()),
@@ -460,7 +559,10 @@ fn handle_send(request_str: &str, from: &str, dkim_private_key_pem: &str) -> Vec
                     server, e
                 ));
                 for r in group_rcpts {
-                    failed.push((r.clone(), e.clone()));
+                    failed.push(FailedRecipient {
+                        recipient: r.clone(),
+                        error: e.clone(),
+                    });
                 }
             }
         }
@@ -473,27 +575,15 @@ fn handle_send(request_str: &str, from: &str, dkim_private_key_pem: &str) -> Vec
     } else {
         "partial"
     };
-
-    let delivered_json = json_array_of_strings(&delivered);
-    let failed_json = {
-        let parts: Vec<String> = failed
-            .iter()
-            .map(|(r, e)| {
-                format!(
-                    r#"{{"recipient":"{}","error":"{}"}}"#,
-                    json_escape(r),
-                    json_escape(e)
-                )
-            })
-            .collect();
-        format!("[{}]", parts.join(","))
-    };
-    let body = format!(
-        r#"{{"status":"{}","delivered":{},"failed":{}}}"#,
-        status, delivered_json, failed_json
-    );
     let http_status = if delivered.is_empty() { 502 } else { 200 };
-    http_response(http_status, "application/json", body.into_bytes())
+    json_response(
+        http_status,
+        &SendResponse {
+            status,
+            delivered,
+            failed,
+        },
+    )
 }
 
 /// Map a recipient address to the SMTP server we should deliver to.
@@ -507,14 +597,6 @@ fn resolve_smtp_server(addr: &str, fallback: Option<&str>) -> Option<String> {
         "gmail.com" => Some(String::from("gmail-smtp-in.l.google.com:25")),
         _ => fallback.map(String::from),
     }
-}
-
-fn json_array_of_strings(items: &[String]) -> String {
-    let parts: Vec<String> = items
-        .iter()
-        .map(|s| format!(r#""{}""#, json_escape(s)))
-        .collect();
-    format!("[{}]", parts.join(","))
 }
 
 // ============================================================================
@@ -806,54 +888,60 @@ fn http_response(status: u16, content_type: &str, body: Vec<u8>) -> Vec<u8> {
     out
 }
 
-fn inbox_page_to_json(page: &Value) -> String {
-    // page is a Record<inbox-page>{ messages: list<message>, next_cursor: u64 }
-    let (messages, next_cursor) = match page {
-        Value::Record { fields, .. } => {
-            let messages = fields.iter().find(|(k, _)| k == "messages").map(|(_, v)| v).cloned();
-            let next_cursor = fields.iter().find(|(k, _)| k == "next-cursor" || k == "next_cursor")
-                .and_then(|(_, v)| if let Value::U64(n) = v { Some(*n) } else { None })
-                .unwrap_or(0);
-            (messages, next_cursor)
-        }
-        _ => (None, 0),
-    };
-
-    let messages_json = match messages {
-        Some(Value::List { items, .. }) => {
-            let parts: Vec<String> = items.iter().map(message_to_json).collect();
-            format!("[{}]", parts.join(","))
-        }
-        _ => String::from("[]"),
-    };
-
-    format!(r#"{{"messages":{},"next_cursor":{}}}"#, messages_json, next_cursor)
-}
-
-fn message_to_json(msg: &Value) -> String {
-    let mut id = 0u64;
-    let mut from = String::new();
-    let mut to = String::new();
-    let mut subject = String::new();
-    let mut body = String::new();
-    let mut received_at = 0u64;
-    if let Value::Record { fields, .. } = msg {
+/// Convert the packr `inbox-page` record returned by the mailbox actor
+/// into a serde-serializable struct. Unknown fields are ignored; missing
+/// fields fall back to defaults.
+fn page_value_to_json(page: &Value) -> InboxPageJson {
+    let mut messages: Vec<InboxMessage> = Vec::new();
+    let mut next_cursor: u64 = 0;
+    if let Value::Record { fields, .. } = page {
         for (k, v) in fields {
-            match (k.as_str(), v) {
-                ("id", Value::U64(n)) => id = *n,
-                ("from", Value::String(s)) => from = s.clone(),
-                ("to", Value::String(s)) => to = s.clone(),
-                ("subject", Value::String(s)) => subject = s.clone(),
-                ("body", Value::String(s)) => body = s.clone(),
-                ("received-at", Value::U64(n)) | ("received_at", Value::U64(n)) => received_at = *n,
+            match k.as_str() {
+                "messages" => {
+                    if let Value::List { items, .. } = v {
+                        messages = items.iter().map(message_value_to_json).collect();
+                    }
+                }
+                "next-cursor" | "next_cursor" => {
+                    if let Value::U64(n) = v {
+                        next_cursor = *n;
+                    }
+                }
                 _ => {}
             }
         }
     }
-    format!(
-        r#"{{"id":{},"from":"{}","to":"{}","subject":"{}","body":"{}","received_at":{}}}"#,
-        id, json_escape(&from), json_escape(&to), json_escape(&subject), json_escape(&body), received_at
-    )
+    InboxPageJson {
+        messages,
+        next_cursor,
+    }
+}
+
+fn message_value_to_json(msg: &Value) -> InboxMessage {
+    let mut out = InboxMessage {
+        id: 0,
+        from: String::new(),
+        to: String::new(),
+        subject: String::new(),
+        body: String::new(),
+        received_at: 0,
+    };
+    if let Value::Record { fields, .. } = msg {
+        for (k, v) in fields {
+            match (k.as_str(), v) {
+                ("id", Value::U64(n)) => out.id = *n,
+                ("from", Value::String(s)) => out.from = s.clone(),
+                ("to", Value::String(s)) => out.to = s.clone(),
+                ("subject", Value::String(s)) => out.subject = s.clone(),
+                ("body", Value::String(s)) => out.body = s.clone(),
+                ("received-at", Value::U64(n)) | ("received_at", Value::U64(n)) => {
+                    out.received_at = *n
+                }
+                _ => {}
+            }
+        }
+    }
+    out
 }
 
 /// Minimal URL percent-decoder. Plus signs become spaces (`form-urlencoded`
@@ -888,212 +976,3 @@ fn url_decode(s: &str) -> String {
     String::from_utf8(out).unwrap_or_else(|_| s.to_string())
 }
 
-fn json_escape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
-        }
-    }
-    out
-}
-
-/// Find `"<key>":` in `s` and parse its value as a list of strings.
-/// Accepts either a bare string (returns a single-element vec) or a
-/// JSON array of strings. Returns an empty vec if the key is missing
-/// or the value is not a recognized shape. Companion to
-/// `parse_simple_json_object`, which only handles flat string values.
-fn parse_string_or_array(s: &str, key: &str) -> Vec<String> {
-    let needle = format!(r#""{}":"#, key);
-    let Some(i) = s.find(&needle) else { return Vec::new() };
-    let after = s[i + needle.len()..].trim_start();
-    let bytes = after.as_bytes();
-    if bytes.is_empty() {
-        return Vec::new();
-    }
-    match bytes[0] {
-        b'"' => {
-            let mut item = Vec::new();
-            let mut j = 1;
-            while j < bytes.len() && bytes[j] != b'"' {
-                if bytes[j] == b'\\' && j + 1 < bytes.len() {
-                    let esc = match bytes[j + 1] {
-                        b'"' => b'"',
-                        b'\\' => b'\\',
-                        b'n' => b'\n',
-                        b'r' => b'\r',
-                        b't' => b'\t',
-                        other => other,
-                    };
-                    item.push(esc);
-                    j += 2;
-                } else {
-                    item.push(bytes[j]);
-                    j += 1;
-                }
-            }
-            let s = String::from_utf8(item).unwrap_or_default();
-            if s.is_empty() { Vec::new() } else { alloc::vec![s] }
-        }
-        b'[' => {
-            let mut out: Vec<String> = Vec::new();
-            let mut j = 1;
-            loop {
-                while j < bytes.len()
-                    && matches!(bytes[j], b' ' | b'\t' | b'\n' | b'\r' | b',')
-                {
-                    j += 1;
-                }
-                if j >= bytes.len() || bytes[j] == b']' {
-                    return out;
-                }
-                if bytes[j] != b'"' {
-                    return out;
-                }
-                j += 1;
-                let mut item = Vec::new();
-                while j < bytes.len() && bytes[j] != b'"' {
-                    if bytes[j] == b'\\' && j + 1 < bytes.len() {
-                        let esc = match bytes[j + 1] {
-                            b'"' => b'"',
-                            b'\\' => b'\\',
-                            b'n' => b'\n',
-                            b'r' => b'\r',
-                            b't' => b'\t',
-                            other => other,
-                        };
-                        item.push(esc);
-                        j += 2;
-                    } else {
-                        item.push(bytes[j]);
-                        j += 1;
-                    }
-                }
-                if j < bytes.len() {
-                    j += 1;
-                }
-                if let Ok(s) = String::from_utf8(item) {
-                    if !s.is_empty() {
-                        out.push(s);
-                    }
-                }
-            }
-        }
-        _ => Vec::new(),
-    }
-}
-
-/// Minimal JSON parser: flat object with string values only.
-/// Returns Vec<(key, value)> in source order. Unrecognized syntax → empty Vec.
-fn parse_simple_json_object(s: &str) -> Vec<(String, String)> {
-    let mut out = Vec::new();
-    let s = s.trim();
-    let s = match s.strip_prefix('{').and_then(|s| s.strip_suffix('}')) {
-        Some(inner) => inner,
-        None => return out,
-    };
-    let chars: Vec<char> = s.chars().collect();
-    let mut i = 0;
-    while i < chars.len() {
-        // skip whitespace and commas
-        while i < chars.len() && (chars[i].is_whitespace() || chars[i] == ',') {
-            i += 1;
-        }
-        if i >= chars.len() {
-            break;
-        }
-        // expect "key"
-        if chars[i] != '"' {
-            return out;
-        }
-        i += 1;
-        let key_start = i;
-        while i < chars.len() && chars[i] != '"' {
-            if chars[i] == '\\' {
-                i += 1;
-            }
-            i += 1;
-        }
-        let key: String = chars[key_start..i].iter().collect();
-        i += 1; // skip closing "
-                // skip whitespace then ":"
-        while i < chars.len() && chars[i].is_whitespace() {
-            i += 1;
-        }
-        if i >= chars.len() || chars[i] != ':' {
-            return out;
-        }
-        i += 1;
-        while i < chars.len() && chars[i].is_whitespace() {
-            i += 1;
-        }
-        if i >= chars.len() {
-            return out;
-        }
-        // Skip non-string values (e.g. JSON arrays) — those are parsed
-        // out of band by helpers like `parse_string_or_array`. We still
-        // want to keep parsing later keys.
-        if chars[i] == '[' {
-            let mut depth = 1;
-            i += 1;
-            while i < chars.len() && depth > 0 {
-                match chars[i] {
-                    '[' => {
-                        depth += 1;
-                        i += 1;
-                    }
-                    ']' => {
-                        depth -= 1;
-                        i += 1;
-                    }
-                    '"' => {
-                        i += 1;
-                        while i < chars.len() && chars[i] != '"' {
-                            if chars[i] == '\\' && i + 1 < chars.len() {
-                                i += 2;
-                            } else {
-                                i += 1;
-                            }
-                        }
-                        if i < chars.len() {
-                            i += 1;
-                        }
-                    }
-                    _ => i += 1,
-                }
-            }
-            continue;
-        }
-        if chars[i] != '"' {
-            return out;
-        }
-        i += 1;
-        let mut value = String::new();
-        while i < chars.len() && chars[i] != '"' {
-            if chars[i] == '\\' && i + 1 < chars.len() {
-                let esc = chars[i + 1];
-                match esc {
-                    'n' => value.push('\n'),
-                    'r' => value.push('\r'),
-                    't' => value.push('\t'),
-                    '"' => value.push('"'),
-                    '\\' => value.push('\\'),
-                    c => value.push(c),
-                }
-                i += 2;
-            } else {
-                value.push(chars[i]);
-                i += 1;
-            }
-        }
-        i += 1; // skip closing "
-        out.push((key, value));
-    }
-    out
-}

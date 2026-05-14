@@ -15,3 +15,5 @@ rsa = { version = "0.9", default-features = false, features = ["sha2", "pem"] }
 sha2 = { version = "0.10", default-features = false }
 base64 = { version = "0.22", default-features = false, features = ["alloc"] }
 getrandom = { version = "0.2", features = ["custom"] }
+serde = { version = "1", default-features = false, features = ["alloc", "derive"] }
+serde_json = { version = "1", default-features = false, features = ["alloc"] }
