@@ -36,7 +36,7 @@ pack_types! {
         }
     }
     exports {
-        theater:simple/actor.init: func(state: value, router-id: string) -> result<smtp-handler-state, string>,
+        theater:simple/actor.init: func(state: value) -> result<smtp-handler-state, string>,
         theater:simple/tcp-client.handle-connection-transfer: func(state: smtp-handler-state, connection-id: string) -> result<smtp-handler-state, string>,
     }
 }
@@ -62,7 +62,13 @@ fn rpc_call(actor_id: String, function: String, params: Value, options: Value) -
 const HOSTNAME: &str = "inbox.local";
 
 #[export(name = "theater:simple/actor.init")]
-fn init(_state: Value, router_id: String) -> Result<(SmtpHandlerState, ()), String> {
+fn init(state: Value) -> Result<(SmtpHandlerState, ()), String> {
+    let router_id = match state {
+        Value::String(s) => s,
+        _ => return Err(String::from(
+            "smtp-handler init: expected init_state = string (router actor id)",
+        )),
+    };
     Ok((SmtpHandlerState { router_id }, ()))
 }
 

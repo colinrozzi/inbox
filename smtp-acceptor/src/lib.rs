@@ -30,15 +30,12 @@ pack_types! {
             transfer: func(connection-id: string, target-actor: string) -> result<_, string>,
         }
         theater:simple/supervisor {
-            spawn: func(manifest: string, init-bytes: option<list<u8>>, wasm-bytes: option<list<u8>>) -> result<string, string>,
+            spawn: func(manifest: string, init-state: value, wasm-bytes: option<list<u8>>) -> result<string, string>,
             stop-child: func(child-id: string) -> result<_, string>,
-        }
-        theater:simple/rpc {
-            call: func(actor-id: string, function: string, params: value, options: value) -> value,
         }
     }
     exports {
-        theater:simple/actor.init: func(state: value, router-id: string) -> result<smtp-acceptor-state, string>,
+        theater:simple/actor.init: func(state: value) -> result<smtp-acceptor-state, string>,
         theater:simple/tcp-client.handle-connection: func(state: smtp-acceptor-state, connection-id: string) -> result<smtp-acceptor-state, string>,
     }
 }
@@ -55,21 +52,24 @@ fn tcp_transfer(connection_id: String, target_actor: String) -> Result<(), Strin
 #[import(module = "theater:simple/supervisor", name = "spawn")]
 fn supervisor_spawn(
     manifest: String,
-    init_bytes: Option<Vec<u8>>,
+    init_state: Value,
     wasm_bytes: Option<Vec<u8>>,
 ) -> Result<String, String>;
 
 #[import(module = "theater:simple/supervisor", name = "stop-child")]
 fn supervisor_stop_child(child_id: String) -> Result<(), String>;
 
-#[import(module = "theater:simple/rpc", name = "call")]
-fn rpc_call(actor_id: String, function: String, params: Value, options: Value) -> Value;
-
 const LISTEN_ADDR: &str = "0.0.0.0:25";
 const SMTP_HANDLER_MANIFEST: &str = "/home/colin/work/actors/inbox/smtp-handler/manifest.toml";
 
 #[export(name = "theater:simple/actor.init")]
-fn init(_state: Value, router_id: String) -> Result<(SmtpAcceptorState, ()), String> {
+fn init(state: Value) -> Result<(SmtpAcceptorState, ()), String> {
+    let router_id = match state {
+        Value::String(s) => s,
+        _ => return Err(String::from(
+            "smtp-acceptor init: expected init_state = string (router actor id)",
+        )),
+    };
     log(format!("[inbox-smtp-acceptor] init (router={})", router_id));
 
     let listener_id = tcp_listen(String::from(LISTEN_ADDR))
@@ -107,16 +107,12 @@ fn handle_connection(
 }
 
 fn try_handle_connection(state: &SmtpAcceptorState, connection_id: &str) -> Result<(), String> {
-    let handler_id = supervisor_spawn(state.smtp_handler_manifest.clone(), None, None)
+    // supervisor.spawn now does setup+auto-init: the router id we pass as
+    // init_state is delivered to smtp-handler's init synchronously inside
+    // the spawn call; the returned handler_id is post-init.
+    let init_state = Value::String(state.router_id.clone());
+    let handler_id = supervisor_spawn(state.smtp_handler_manifest.clone(), init_state, None)
         .map_err(|e| format!("spawn smtp-handler failed: {}", e))?;
-
-    let init_params = Value::Tuple(alloc::vec![Value::String(state.router_id.clone())]);
-    let _ = rpc_call(
-        handler_id.clone(),
-        String::from("theater:simple/actor.init"),
-        init_params,
-        Value::Tuple(alloc::vec![]),
-    );
 
     if let Err(e) = tcp_transfer(connection_id.to_string(), handler_id.clone()) {
         let _ = supervisor_stop_child(handler_id);

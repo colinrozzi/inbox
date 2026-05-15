@@ -32,11 +32,8 @@ pack_types! {
             transfer: func(connection-id: string, target-actor: string) -> result<_, string>,
         }
         theater:simple/supervisor {
-            spawn: func(manifest: string, init-bytes: option<list<u8>>, wasm-bytes: option<list<u8>>) -> result<string, string>,
+            spawn: func(manifest: string, init-state: value, wasm-bytes: option<list<u8>>) -> result<string, string>,
             stop-child: func(child-id: string) -> result<_, string>,
-        }
-        theater:simple/rpc {
-            call: func(actor-id: string, function: string, params: value, options: value) -> value,
         }
         theater:simple/store {
             store-at-label: func(store-id: string, label: string, content: list<u8>) -> result<string, string>,
@@ -60,7 +57,7 @@ fn tcp_transfer(connection_id: String, target_actor: String) -> Result<(), Strin
 #[import(module = "theater:simple/supervisor", name = "spawn")]
 fn supervisor_spawn(
     manifest: String,
-    init_bytes: Option<Vec<u8>>,
+    init_state: Value,
     wasm_bytes: Option<Vec<u8>>,
 ) -> Result<String, String>;
 
@@ -69,9 +66,6 @@ fn supervisor_stop_child(child_id: String) -> Result<(), String>;
 
 #[import(module = "theater:simple/store", name = "store-at-label")]
 fn store_store_at_label(store_id: String, label: String, content: Vec<u8>) -> Result<String, String>;
-
-#[import(module = "theater:simple/rpc", name = "call")]
-fn rpc_call(actor_id: String, function: String, params: Value, options: Value) -> Value;
 
 const LISTEN_ADDR: &str = "0.0.0.0:443";
 const API_HANDLER_MANIFEST: &str = "/home/colin/work/actors/inbox/api-handler/manifest.toml";
@@ -120,18 +114,15 @@ fn init(state: Value) -> Result<(AcceptorState, ()), String> {
     .map_err(|e| format!("persist dkim key failed: {}", e))?;
 
     // Spawn the mailbox-router. It owns the address → mailbox-actor mapping
-    // and spawns mailbox actors on demand.
-    let router_id = supervisor_spawn(String::from(ROUTER_MANIFEST), None, None)
-        .map_err(|e| format!("spawn router failed: {}", e))?;
+    // and spawns mailbox actors on demand. supervisor.spawn now does
+    // setup+auto-init: init_state is passed straight to the child's init.
+    let router_id = supervisor_spawn(
+        String::from(ROUTER_MANIFEST),
+        Value::String(String::from(MAILBOX_MANIFEST)),
+        None,
+    )
+    .map_err(|e| format!("spawn router failed: {}", e))?;
     log(format!("[inbox-acceptor] spawned mailbox-router {}", router_id));
-
-    let init_params = Value::Tuple(alloc::vec![Value::String(String::from(MAILBOX_MANIFEST))]);
-    let _ = rpc_call(
-        router_id.clone(),
-        String::from("theater:simple/actor.init"),
-        init_params,
-        Value::Tuple(alloc::vec![]),
-    );
 
     let listener_id = tcp_listen(String::from(LISTEN_ADDR))
         .map_err(|e| format!("listen failed: {}", e))?;
@@ -142,16 +133,12 @@ fn init(state: Value) -> Result<(AcceptorState, ()), String> {
 
     // Spawn the SMTP acceptor and pass it the router ID so inbound mail
     // can be routed to the right mailbox.
-    let smtp_acceptor_id =
-        supervisor_spawn(String::from(SMTP_ACCEPTOR_MANIFEST), None, None)
-            .map_err(|e| format!("spawn smtp-acceptor failed: {}", e))?;
-    let smtp_init_params = Value::Tuple(alloc::vec![Value::String(router_id.clone())]);
-    let _ = rpc_call(
-        smtp_acceptor_id.clone(),
-        String::from("theater:simple/actor.init"),
-        smtp_init_params,
-        Value::Tuple(alloc::vec![]),
-    );
+    let smtp_acceptor_id = supervisor_spawn(
+        String::from(SMTP_ACCEPTOR_MANIFEST),
+        Value::String(router_id.clone()),
+        None,
+    )
+    .map_err(|e| format!("spawn smtp-acceptor failed: {}", e))?;
     log(format!(
         "[inbox-acceptor] spawned smtp-acceptor {}",
         smtp_acceptor_id
@@ -188,17 +175,15 @@ fn handle_connection(
 }
 
 fn try_handle_connection(state: &AcceptorState, connection_id: &str) -> Result<(), String> {
-    let handler_id = supervisor_spawn(state.api_handler_manifest.clone(), None, None)
-        .map_err(|e| format!("spawn api-handler failed: {}", e))?;
-
-    // Just router_id — api-handler loads the DKIM key from the store itself.
-    let init_params = Value::Tuple(alloc::vec![Value::String(state.router_id.clone())]);
-    let _ = rpc_call(
-        handler_id.clone(),
-        String::from("theater:simple/actor.init"),
-        init_params,
-        Value::Tuple(alloc::vec![]),
-    );
+    // supervisor.spawn does setup+auto-init: the router id we pass here is
+    // delivered to api-handler's init synchronously; it also pulls the
+    // DKIM key and bearer token from the store on its own.
+    let handler_id = supervisor_spawn(
+        state.api_handler_manifest.clone(),
+        Value::String(state.router_id.clone()),
+        None,
+    )
+    .map_err(|e| format!("spawn api-handler failed: {}", e))?;
 
     if let Err(e) = tcp_transfer(connection_id.to_string(), handler_id.clone()) {
         // Transfer failed — the api-handler is sitting there with no

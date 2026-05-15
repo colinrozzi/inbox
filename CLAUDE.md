@@ -159,6 +159,8 @@ ssh linode systemctl restart inbox.service
 
 State persists across restarts (router bindings, mailboxes, DKIM key, bearer token are all in the store).
 
+**One-time after the theater-#27 spawn/init refactor**: the systemd unit's `ExecStart` must say `theater spawn …` (was `theater start …`). The RUNBOOK unit example is updated; the deployed `/etc/systemd/system/inbox.service` on the VPS needs a one-time `sed -i 's| theater start | theater spawn |' /etc/systemd/system/inbox.service` + `systemctl daemon-reload` before the next restart.
+
 **Important**: the acceptor manifest has `initial_state = """..."""` carrying the bearer token (line 1) and the DKIM PEM (rest). When you change the acceptor's manifest, preserve that field. A python script `/tmp/build_manifest.py` on the VPS regenerates the acceptor manifest from `/etc/inbox/{api-token,dkim/private.pem}` — use it.
 
 ### Manifest deep gotchas

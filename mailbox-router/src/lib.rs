@@ -46,10 +46,7 @@ pack_types! {
             log: func(msg: string),
         }
         theater:simple/supervisor {
-            spawn: func(manifest: string, init-bytes: option<list<u8>>, wasm-bytes: option<list<u8>>) -> result<string, string>,
-        }
-        theater:simple/rpc {
-            call: func(actor-id: string, function: string, params: value, options: value) -> value,
+            spawn: func(manifest: string, init-state: value, wasm-bytes: option<list<u8>>) -> result<string, string>,
         }
         theater:simple/store {
             get: func(store-id: string, content-ref: string) -> result<list<u8>, string>,
@@ -58,7 +55,7 @@ pack_types! {
         }
     }
     exports {
-        theater:simple/actor.init: func(state: value, mailbox-manifest: string) -> result<router-state, string>,
+        theater:simple/actor.init: func(state: value) -> result<router-state, string>,
         theater:inbox/router.register: func(state: router-state, address: string) -> result<tuple<router-state, string>, string>,
         theater:inbox/router.lookup: func(state: router-state, address: string) -> result<tuple<router-state, option<string>>, string>,
         theater:inbox/router.list: func(state: router-state) -> result<tuple<router-state, list<binding>>, string>,
@@ -71,12 +68,9 @@ fn log(msg: String);
 #[import(module = "theater:simple/supervisor", name = "spawn")]
 fn supervisor_spawn(
     manifest: String,
-    init_bytes: Option<Vec<u8>>,
+    init_state: Value,
     wasm_bytes: Option<Vec<u8>>,
 ) -> Result<String, String>;
-
-#[import(module = "theater:simple/rpc", name = "call")]
-fn rpc_call(actor_id: String, function: String, params: Value, options: Value) -> Value;
 
 #[import(module = "theater:simple/store", name = "get")]
 fn store_get(store_id: String, content_ref: String) -> Result<Vec<u8>, String>;
@@ -120,23 +114,24 @@ fn save_bindings(bindings: &[Binding]) {
     }
 }
 
-/// Spawn a mailbox actor and pass it the address so it can load its own
-/// messages from the store. Returns the new actor id.
+/// Spawn a mailbox actor with its address packed into init_state so the
+/// new actor can load its own messages from the store on init. Auto-init
+/// runs synchronously inside `supervisor_spawn`, so the id is only
+/// returned after the child has finished its init.
 fn spawn_mailbox(manifest: &str, address: &str) -> Result<String, String> {
-    let mailbox_id = supervisor_spawn(String::from(manifest), None, None)
-        .map_err(|e| format!("spawn mailbox failed: {}", e))?;
-    let init_params = Value::Tuple(alloc::vec![Value::String(String::from(address))]);
-    let _ = rpc_call(
-        mailbox_id.clone(),
-        String::from("theater:simple/actor.init"),
-        init_params,
-        Value::Tuple(alloc::vec![]),
-    );
-    Ok(mailbox_id)
+    let init_state = Value::String(String::from(address));
+    supervisor_spawn(String::from(manifest), init_state, None)
+        .map_err(|e| format!("spawn mailbox failed: {}", e))
 }
 
 #[export(name = "theater:simple/actor.init")]
-fn init(_state: Value, mailbox_manifest: String) -> Result<(RouterState, ()), String> {
+fn init(state: Value) -> Result<(RouterState, ()), String> {
+    let mailbox_manifest = match state {
+        Value::String(s) => s,
+        _ => return Err(String::from(
+            "mailbox-router init: expected init_state = string (mailbox manifest path)",
+        )),
+    };
     log(format!("[mailbox-router] init (manifest={})", mailbox_manifest));
 
     let saved = load_bindings();

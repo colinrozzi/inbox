@@ -138,7 +138,7 @@ table doesn't recognize; for known domains (e.g. `gmail.com`,
 `colinrozzi.com`) the server picks the right SMTP host automatically,
 even when recipients span multiple domains in one send.
 
-The wrapper generates a temp manifest with your args embedded in `initial_state` and runs `theater start` against the local theater binary at `result-theater/bin/theater`. Output goes to stdout via the `theater:simple/terminal` host functions.
+The wrapper generates a temp manifest with your args embedded in `initial_state` and runs `theater spawn` against the local theater binary at `result-theater/bin/theater`. Output goes to stdout via the `theater:simple/terminal` host functions.
 
 ## Running locally (full server)
 
@@ -160,7 +160,7 @@ openssl rand -hex 32
 #   -----END PRIVATE KEY-----
 #   """
 
-theater start acceptor/manifest.toml
+theater spawn acceptor/manifest.toml
 
 # In another shell — every request needs Authorization: Bearer <token>
 TOKEN=<the token you generated>

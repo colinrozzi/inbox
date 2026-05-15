@@ -66,7 +66,7 @@ pack_types! {
         }
     }
     exports {
-        theater:simple/actor.init: func(state: value, router-id: string) -> result<handler-state, string>,
+        theater:simple/actor.init: func(state: value) -> result<handler-state, string>,
         theater:simple/tcp-client.handle-connection-transfer: func(state: handler-state, connection-id: string) -> result<handler-state, string>,
     }
 }
@@ -251,7 +251,13 @@ fn load_label_as_string(label: &str) -> Result<String, String> {
 }
 
 #[export(name = "theater:simple/actor.init")]
-fn init(_state: Value, router_id: String) -> Result<(HandlerState, ()), String> {
+fn init(state: Value) -> Result<(HandlerState, ()), String> {
+    let router_id = match state {
+        Value::String(s) => s,
+        _ => return Err(String::from(
+            "api-handler init: expected init_state = string (router actor id)",
+        )),
+    };
     let dkim_private_key_pem = load_label_as_string(DKIM_KEY_LABEL)?;
     let bearer_token = load_label_as_string(BEARER_TOKEN_LABEL)?;
     Ok((

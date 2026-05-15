@@ -217,4 +217,4 @@ enabled = true
 type = "terminal"
 EOF
 
-exec "$INBOX_THEATER" start "$tmp/manifest.toml"
+exec "$INBOX_THEATER" spawn "$tmp/manifest.toml"

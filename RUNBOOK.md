@@ -184,7 +184,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/var/lib/inbox/gc-roots/theater/bin/theater start /home/colin/work/actors/inbox/acceptor/manifest.toml
+ExecStart=/var/lib/inbox/gc-roots/theater/bin/theater spawn /home/colin/work/actors/inbox/acceptor/manifest.toml
 WorkingDirectory=/var/lib/inbox
 Restart=on-failure
 RestartSec=5
