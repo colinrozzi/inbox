@@ -139,6 +139,10 @@ struct CliCommand {
     since: u64,
     #[serde(default)]
     full: bool,
+    #[serde(default)]
+    id: u64,
+    #[serde(default)]
+    note: Option<String>,
 }
 
 fn default_api() -> String {
@@ -211,6 +215,7 @@ fn run(req: &CliCommand) -> Result<(), String> {
         "lookup" => run_lookup(req),
         "read" => run_read(req),
         "send" => run_send(req),
+        "forward" => run_forward(req),
         other => Err(format!("unknown cmd: {}", other)),
     }
 }
@@ -292,6 +297,86 @@ fn run_send(req: &CliCommand) -> Result<(), String> {
     let path = format!("/v1/mailboxes/{}/send", url_encode(addr));
     let body = http(req, "POST", &path, Some(&body_json))?;
     out(&format!("{}\n", body));
+    Ok(())
+}
+
+/// `./cli/inbox forward <from> <id> --to T... [--cc C...] [--note N]`.
+///
+/// Fetch message `<id>` from `<from>`'s inbox, then send a new message
+/// with subject "Fwd: <original>" and a body that reproduces the original
+/// content under an informal `---------- Forwarded message ----------`
+/// header block (From + Date + Subject). The optional `--note` appears
+/// above the separator. Routing reuses the normal /send path so the
+/// per-domain MX dispatch works.
+fn run_forward(req: &CliCommand) -> Result<(), String> {
+    let addr = req.address.as_ref().ok_or("forward: <from> required")?;
+    if req.to.is_empty() {
+        return Err(String::from("forward: at least one --to required"));
+    }
+
+    // Pull the message from the forwarder's mailbox. since=0 returns
+    // everything; we scan for the requested id. Cheap for typical inbox
+    // sizes; a future API change could allow a direct id lookup.
+    let inbox_path = format!("/v1/mailboxes/{}/inbox?since=0", url_encode(addr));
+    let body = http(req, "GET", &inbox_path, None)?;
+    let page: InboxPage = serde_json::from_str(&body)
+        .map_err(|e| format!("parse /inbox response: {}", e))?;
+    let original = page
+        .messages
+        .iter()
+        .find(|m| m.id == req.id)
+        .ok_or_else(|| format!("no message id={} in {}'s mailbox", req.id, addr))?;
+
+    let new_subject = if original.subject.starts_with("Fwd:")
+        || original.subject.starts_with("Fw:")
+    {
+        original.subject.clone()
+    } else {
+        format!("Fwd: {}", original.subject)
+    };
+
+    let mut forwarded_body = String::new();
+    if let Some(n) = req.note.as_deref() {
+        if !n.is_empty() {
+            forwarded_body.push_str(n);
+            forwarded_body.push_str("\n\n");
+        }
+    }
+    forwarded_body.push_str("---------- Forwarded message ----------\n");
+    forwarded_body.push_str(&format!("From: {}\n", original.from));
+    if original.received_at != 0 {
+        // Informal — epoch ms is enough for a forwarded note; receivers
+        // who care can parse it. (The CLI doesn't pull in a date crate
+        // just for this.)
+        forwarded_body.push_str(&format!(
+            "Date: {} (epoch ms)\n",
+            original.received_at
+        ));
+    }
+    forwarded_body.push_str(&format!("Subject: {}\n", original.subject));
+    forwarded_body.push_str("\n");
+    forwarded_body.push_str(&original.body);
+
+    #[derive(Serialize)]
+    struct SendBody<'a> {
+        to: &'a [String],
+        #[serde(skip_serializing_if = "<[String]>::is_empty")]
+        cc: &'a [String],
+        subject: &'a str,
+        body: &'a str,
+    }
+
+    let body_json = serde_json::to_string(&SendBody {
+        to: &req.to,
+        cc: &req.cc,
+        subject: &new_subject,
+        body: &forwarded_body,
+    })
+    .map_err(|e| format!("encode body: {}", e))?;
+
+    let send_path = format!("/v1/mailboxes/{}/send", url_encode(addr));
+    let resp = http(req, "POST", &send_path, Some(&body_json))?;
+    out(&format!("{}\n", resp));
     Ok(())
 }
 

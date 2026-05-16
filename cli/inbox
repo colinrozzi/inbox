@@ -58,6 +58,11 @@ commands:
                 [--subject S] [--body B] [--smtp HOST:PORT]
                                              send a message; --to/--cc/--bcc
                                              may each be repeated
+  forward <from> <id> --to T [--to T2 ...] [--cc C ...] [--note N]
+                                             forward a message you've received
+                                             (from your <from> mailbox) to one
+                                             or more recipients, preserving the
+                                             original from/subject/body
 EOF
   exit 1
 }
@@ -138,6 +143,24 @@ case "$cmd" in
       esac
     done
     state=$(build_state read address "$addr" raw:since "$since" raw:full "$full")
+    ;;
+  forward)
+    [ $# -lt 2 ] && usage
+    from=$1; id=$2; shift 2
+    to=() cc=() note=
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --to) to+=("$2"); shift 2 ;;
+        --cc) cc+=("$2"); shift 2 ;;
+        --note) note=$2; shift 2 ;;
+        *) usage ;;
+      esac
+    done
+    [ ${#to[@]} -lt 1 ] && { echo "forward: at least one --to required" >&2; exit 2; }
+    to_json=$(json_array "${to[@]}")
+    cc_json=$(json_array ${cc[@]+"${cc[@]}"})
+    args=(address "$from" raw:id "$id" raw:to "$to_json" raw:cc "$cc_json" note "$note")
+    state=$(build_state forward "${args[@]}")
     ;;
   send)
     [ $# -lt 1 ] && usage

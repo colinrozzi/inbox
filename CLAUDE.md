@@ -17,6 +17,9 @@ The CLI is *in this repo* and is what you'd dogfood:
 ./cli/inbox send inbox-dev@colinrozzi.com --to <addr> [--cc <addr>] [--bcc <addr>] \
     --subject "..." --body "..."
 
+# forward a message you've received (preserves original from/subject/body)
+./cli/inbox forward inbox-dev@colinrozzi.com <id> --to <addr> [--cc <addr>] [--note "..."]
+
 ./cli/inbox lookup <addr>
 ./cli/inbox list
 ./cli/inbox new <addr>          # register a new mailbox
