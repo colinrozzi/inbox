@@ -59,7 +59,7 @@ pack_types! {
         }
     }
     exports {
-        theater:simple/actor.init: func(state: value, address: string) -> result<mailbox-state, string>,
+        theater:simple/actor.init: func(state: value) -> result<mailbox-state, string>,
         theater:inbox/mailbox.list-since: func(state: mailbox-state, cursor: u64) -> result<tuple<mailbox-state, inbox-page>, string>,
         theater:inbox/mailbox.put-message: func(state: mailbox-state, from: string, to: string, subject: string, body: string) -> result<tuple<mailbox-state, u64>, string>,
     }
@@ -108,7 +108,13 @@ fn save_state(state: &MailboxState) {
 }
 
 #[export(name = "theater:simple/actor.init")]
-fn init(_state: Value, address: String) -> Result<(MailboxState, ()), String> {
+fn init(state: Value) -> Result<(MailboxState, ()), String> {
+    let address = match state {
+        Value::String(s) => s,
+        _ => return Err(String::from(
+            "mailbox init: expected init_state = string (email address)",
+        )),
+    };
     let state = load_state(&address).unwrap_or_else(|| MailboxState {
         address: address.clone(),
         messages: Vec::new(),
