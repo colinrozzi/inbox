@@ -125,7 +125,13 @@ Then:
                   [--to carol@example.com]... [--cc dan@example.com]... \
                   [--bcc eve@example.com]... \
                   --subject "hi" --body "hello"
+./cli/inbox forward alice@yourdomain.com <id> --to bob@example.com \
+                  [--cc carol@example.com]... [--note "fwd note"]
 ```
+
+`forward` looks up message `<id>` in `<from>`'s mailbox and resends it as
+`Fwd: <original-subject>` to the `--to`/`--cc` recipients. `--note` adds
+a one-liner above the forwarded block.
 
 `--smtp HOST:PORT` is now a fallback for domains the server's routing
 table doesn't recognize; for known domains (e.g. `gmail.com`,
