@@ -30,7 +30,7 @@ pack_types! {
             transfer: func(connection-id: string, target-actor: string) -> result<_, string>,
         }
         theater:simple/supervisor {
-            spawn: func(manifest: string, init-state: value, wasm-bytes: option<list<u8>>) -> result<string, string>,
+            spawn: func(manifest: string, init-state: option<value>, wasm-bytes: option<list<u8>>) -> result<string, string>,
             stop-child: func(child-id: string) -> result<_, string>,
         }
     }
@@ -52,7 +52,7 @@ fn tcp_transfer(connection_id: String, target_actor: String) -> Result<(), Strin
 #[import(module = "theater:simple/supervisor", name = "spawn")]
 fn supervisor_spawn(
     manifest: String,
-    init_state: Value,
+    init_state: Option<Value>,
     wasm_bytes: Option<Vec<u8>>,
 ) -> Result<String, String>;
 
@@ -110,7 +110,7 @@ fn try_handle_connection(state: &SmtpAcceptorState, connection_id: &str) -> Resu
     // supervisor.spawn now does setup+auto-init: the router id we pass as
     // init_state is delivered to smtp-handler's init synchronously inside
     // the spawn call; the returned handler_id is post-init.
-    let init_state = Value::String(state.router_id.clone());
+    let init_state = Some(Value::String(state.router_id.clone()));
     let handler_id = supervisor_spawn(state.smtp_handler_manifest.clone(), init_state, None)
         .map_err(|e| format!("spawn smtp-handler failed: {}", e))?;
 

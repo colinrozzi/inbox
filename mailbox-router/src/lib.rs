@@ -46,7 +46,7 @@ pack_types! {
             log: func(msg: string),
         }
         theater:simple/supervisor {
-            spawn: func(manifest: string, init-state: value, wasm-bytes: option<list<u8>>) -> result<string, string>,
+            spawn: func(manifest: string, init-state: option<value>, wasm-bytes: option<list<u8>>) -> result<string, string>,
         }
         theater:simple/store {
             get: func(store-id: string, content-ref: string) -> result<list<u8>, string>,
@@ -68,7 +68,7 @@ fn log(msg: String);
 #[import(module = "theater:simple/supervisor", name = "spawn")]
 fn supervisor_spawn(
     manifest: String,
-    init_state: Value,
+    init_state: Option<Value>,
     wasm_bytes: Option<Vec<u8>>,
 ) -> Result<String, String>;
 
@@ -119,7 +119,7 @@ fn save_bindings(bindings: &[Binding]) {
 /// runs synchronously inside `supervisor_spawn`, so the id is only
 /// returned after the child has finished its init.
 fn spawn_mailbox(manifest: &str, address: &str) -> Result<String, String> {
-    let init_state = Value::String(String::from(address));
+    let init_state = Some(Value::String(String::from(address)));
     supervisor_spawn(String::from(manifest), init_state, None)
         .map_err(|e| format!("spawn mailbox failed: {}", e))
 }
