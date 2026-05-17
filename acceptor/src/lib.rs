@@ -32,7 +32,7 @@ pack_types! {
             transfer: func(connection-id: string, target-actor: string) -> result<_, string>,
         }
         theater:simple/supervisor {
-            spawn: func(manifest: string, init-state: value, wasm-bytes: option<list<u8>>) -> result<string, string>,
+            spawn: func(manifest: string, init-state: option<value>, wasm-bytes: option<list<u8>>) -> result<string, string>,
             stop-child: func(child-id: string) -> result<_, string>,
         }
         theater:simple/store {
@@ -57,7 +57,7 @@ fn tcp_transfer(connection_id: String, target_actor: String) -> Result<(), Strin
 #[import(module = "theater:simple/supervisor", name = "spawn")]
 fn supervisor_spawn(
     manifest: String,
-    init_state: Value,
+    init_state: Option<Value>,
     wasm_bytes: Option<Vec<u8>>,
 ) -> Result<String, String>;
 
@@ -118,7 +118,7 @@ fn init(state: Value) -> Result<(AcceptorState, ()), String> {
     // setup+auto-init: init_state is passed straight to the child's init.
     let router_id = supervisor_spawn(
         String::from(ROUTER_MANIFEST),
-        Value::String(String::from(MAILBOX_MANIFEST)),
+        Some(Value::String(String::from(MAILBOX_MANIFEST))),
         None,
     )
     .map_err(|e| format!("spawn router failed: {}", e))?;
@@ -135,7 +135,7 @@ fn init(state: Value) -> Result<(AcceptorState, ()), String> {
     // can be routed to the right mailbox.
     let smtp_acceptor_id = supervisor_spawn(
         String::from(SMTP_ACCEPTOR_MANIFEST),
-        Value::String(router_id.clone()),
+        Some(Value::String(router_id.clone())),
         None,
     )
     .map_err(|e| format!("spawn smtp-acceptor failed: {}", e))?;
@@ -180,7 +180,7 @@ fn try_handle_connection(state: &AcceptorState, connection_id: &str) -> Result<(
     // DKIM key and bearer token from the store on its own.
     let handler_id = supervisor_spawn(
         state.api_handler_manifest.clone(),
-        Value::String(state.router_id.clone()),
+        Some(Value::String(state.router_id.clone())),
         None,
     )
     .map_err(|e| format!("spawn api-handler failed: {}", e))?;
