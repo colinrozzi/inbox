@@ -13,5 +13,5 @@ type = "rpc"
 
 [[handler]]
 type = "store"
-base_path = "/var/lib/inbox/store"
+base_path = "/mnt/main-volume/inbox/store"
 store_id = "inbox"
