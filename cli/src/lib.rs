@@ -500,11 +500,12 @@ fn print_messages(page: &InboxPage, full: bool) {
             strip_quoted_history(&m.body)
         };
         let lines_seen = display.split('\n').count();
-        for line in display.split('\n').take(20) {
+        let cap = if full { usize::MAX } else { 120 };
+        for line in display.split('\n').take(cap) {
             out(&format!("      {}\n", line));
         }
-        if lines_seen > 20 {
-            out(&format!("      ... ({} more lines)\n", lines_seen - 20));
+        if lines_seen > cap {
+            out(&format!("      ... ({} more lines; --full to show)\n", lines_seen - cap));
         }
         if !full && display.len() < m.body.len() {
             out("      [quoted history hidden; --full to show]\n");
