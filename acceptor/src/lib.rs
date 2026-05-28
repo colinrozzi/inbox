@@ -81,14 +81,18 @@ const BEARER_TOKEN_LABEL: &str = "api-bearer-token";
 fn init(state: Value) -> Result<(AcceptorState, ()), String> {
     log(String::from("[inbox-acceptor] init"));
 
-    // initial_state format: first line is the API bearer token, the rest is
+    // initial_state format: first line is the API bearer token(s), the rest is
     // the DKIM private key (PEM). Both go into the shared store under
     // stable labels so api-handler children can fetch them on demand.
+    //
+    // The bearer line MAY be a comma-separated list of bearer tokens during
+    // a rotation window (e.g. "<new>,<old>") — api-handler accepts any of
+    // them. Single-bearer deploys pre-rotation work unchanged.
     let raw = match state {
         Value::String(s) if !s.is_empty() => s,
         _ => {
             return Err(String::from(
-                "acceptor needs initial_state = \"<bearer-token>\\n<DKIM PEM>\" in manifest",
+                "acceptor needs initial_state = \"<bearer-token>[,<bearer-token>...]\\n<DKIM PEM>\" in manifest",
             ))
         }
     };
@@ -96,7 +100,7 @@ fn init(state: Value) -> Result<(AcceptorState, ()), String> {
         Some((t, rest)) if !t.is_empty() => (t.to_string(), rest.to_string()),
         _ => {
             return Err(String::from(
-                "initial_state must be: <bearer-token>\\n<DKIM PEM>",
+                "initial_state must be: <bearer-token>[,<bearer-token>...]\\n<DKIM PEM>",
             ))
         }
     };
