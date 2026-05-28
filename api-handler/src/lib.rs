@@ -308,7 +308,13 @@ fn route(
         Err(_) => return error_response(400, "non-utf8 request"),
     };
 
-    if extract_bearer(request_str) != Some(bearer_token) {
+    let presented = extract_bearer(request_str);
+    if !bearer_token
+        .split(',')
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .any(|t| presented == Some(t))
+    {
         return error_response(401, "unauthorized");
     }
 

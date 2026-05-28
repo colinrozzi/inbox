@@ -45,6 +45,8 @@ The address in the URL path must be percent-encoded (`@` → `%40`).
 
 Every route requires `Authorization: Bearer <token>`; missing or wrong returns `401`. The token is configured once on the deploy side (acceptor reads it from `initial_state` and writes it to the store under `api-bearer-token`); clients read it from `~/.config/inbox/token` or `$INBOX_TOKEN`.
 
+The acceptor's bearer field accepts a single token or a comma-separated list (`"<new>,<old>"`); api-handler accepts any of them. Use the list form during a rotation window so consumers can update at their own pace without 401-flicker; drop the old token from the list once everyone's caught up.
+
 The cursor design assumes agents poll: agents remember the `next_cursor` from the last fetch and pass it as `since=` next time.
 
 ## SMTP

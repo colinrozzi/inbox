@@ -85,6 +85,8 @@ chmod 600 ~/.config/inbox/token
 
 The CLI looks at `$INBOX_TOKEN` first, then `~/.config/inbox/token`. Curl from anywhere is `-H "Authorization: Bearer $(cat ~/.config/inbox/token)"`.
 
+To rotate the bearer without a 401-flicker window: write `<new>,<old>` to the acceptor manifest's bearer line in `initial_state` (comma-separated), redeploy, distribute the new bearer to all consumers, then redeploy again with just `<new>`. The acceptor stores whatever line you give it; the api-handler accepts any comma-separated entry.
+
 ## 5. Build
 
 Locally (recommended — the VPS may not have enough disk for a full rust build):
