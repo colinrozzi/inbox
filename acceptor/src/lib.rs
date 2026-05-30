@@ -30,7 +30,7 @@ use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use packr_guest::{export, import, pack_types, GraphValue, Value, ValueType};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 packr_guest::setup_guest!();
 
@@ -114,6 +114,16 @@ struct Config {
     mailbox_manifest: String,
     router_manifest: String,
     smtp_acceptor_manifest: String,
+    // smtp-acceptor (spawned at init) needs its own handler-manifest
+    // reference to spawn smtp-handler per inbound SMTP connection.
+    // We pass this through to smtp-acceptor via its init_state JSON.
+    smtp_handler_manifest: String,
+}
+
+#[derive(Serialize)]
+struct SmtpInit<'a> {
+    router_id: &'a str,
+    smtp_handler_manifest: &'a str,
 }
 
 #[export(name = "theater:simple/actor.init")]
@@ -137,6 +147,9 @@ fn init(state: Value) -> Result<(AcceptorState, ()), String> {
         mailbox_manifest,
         router_manifest,
         smtp_acceptor_manifest,
+        // None means legacy path: smtp-acceptor will use its own default.
+        // Some(ref) means JSON path: we pass this through to smtp-acceptor.
+        smtp_handler_manifest_opt,
     ) = if let Ok(cfg) = serde_json::from_str::<Config>(&raw) {
         if cfg.bearer_token.is_empty() {
             return Err(String::from("bearer_token must be non-empty"));
@@ -148,9 +161,10 @@ fn init(state: Value) -> Result<(AcceptorState, ()), String> {
             || cfg.mailbox_manifest.is_empty()
             || cfg.router_manifest.is_empty()
             || cfg.smtp_acceptor_manifest.is_empty()
+            || cfg.smtp_handler_manifest.is_empty()
         {
             return Err(String::from(
-                "all four *_manifest references must be non-empty",
+                "all five *_manifest references must be non-empty",
             ));
         }
         (
@@ -160,12 +174,14 @@ fn init(state: Value) -> Result<(AcceptorState, ()), String> {
             cfg.mailbox_manifest,
             cfg.router_manifest,
             cfg.smtp_acceptor_manifest,
+            Some(cfg.smtp_handler_manifest),
         )
     } else {
         // Backward-compat: legacy "<bearer-line>\n<DKIM PEM>" shape used by
         // the systemd build_manifest.py on the VPS. Default the four
         // sub-manifest references to the hardcoded file paths that shape
-        // implicitly relies on.
+        // implicitly relies on. smtp_handler_manifest is None — smtp-acceptor
+        // receives a plain router_id string and uses its own default.
         match raw.split_once('\n') {
             Some((t, rest)) if !t.is_empty() => (
                 t.to_string(),
@@ -174,6 +190,7 @@ fn init(state: Value) -> Result<(AcceptorState, ()), String> {
                 String::from(DEFAULT_MAILBOX_MANIFEST),
                 String::from(DEFAULT_ROUTER_MANIFEST),
                 String::from(DEFAULT_SMTP_ACCEPTOR_MANIFEST),
+                None,
             ),
             _ => {
                 return Err(String::from(
@@ -215,11 +232,25 @@ fn init(state: Value) -> Result<(AcceptorState, ()), String> {
         LISTEN_ADDR, listener_id
     ));
 
-    // Spawn the SMTP acceptor and pass it the router ID so inbound mail
-    // can be routed to the right mailbox.
+    // Spawn the SMTP acceptor. When we have a smtp_handler_manifest
+    // reference from JSON config, pass a JSON {router_id, smtp_handler_manifest}
+    // so smtp-acceptor can spawn smtp-handler via a deploy-agnostic
+    // reference. On the legacy path, fall back to passing just the
+    // plain router id string — smtp-acceptor uses its own default
+    // file-path reference for the handler.
+    let smtp_init_state = match &smtp_handler_manifest_opt {
+        Some(handler_ref) => Value::String(
+            serde_json::to_string(&SmtpInit {
+                router_id: &router_id,
+                smtp_handler_manifest: handler_ref,
+            })
+            .map_err(|e| format!("serialize smtp-acceptor init failed: {}", e))?,
+        ),
+        None => Value::String(router_id.clone()),
+    };
     let smtp_acceptor_id = supervisor_spawn(
         smtp_acceptor_manifest,
-        Some(Value::String(router_id.clone())),
+        Some(smtp_init_state),
         None,
     )
     .map_err(|e| format!("spawn smtp-acceptor failed: {}", e))?;

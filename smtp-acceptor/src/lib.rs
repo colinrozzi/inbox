@@ -1,6 +1,17 @@
 //! SMTP acceptor: listens on TCP for inbound mail. Same actor-per-connection
 //! pattern as the HTTP acceptor — spawns an smtp-handler for each connection,
 //! passes it the mailbox ID, transfers.
+//!
+//! Init state shape (Value::String): either
+//!   {"router_id": "<id>", "smtp_handler_manifest": "<reference>"}  — JSON
+//! or
+//!   "<router_id>"                                                  — legacy
+//!
+//! Legacy shape is what the pre-refactor inbox-acceptor sends (plain
+//! router id, no manifest reference); on that path we fall back to the
+//! built-in DEFAULT_SMTP_HANDLER_MANIFEST file path which is what the
+//! systemd VPS deploy lays out via the nix store. New inbox-acceptor
+//! sends the JSON shape with a deploy-agnostic manifest reference.
 
 #![no_std]
 extern crate alloc;
@@ -9,6 +20,7 @@ use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use packr_guest::{export, import, pack_types, GraphValue, Value, ValueType};
+use serde::Deserialize;
 
 packr_guest::setup_guest!();
 
@@ -60,16 +72,47 @@ fn supervisor_spawn(
 fn supervisor_stop_child(child_id: String) -> Result<(), String>;
 
 const LISTEN_ADDR: &str = "0.0.0.0:25";
-const SMTP_HANDLER_MANIFEST: &str = "/home/colin/work/actors/inbox/smtp-handler/manifest.toml";
+
+// Default smtp-handler manifest reference — used only on the legacy
+// init path (plain Value::String router id, no JSON). Once cutover
+// happens and every spawn is JSON with smtp_handler_manifest supplied
+// by inbox-acceptor's config, this becomes unused.
+const DEFAULT_SMTP_HANDLER_MANIFEST: &str =
+    "/home/colin/work/actors/inbox/smtp-handler/manifest.toml";
+
+#[derive(Deserialize)]
+struct Config {
+    router_id: String,
+    smtp_handler_manifest: String,
+}
 
 #[export(name = "theater:simple/actor.init")]
 fn init(state: Value) -> Result<(SmtpAcceptorState, ()), String> {
-    let router_id = match state {
-        Value::String(s) => s,
-        _ => return Err(String::from(
-            "smtp-acceptor init: expected init_state = string (router actor id)",
-        )),
+    let raw = match state {
+        Value::String(s) if !s.is_empty() => s,
+        _ => {
+            return Err(String::from(
+                "smtp-acceptor init: expected init_state as a non-empty string \
+                 (JSON {router_id, smtp_handler_manifest} or legacy plain router id)",
+            ))
+        }
     };
+
+    let (router_id, smtp_handler_manifest) =
+        if let Ok(cfg) = serde_json::from_str::<Config>(&raw) {
+            if cfg.router_id.is_empty() {
+                return Err(String::from("router_id must be non-empty"));
+            }
+            if cfg.smtp_handler_manifest.is_empty() {
+                return Err(String::from("smtp_handler_manifest must be non-empty"));
+            }
+            (cfg.router_id, cfg.smtp_handler_manifest)
+        } else {
+            // Legacy: bare router id string. Default the manifest reference
+            // to the systemd-deploy file path.
+            (raw, String::from(DEFAULT_SMTP_HANDLER_MANIFEST))
+        };
+
     log(format!("[inbox-smtp-acceptor] init (router={})", router_id));
 
     let listener_id = tcp_listen(String::from(LISTEN_ADDR))
@@ -83,7 +126,7 @@ fn init(state: Value) -> Result<(SmtpAcceptorState, ()), String> {
         SmtpAcceptorState {
             listener_id,
             router_id,
-            smtp_handler_manifest: String::from(SMTP_HANDLER_MANIFEST),
+            smtp_handler_manifest,
         },
         (),
     ))

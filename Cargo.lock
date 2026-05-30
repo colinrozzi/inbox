@@ -192,6 +192,8 @@ name = "inbox-smtp-acceptor"
 version = "0.1.0"
 dependencies = [
  "packr-guest",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

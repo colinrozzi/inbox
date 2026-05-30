@@ -13,7 +13,8 @@
 #         "API_HANDLER_MANIFEST":    "...",
 #         "MAILBOX_MANIFEST":        "...",
 #         "ROUTER_MANIFEST":         "...",
-#         "SMTP_ACCEPTOR_MANIFEST":  "..."
+#         "SMTP_ACCEPTOR_MANIFEST":  "...",
+#         "SMTP_HANDLER_MANIFEST":   "..."
 #       }
 #     }
 #   }
@@ -63,7 +64,8 @@ initial_state = '''
   "api_handler_manifest":   "__API_HANDLER_MANIFEST__",
   "mailbox_manifest":       "__MAILBOX_MANIFEST__",
   "router_manifest":        "__ROUTER_MANIFEST__",
-  "smtp_acceptor_manifest": "__SMTP_ACCEPTOR_MANIFEST__"
+  "smtp_acceptor_manifest": "__SMTP_ACCEPTOR_MANIFEST__",
+  "smtp_handler_manifest":  "__SMTP_HANDLER_MANIFEST__"
 }
 '''
 
