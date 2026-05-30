@@ -1,0 +1,201 @@
+name: Release
+
+on:
+  # Developer-initiated: `nix run .#release` from main (or `git tag release-*`
+  # + push) creates the tag. The tag push triggers this workflow. No
+  # auto-trigger on every main commit — release is an explicit step.
+  push:
+    tags: ['release-*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  release:
+    name: Build + tag + upload artifacts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: DeterminateSystems/nix-installer-action@main
+
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+
+      # Workspace build sanity check. Blocks the release if main does not
+      # compile. Produces result/ with the seven wasm actors.
+      - name: Build workspace
+        run: nix build
+
+      - name: Create GitHub release and upload artifacts
+        run: |
+          if [ -n "$GITHUB_REF_NAME" ] && [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            TAG="$GITHUB_REF_NAME"
+          else
+            DATE=$(date +%Y%m%d)
+            SHA=$(git rev-parse --short=7 HEAD)
+            TAG="release-$DATE-$SHA"
+            git tag "$TAG"
+            git push origin "$TAG"
+          fi
+          gh release create "$TAG" --generate-notes
+
+          STAGE_TAG="${TAG#release-}"
+          ASSETS=()
+          REPO="${{ github.repository }}"
+
+          # 1) Per-actor wasms — each as its own release asset with a
+          #    stage-tagged filename. Sentinel's `package` field points at
+          #    one of these (inbox_acceptor) directly. The acceptor's
+          #    initial_state JSON references the sub-manifest URLs below;
+          #    each sub-manifest's package field in turn points at its
+          #    corresponding wasm asset.
+          for actor in \
+            inbox_acceptor \
+            inbox_api_handler \
+            inbox_mailbox \
+            inbox_mailbox_router \
+            inbox_smtp_acceptor \
+            inbox_smtp_handler \
+            inbox_cli
+          do
+            cp "$(realpath result)/${actor}.wasm" "${actor}-${STAGE_TAG}.wasm"
+            chmod +w "${actor}-${STAGE_TAG}.wasm"
+            ASSETS+=("${actor}-${STAGE_TAG}.wasm")
+          done
+
+          # 2) Sub-manifest TOMLs for the five sub-actors that
+          #    inbox-acceptor / smtp-acceptor reference via initial_state.
+          #    Each manifest's package field is a self-referential
+          #    https:// URL pointing at this release's matching wasm.
+          #    The handler stanzas mirror the in-repo manifests.
+
+          API_HANDLER_MANIFEST_FILE="inbox-api-handler-${STAGE_TAG}.toml"
+          API_HANDLER_WASM_URL="https://github.com/${REPO}/releases/download/${TAG}/inbox_api_handler-${STAGE_TAG}.wasm"
+          cat > "${API_HANDLER_MANIFEST_FILE}" <<TOML
+          name = "inbox-api-handler"
+          version = "0.1.0"
+          package = "${API_HANDLER_WASM_URL}"
+
+          [[handler]]
+          type = "runtime"
+
+          [[handler]]
+          type = "tcp"
+
+          [[handler]]
+          type = "rpc"
+
+          [[handler]]
+          type = "store"
+          base_path = "/mnt/main-volume/inbox/store"
+          store_id = "inbox"
+          TOML
+          ASSETS+=("${API_HANDLER_MANIFEST_FILE}")
+
+          MAILBOX_MANIFEST_FILE="inbox-mailbox-${STAGE_TAG}.toml"
+          MAILBOX_WASM_URL="https://github.com/${REPO}/releases/download/${TAG}/inbox_mailbox-${STAGE_TAG}.wasm"
+          cat > "${MAILBOX_MANIFEST_FILE}" <<TOML
+          name = "inbox-mailbox"
+          version = "0.1.0"
+          package = "${MAILBOX_WASM_URL}"
+
+          [[handler]]
+          type = "runtime"
+
+          [[handler]]
+          type = "store"
+          base_path = "/mnt/main-volume/inbox/store"
+          store_id = "inbox"
+          TOML
+          ASSETS+=("${MAILBOX_MANIFEST_FILE}")
+
+          ROUTER_MANIFEST_FILE="inbox-mailbox-router-${STAGE_TAG}.toml"
+          ROUTER_WASM_URL="https://github.com/${REPO}/releases/download/${TAG}/inbox_mailbox_router-${STAGE_TAG}.wasm"
+          cat > "${ROUTER_MANIFEST_FILE}" <<TOML
+          name = "inbox-mailbox-router"
+          version = "0.1.0"
+          package = "${ROUTER_WASM_URL}"
+
+          [[handler]]
+          type = "runtime"
+
+          [[handler]]
+          type = "supervisor"
+
+          [[handler]]
+          type = "rpc"
+
+          [[handler]]
+          type = "store"
+          base_path = "/mnt/main-volume/inbox/store"
+          store_id = "inbox"
+          TOML
+          ASSETS+=("${ROUTER_MANIFEST_FILE}")
+
+          SMTP_ACCEPTOR_MANIFEST_FILE="inbox-smtp-acceptor-${STAGE_TAG}.toml"
+          SMTP_ACCEPTOR_WASM_URL="https://github.com/${REPO}/releases/download/${TAG}/inbox_smtp_acceptor-${STAGE_TAG}.wasm"
+          cat > "${SMTP_ACCEPTOR_MANIFEST_FILE}" <<TOML
+          name = "inbox-smtp-acceptor"
+          version = "0.1.0"
+          package = "${SMTP_ACCEPTOR_WASM_URL}"
+
+          [[handler]]
+          type = "runtime"
+
+          [[handler]]
+          type = "tcp"
+
+          [[handler]]
+          type = "supervisor"
+
+          [[handler]]
+          type = "rpc"
+          TOML
+          ASSETS+=("${SMTP_ACCEPTOR_MANIFEST_FILE}")
+
+          SMTP_HANDLER_MANIFEST_FILE="inbox-smtp-handler-${STAGE_TAG}.toml"
+          SMTP_HANDLER_WASM_URL="https://github.com/${REPO}/releases/download/${TAG}/inbox_smtp_handler-${STAGE_TAG}.wasm"
+          cat > "${SMTP_HANDLER_MANIFEST_FILE}" <<TOML
+          name = "inbox-smtp-handler"
+          version = "0.1.0"
+          package = "${SMTP_HANDLER_WASM_URL}"
+
+          [[handler]]
+          type = "runtime"
+
+          [[handler]]
+          type = "tcp"
+
+          [[handler]]
+          type = "rpc"
+          TOML
+          ASSETS+=("${SMTP_HANDLER_MANIFEST_FILE}")
+
+          # 3) Bundle of all seven wasms (humans / local use) + sha256.
+          STAGE="inbox-${STAGE_TAG}-wasm32"
+          mkdir -p "$STAGE"
+          for actor in \
+            inbox_acceptor \
+            inbox_api_handler \
+            inbox_mailbox \
+            inbox_mailbox_router \
+            inbox_smtp_acceptor \
+            inbox_smtp_handler \
+            inbox_cli
+          do
+            cp "$(realpath result)/${actor}.wasm" "$STAGE/"
+          done
+          chmod -R +w "$STAGE"
+          tar -czf "$STAGE.tar.gz" "$STAGE"
+          sha256sum "$STAGE.tar.gz" > "$STAGE.tar.gz.sha256"
+
+          gh release upload "$TAG" "${ASSETS[@]}" "$STAGE.tar.gz" "$STAGE.tar.gz.sha256"
+        env:
+          GH_TOKEN: ${{ github.token }}
