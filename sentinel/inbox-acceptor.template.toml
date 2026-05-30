@@ -1,35 +1,71 @@
 # Sentinel-managed deploy template for inbox-acceptor.
 #
 # Sentinel renders this template by literal substring substitution of
-# __PACKAGE__, __BEARER_TOKEN__, __DKIM_KEY__ from its per-child config
-# at every spawn. The expected sentinel-side child entry shape:
+# the __X__ placeholders from its per-child config at every spawn:
 #
 #   children: {
 #     "inbox-acceptor": {
 #       manifest_template: <contents of this file>,
 #       default_package:   "<canonical inbox_acceptor.wasm URL>",
-#       secrets:           { "BEARER_TOKEN": "...", "DKIM_KEY": "..." }
+#       secrets: {
+#         "BEARER_TOKEN":            "...",
+#         "DKIM_PRIVATE_KEY":        "...",
+#         "API_HANDLER_MANIFEST":    "...",
+#         "MAILBOX_MANIFEST":        "...",
+#         "ROUTER_MANIFEST":         "...",
+#         "SMTP_ACCEPTOR_MANIFEST":  "..."
+#       }
 #     }
 #   }
 #
-# Operator notes:
-#  - __DKIM_KEY__ is a multi-line PEM. initial_state uses TOML triple-quoted
-#    string syntax so the runtime parses the substituted content with newlines
-#    preserved.
-#  - __BEARER_TOKEN__ may be a single value or a comma-separated list (e.g.
-#    "<new>,<old>") during a rotation window — api-handler accepts any token
-#    in the list (see api-handler/src/lib.rs:311).
-#  - This template and the systemd-deployed acceptor/manifest.toml share the
-#    same store_id ("inbox") and base_path. Pre-cutover the two paths cannot
-#    coexist on the same host — port :443 / :25 contention and concurrent
-#    writers to the same store. Cutover order is "stop systemd, then sentinel
-#    spawn" with a ~5-10s window where the listeners are bouncing.
+# OPERATOR NOTE — DKIM_PRIVATE_KEY MUST BE JSON-ESCAPED:
+#   The PEM is multi-line. Inside the JSON initial_state field, newlines
+#   are illegal as raw bytes — they MUST appear as the two-character
+#   escape sequence \n. Set DKIM_PRIVATE_KEY in sentinel's secrets map
+#   as a single-line string with literal \n escapes, e.g.
+#     "DKIM_PRIVATE_KEY": "-----BEGIN RSA PRIVATE KEY-----\nMIIE...\n-----END RSA PRIVATE KEY-----\n"
+#   Sentinel substitutes the value verbatim into the TOML literal string
+#   below; theater passes the resulting JSON to the acceptor; serde_json
+#   parses \n back to newlines; the PEM reaches DKIM signing intact.
+#
+# OPERATOR NOTE — BEARER_TOKEN ROTATION:
+#   The bearer field accepts a single token or a comma-separated rotation
+#   list ("<new>,<old>"). api-handler accepts any token in the list (see
+#   api-handler/src/lib.rs:311). Set BEARER_TOKEN as a single-line string;
+#   no escape needed.
+#
+# OPERATOR NOTE — MANIFEST REFERENCES:
+#   *_MANIFEST values are opaque references that theater's
+#   resolve_reference dispatches. Three accepted forms:
+#     - file paths (/path/to/manifest.toml)        — dev/legacy
+#     - https://... URLs                            — release artifacts
+#     - store://... references                       — sentinel pre-staged
+#   For production sentinel-managed deploy, all four should be https://
+#   URLs pointing at the matching release-asset manifest TOMLs on
+#   github.com/colinrozzi/inbox/releases.
+#
+# COEXISTENCE CONSTRAINT:
+#   Pre-cutover, this template and the systemd-deployed
+#   acceptor/manifest.toml share store_id ("inbox") + base_path. They
+#   cannot coexist on the same host — port :443 / :25 contention AND
+#   concurrent writers to the same store. Cutover order is "stop systemd;
+#   nc sentinel start inbox-acceptor" with a ~5-10s downtime window
+#   (CLI/HTTP clients retry; SMTP peers retry per RFC 5321 §4.5.4.1).
+#   See the cutover PR description for the full procedure.
 
 name = "inbox-acceptor"
 version = "0.1.0"
 package = "__PACKAGE__"
-initial_state = """__BEARER_TOKEN__
-__DKIM_KEY__"""
+initial_state = '''
+{
+  "bearer_token":           "__BEARER_TOKEN__",
+  "dkim_private_key":       "__DKIM_PRIVATE_KEY__",
+  "api_handler_manifest":   "__API_HANDLER_MANIFEST__",
+  "mailbox_manifest":       "__MAILBOX_MANIFEST__",
+  "router_manifest":        "__ROUTER_MANIFEST__",
+  "smtp_acceptor_manifest": "__SMTP_ACCEPTOR_MANIFEST__"
+}
+'''
 
 [[handler]]
 type = "runtime"
