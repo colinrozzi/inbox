@@ -1,0 +1,49 @@
+# Sentinel-managed deploy template for inbox-acceptor.
+#
+# Sentinel renders this template by literal substring substitution of
+# __PACKAGE__, __BEARER_TOKEN__, __DKIM_KEY__ from its per-child config
+# at every spawn. The expected sentinel-side child entry shape:
+#
+#   children: {
+#     "inbox-acceptor": {
+#       manifest_template: <contents of this file>,
+#       default_package:   "<canonical inbox_acceptor.wasm URL>",
+#       secrets:           { "BEARER_TOKEN": "...", "DKIM_KEY": "..." }
+#     }
+#   }
+#
+# Operator notes:
+#  - __DKIM_KEY__ is a multi-line PEM. initial_state uses TOML triple-quoted
+#    string syntax so the runtime parses the substituted content with newlines
+#    preserved.
+#  - __BEARER_TOKEN__ may be a single value or a comma-separated list (e.g.
+#    "<new>,<old>") during a rotation window — api-handler accepts any token
+#    in the list (see api-handler/src/lib.rs:311).
+#  - This template and the systemd-deployed acceptor/manifest.toml share the
+#    same store_id ("inbox") and base_path. Pre-cutover the two paths cannot
+#    coexist on the same host — port :443 / :25 contention and concurrent
+#    writers to the same store. Cutover order is "stop systemd, then sentinel
+#    spawn" with a ~5-10s window where the listeners are bouncing.
+
+name = "inbox-acceptor"
+version = "0.1.0"
+package = "__PACKAGE__"
+initial_state = """__BEARER_TOKEN__
+__DKIM_KEY__"""
+
+[[handler]]
+type = "runtime"
+
+[[handler]]
+type = "tcp"
+
+[[handler]]
+type = "supervisor"
+
+[[handler]]
+type = "rpc"
+
+[[handler]]
+type = "store"
+base_path = "/mnt/main-volume/inbox/store"
+store_id = "inbox"
