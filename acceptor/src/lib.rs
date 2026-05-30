@@ -1,8 +1,27 @@
 //! Inbox acceptor.
 //!
-//! On startup: spawns the singleton mailbox actor, holds onto its ID.
-//! On each TCP connection: spawns an api-handler, hands it the mailbox ID
-//! via init bytes, then transfers the connection.
+//! On startup: parses initial_state (JSON config with bearer + DKIM + 4
+//! sub-manifest references), persists secrets into the shared store,
+//! spawns the singleton mailbox-router and smtp-acceptor, binds :443.
+//! On each TCP connection: spawns an api-handler (using the
+//! api_handler_manifest reference held in AcceptorState), hands it the
+//! router ID, then transfers the connection.
+//!
+//! Expected initial_state shape (JSON string in Value::String):
+//!   {
+//!     "bearer_token":           "<API bearer or comma-separated rotation list>",
+//!     "dkim_private_key":       "<PEM, newlines as \\n escapes inside JSON>",
+//!     "api_handler_manifest":   "<theater resolve_reference: file:/https:/store:>",
+//!     "mailbox_manifest":       "<same>",
+//!     "router_manifest":        "<same>",
+//!     "smtp_acceptor_manifest": "<same>"
+//!   }
+//!
+//! Backward-compat: if initial_state is NOT JSON, accept the legacy
+//! "<bearer-line>\n<DKIM PEM>" shape and use built-in default file-path
+//! references for the 4 sub-manifests (matching what the systemd
+//! build_manifest.py script on the VPS currently emits). Keeps the
+//! systemd path working through the refactor → cutover window.
 
 #![no_std]
 extern crate alloc;
@@ -11,6 +30,7 @@ use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use packr_guest::{export, import, pack_types, GraphValue, Value, ValueType};
+use serde::Deserialize;
 
 packr_guest::setup_guest!();
 
@@ -68,42 +88,102 @@ fn supervisor_stop_child(child_id: String) -> Result<(), String>;
 fn store_store_at_label(store_id: String, label: String, content: Vec<u8>) -> Result<String, String>;
 
 const LISTEN_ADDR: &str = "0.0.0.0:443";
-const API_HANDLER_MANIFEST: &str = "/home/colin/work/actors/inbox/api-handler/manifest.toml";
-const MAILBOX_MANIFEST: &str = "/home/colin/work/actors/inbox/mailbox/manifest.toml";
-const ROUTER_MANIFEST: &str = "/home/colin/work/actors/inbox/mailbox-router/manifest.toml";
-const SMTP_ACCEPTOR_MANIFEST: &str = "/home/colin/work/actors/inbox/smtp-acceptor/manifest.toml";
+
+// Default sub-manifest references — used ONLY by the backward-compat
+// branch of init() when initial_state is in the legacy line-prefix shape.
+// The systemd build_manifest.py on the VPS currently emits that shape.
+// Once move-inbox-under-sentinel cutover (roadmap item 2) happens, every
+// deploy passes JSON initial_state and these defaults become unused.
+const DEFAULT_API_HANDLER_MANIFEST: &str =
+    "/home/colin/work/actors/inbox/api-handler/manifest.toml";
+const DEFAULT_MAILBOX_MANIFEST: &str = "/home/colin/work/actors/inbox/mailbox/manifest.toml";
+const DEFAULT_ROUTER_MANIFEST: &str =
+    "/home/colin/work/actors/inbox/mailbox-router/manifest.toml";
+const DEFAULT_SMTP_ACCEPTOR_MANIFEST: &str =
+    "/home/colin/work/actors/inbox/smtp-acceptor/manifest.toml";
 
 const STORE_ID: &str = "inbox";
 const DKIM_KEY_LABEL: &str = "dkim-key";
 const BEARER_TOKEN_LABEL: &str = "api-bearer-token";
 
+#[derive(Deserialize)]
+struct Config {
+    bearer_token: String,
+    dkim_private_key: String,
+    api_handler_manifest: String,
+    mailbox_manifest: String,
+    router_manifest: String,
+    smtp_acceptor_manifest: String,
+}
+
 #[export(name = "theater:simple/actor.init")]
 fn init(state: Value) -> Result<(AcceptorState, ()), String> {
     log(String::from("[inbox-acceptor] init"));
 
-    // initial_state format: first line is the API bearer token(s), the rest is
-    // the DKIM private key (PEM). Both go into the shared store under
-    // stable labels so api-handler children can fetch them on demand.
-    //
-    // The bearer line MAY be a comma-separated list of bearer tokens during
-    // a rotation window (e.g. "<new>,<old>") — api-handler accepts any of
-    // them. Single-bearer deploys pre-rotation work unchanged.
     let raw = match state {
         Value::String(s) if !s.is_empty() => s,
         _ => {
             return Err(String::from(
-                "acceptor needs initial_state = \"<bearer-token>[,<bearer-token>...]\\n<DKIM PEM>\" in manifest",
+                "acceptor needs initial_state as a non-empty string \
+                 (JSON config or legacy '<bearer>\\n<DKIM PEM>')",
             ))
         }
     };
-    let (bearer_token, dkim_private_key_pem) = match raw.split_once('\n') {
-        Some((t, rest)) if !t.is_empty() => (t.to_string(), rest.to_string()),
-        _ => {
+
+    let (
+        bearer_token,
+        dkim_private_key,
+        api_handler_manifest,
+        mailbox_manifest,
+        router_manifest,
+        smtp_acceptor_manifest,
+    ) = if let Ok(cfg) = serde_json::from_str::<Config>(&raw) {
+        if cfg.bearer_token.is_empty() {
+            return Err(String::from("bearer_token must be non-empty"));
+        }
+        if cfg.dkim_private_key.is_empty() {
+            return Err(String::from("dkim_private_key must be non-empty"));
+        }
+        if cfg.api_handler_manifest.is_empty()
+            || cfg.mailbox_manifest.is_empty()
+            || cfg.router_manifest.is_empty()
+            || cfg.smtp_acceptor_manifest.is_empty()
+        {
             return Err(String::from(
-                "initial_state must be: <bearer-token>[,<bearer-token>...]\\n<DKIM PEM>",
-            ))
+                "all four *_manifest references must be non-empty",
+            ));
+        }
+        (
+            cfg.bearer_token,
+            cfg.dkim_private_key,
+            cfg.api_handler_manifest,
+            cfg.mailbox_manifest,
+            cfg.router_manifest,
+            cfg.smtp_acceptor_manifest,
+        )
+    } else {
+        // Backward-compat: legacy "<bearer-line>\n<DKIM PEM>" shape used by
+        // the systemd build_manifest.py on the VPS. Default the four
+        // sub-manifest references to the hardcoded file paths that shape
+        // implicitly relies on.
+        match raw.split_once('\n') {
+            Some((t, rest)) if !t.is_empty() => (
+                t.to_string(),
+                rest.to_string(),
+                String::from(DEFAULT_API_HANDLER_MANIFEST),
+                String::from(DEFAULT_MAILBOX_MANIFEST),
+                String::from(DEFAULT_ROUTER_MANIFEST),
+                String::from(DEFAULT_SMTP_ACCEPTOR_MANIFEST),
+            ),
+            _ => {
+                return Err(String::from(
+                    "initial_state is neither valid JSON config nor legacy \
+                     '<bearer-token>\\n<DKIM PEM>' shape",
+                ))
+            }
         }
     };
+
     store_store_at_label(
         String::from(STORE_ID),
         String::from(BEARER_TOKEN_LABEL),
@@ -113,7 +193,7 @@ fn init(state: Value) -> Result<(AcceptorState, ()), String> {
     store_store_at_label(
         String::from(STORE_ID),
         String::from(DKIM_KEY_LABEL),
-        dkim_private_key_pem.into_bytes(),
+        dkim_private_key.into_bytes(),
     )
     .map_err(|e| format!("persist dkim key failed: {}", e))?;
 
@@ -121,8 +201,8 @@ fn init(state: Value) -> Result<(AcceptorState, ()), String> {
     // and spawns mailbox actors on demand. supervisor.spawn now does
     // setup+auto-init: init_state is passed straight to the child's init.
     let router_id = supervisor_spawn(
-        String::from(ROUTER_MANIFEST),
-        Some(Value::String(String::from(MAILBOX_MANIFEST))),
+        router_manifest,
+        Some(Value::String(mailbox_manifest)),
         None,
     )
     .map_err(|e| format!("spawn router failed: {}", e))?;
@@ -138,7 +218,7 @@ fn init(state: Value) -> Result<(AcceptorState, ()), String> {
     // Spawn the SMTP acceptor and pass it the router ID so inbound mail
     // can be routed to the right mailbox.
     let smtp_acceptor_id = supervisor_spawn(
-        String::from(SMTP_ACCEPTOR_MANIFEST),
+        smtp_acceptor_manifest,
         Some(Value::String(router_id.clone())),
         None,
     )
@@ -153,7 +233,7 @@ fn init(state: Value) -> Result<(AcceptorState, ()), String> {
         AcceptorState {
             listener_id,
             router_id,
-            api_handler_manifest: String::from(API_HANDLER_MANIFEST),
+            api_handler_manifest,
         },
         (),
     ))
