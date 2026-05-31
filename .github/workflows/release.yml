@@ -89,6 +89,14 @@ jobs:
           [[handler]]
           type = "tcp"
 
+          # client_tls lets api-handler take over the TLS handshake on the
+          # connection inbox-acceptor transfers to it. auto_handshake=false
+          # so api-handler controls the timing (it runs the HTTP/1.1 path
+          # after TLS negotiation, including bearer-token auth + DKIM-sign).
+          [handler.client_tls]
+          enabled = true
+          auto_handshake = false
+
           [[handler]]
           type = "rpc"
 
@@ -172,6 +180,15 @@ jobs:
 
           [[handler]]
           type = "tcp"
+
+          # server_tls is used for STARTTLS upgrade after inbox-smtp-acceptor
+          # transfers the plain-TCP :25 connection here. Same cert/key as
+          # inbox-acceptor's :443 listener — single fullchain covers both
+          # ports on mail.colinrozzi.com.
+          [handler.server_tls]
+          enabled = true
+          cert = "/etc/letsencrypt/live/mail.colinrozzi.com/fullchain.pem"
+          key = "/etc/letsencrypt/live/mail.colinrozzi.com/privkey.pem"
 
           [[handler]]
           type = "rpc"
