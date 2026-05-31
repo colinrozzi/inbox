@@ -1,7 +1,14 @@
 # Sentinel-managed deploy template for inbox-acceptor.
 #
 # Sentinel renders this template by literal substring substitution of
-# the __X__ placeholders from its per-child config at every spawn:
+# the placeholders below (each wrapped in doubled underscores) from
+# its per-child config at every spawn:
+#
+# (Comment intentionally avoids writing an example placeholder name in
+# the doubled-underscore form — Phase 3.3's secret-validation regex
+# scans the whole template for that pattern and would treat an example
+# in a doc comment as a required secret. Manager patched this locally
+# on the 2026-05-31 cutover attempt; fixed in source here.)
 #
 #   children: {
 #     "inbox-acceptor": {
