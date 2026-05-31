@@ -53,21 +53,32 @@
 #   nc sentinel start inbox-acceptor" with a ~5-10s downtime window
 #   (CLI/HTTP clients retry; SMTP peers retry per RFC 5321 §4.5.4.1).
 #   See the cutover PR description for the full procedure.
+#
+# WHY initial_state IS A SINGLE-LINE TOML LITERAL (not multi-line):
+#   Sentinel embeds this entire template as a STRING value in its own
+#   outer manifest, which itself uses TOML triple-quote literal syntax.
+#   TOML literal strings have NO escape mechanism for nested triple
+#   quotes — if this template uses triple-quote for its inner
+#   initial_state, the outer parse closes the wrapping string early
+#   ("expected newline" error at the inner triple-quote position).
+#   Cutover attempt on 2026-05-31 hit this exact bug and rolled back.
+#   Keep initial_state as a single-line single-quote literal. Don't
+#   "improve readability" by re-introducing multi-line.
 
 name = "inbox-acceptor"
 version = "0.1.0"
 package = "__PACKAGE__"
-initial_state = '''
-{
-  "bearer_token":           "__BEARER_TOKEN__",
-  "dkim_private_key":       "__DKIM_PRIVATE_KEY__",
-  "api_handler_manifest":   "__API_HANDLER_MANIFEST__",
-  "mailbox_manifest":       "__MAILBOX_MANIFEST__",
-  "router_manifest":        "__ROUTER_MANIFEST__",
-  "smtp_acceptor_manifest": "__SMTP_ACCEPTOR_MANIFEST__",
-  "smtp_handler_manifest":  "__SMTP_HANDLER_MANIFEST__"
-}
-'''
+# JSON shape (one-line for nesting-safety; see operator note above):
+#   {
+#     "bearer_token":           "<token or comma-separated rotation list>",
+#     "dkim_private_key":       "<PEM, newlines as \n escapes>",
+#     "api_handler_manifest":   "<reference>",
+#     "mailbox_manifest":       "<reference>",
+#     "router_manifest":        "<reference>",
+#     "smtp_acceptor_manifest": "<reference>",
+#     "smtp_handler_manifest":  "<reference>"
+#   }
+initial_state = '{"bearer_token":"__BEARER_TOKEN__","dkim_private_key":"__DKIM_PRIVATE_KEY__","api_handler_manifest":"__API_HANDLER_MANIFEST__","mailbox_manifest":"__MAILBOX_MANIFEST__","router_manifest":"__ROUTER_MANIFEST__","smtp_acceptor_manifest":"__SMTP_ACCEPTOR_MANIFEST__","smtp_handler_manifest":"__SMTP_HANDLER_MANIFEST__"}'
 
 [[handler]]
 type = "runtime"
