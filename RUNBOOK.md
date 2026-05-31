@@ -270,3 +270,123 @@ INBOX_API=mail.colinrozzi.com:8080 ./cli/inbox send colin@colinrozzi.com \
 - DMARC is `p=none`. Bump to `quarantine` or `reject` once you've seen a few days of clean aggregate reports in the rua mailbox.
 - Under heavy concurrent load (>10–20 requests in a burst), individual TCP connections can fail with `Connection not found` — the acceptor logs each one and keeps running, but those requests are lost. Root cause is per-connection wasm-spawn cost serializing through one accept loop; fixes are an api-handler pool or a single long-lived api-handler.
 - Theater's `timer.now()` doesn't currently work from pack actors, so outbound mail has no `Date` or `Message-ID` header; receivers add `Date` for us. Untracked theater bug.
+
+## 12. Sentinel-managed deploy (cutover from systemd)
+
+Sections 1-9 describe the systemd-managed deploy that's the legacy path. Inbox was cut over to sentinel-managed deploy on 2026-05-31 (release tag `release-20260531-d3b180d`); this section is the operational procedure for that flow.
+
+### Prereqs
+
+- sentinel running on the VPS with Phase 3.3 or later (multi-actor supervision + per-child secret-validation)
+- Cert pair at `/etc/letsencrypt/live/mail.colinrozzi.com/{fullchain,privkey}.pem` (certbot-owned, renewed automatically)
+- Existing store at `/mnt/main-volume/inbox/store` (sentinel-managed deploy reuses the systemd-deploy's store — zero migration of mailbox data)
+
+### Per-deploy procedure
+
+```sh
+# 1. Cut a release tag against the desired inbox/main commit.
+#    Triggers .github/workflows/release.yml — uploads 7 wasms + 5
+#    sub-manifest TOMLs + tarball + sha256 as release assets.
+git tag release-$(date +%Y%m%d)-$(git rev-parse --short=7 HEAD) origin/main
+git push origin <tag>
+# Wait ~3-5 min for workflow to complete.
+
+# 2. Verify both TLS-bearing sub-manifests rendered correctly.
+TAG=release-YYYYMMDD-<sha7>
+curl -sL https://github.com/colinrozzi/inbox/releases/download/$TAG/inbox-api-handler-${TAG#release-}.toml | grep client_tls
+curl -sL https://github.com/colinrozzi/inbox/releases/download/$TAG/inbox-smtp-handler-${TAG#release-}.toml | grep server_tls
+# Both must return a matching line. If either is empty, the release
+# is broken — hold cutover, file a release.yml fix.
+
+# 3. Render sentinel's children.inbox-acceptor.manifest_template from
+#    sentinel/inbox-acceptor.template.toml in inbox/main HEAD. Substitute
+#    the 7 placeholders inline (sentinel will substitute again at spawn
+#    if the placeholders also appear in the live config).
+```
+
+### Sentinel children entry shape
+
+```
+children: {
+  "inbox-acceptor": {
+    manifest_template: <contents of sentinel/inbox-acceptor.template.toml>,
+    default_package:   "https://github.com/colinrozzi/inbox/releases/download/<TAG>/inbox_acceptor-<STAGE_TAG>.wasm",
+    secrets: {
+      "BEARER_TOKEN":            "<contents of /etc/inbox/api-token>",
+      "DKIM_PRIVATE_KEY":        "<PEM with newlines escaped as \\n>",
+      "API_HANDLER_MANIFEST":    "https://github.com/colinrozzi/inbox/releases/download/<TAG>/inbox-api-handler-<STAGE_TAG>.toml",
+      "MAILBOX_MANIFEST":        "https://github.com/colinrozzi/inbox/releases/download/<TAG>/inbox-mailbox-<STAGE_TAG>.toml",
+      "ROUTER_MANIFEST":         "https://github.com/colinrozzi/inbox/releases/download/<TAG>/inbox-mailbox-router-<STAGE_TAG>.toml",
+      "SMTP_ACCEPTOR_MANIFEST":  "https://github.com/colinrozzi/inbox/releases/download/<TAG>/inbox-smtp-acceptor-<STAGE_TAG>.toml",
+      "SMTP_HANDLER_MANIFEST":   "https://github.com/colinrozzi/inbox/releases/download/<TAG>/inbox-smtp-handler-<STAGE_TAG>.toml"
+    }
+  }
+}
+```
+
+`STAGE_TAG` is the `release-` prefix stripped: `release-20260531-d3b180d` → `20260531-d3b180d`.
+
+`DKIM_PRIVATE_KEY` MUST be JSON-escaped (newlines as `\n`) because the value lands inside a JSON string field in the rendered initial_state. Raw newlines break JSON parse. One-shot escape: `awk '{printf "%s\\n", $0}' /etc/inbox/dkim/private.pem`.
+
+### Cutover steps
+
+```sh
+# 0.5. Diff sentinel/inbox-acceptor.template.toml in inbox/main against
+#      the prod /home/colin/work/actors/inbox/acceptor/manifest.toml.
+#      If you find a stanza in prod that isn't in the in-repo template
+#      (TLS blocks, store paths, handler sub-tables), STOP and update
+#      the template first. The in-repo manifests are not authoritative
+#      for prod — build_manifest.py historically injected prod-only
+#      config at deploy time. Cutover attempt 2 on 2026-05-31 missed
+#      [handler.server_tls] this way; 3-min outage.
+
+# 1. Install rendered sentinel manifest (children map with inbox-acceptor
+#    entry per above), restart sentinel. Phase 3.3 secret-validation will
+#    refuse spawn if any placeholder lacks a matching secret.
+
+# 2. systemctl stop inbox.service
+#    Outage window starts.
+
+# 3. nc sentinel {cmd:start, name:inbox-acceptor, package:<URL>}
+#    Sentinel fetches the wasm, spawns inbox-acceptor. Acceptor parses
+#    JSON initial_state, persists bearer + DKIM to store, spawns the
+#    4 singleton sub-actors (mailbox-router, smtp-acceptor, etc.),
+#    starts restoring mailboxes from /mnt/main-volume/inbox/store.
+
+# 4. Poll until :443 AND :25 are bound AND TLS handshake completes.
+#    Sequential mailbox restoration adds ~3s per mailbox to bind time;
+#    a 10-mailbox store needs ~30s before the :443 listener is ready.
+#    Don't gate cutover on a fixed sleep — use a poll loop:
+until curl -sI --max-time 2 https://mail.colinrozzi.com:443 2>/dev/null | head -1 | grep -q HTTP; do sleep 2; done
+until openssl s_client -connect mail.colinrozzi.com:25 -starttls smtp -quiet </dev/null 2>/dev/null | grep -q '220'; do sleep 2; done
+
+# 5. Verify functionally: inbox CLI lookup of a known mailbox.
+INBOX_TOKEN=$(cat /etc/inbox/api-token) inbox lookup colin@colinrozzi.com
+
+# 6. systemctl disable inbox.service
+#    Reboot-safety — prevents systemd from racing sentinel to bind :443/:25
+#    on next host reboot.
+
+# 7. KEEP /etc/systemd/system/inbox.service on disk for at least 1 week
+#    as a rollback path. Delete only after sentinel-managed inbox is
+#    stable through ≥1 sentinel restart and ≥1 fresh inbox release.
+```
+
+### Rollback
+
+If the sentinel-managed inbox-acceptor fails health probes or shows unexpected behavior in the first hour:
+
+```sh
+nc sentinel {cmd:stop, name:inbox-acceptor}    # release :443 + :25
+systemctl enable inbox.service
+systemctl start inbox.service                  # systemd-managed inbox resumes
+```
+
+State on `/mnt/main-volume/inbox/store` is preserved across the rollback — mailboxes, router bindings, DKIM key, bearer token all carry over.
+
+### Known gotchas
+
+- **TLS bind timing**: mailbox restoration is sequential. ~3s per mailbox. A 10-mailbox store takes ~30s before `:443` accepts connections. A fixed-duration pre-cutover health gate (`sleep 8 && curl ...`) will fire before the listener is up. Use a poll loop (see step 4 above).
+- **In-repo manifest drift**: in-repo `acceptor/manifest.toml` and the 5 sub-manifests lack TLS / cert-path blocks that the prod systemd `build_manifest.py` script injects. When updating `sentinel/inbox-acceptor.template.toml` or `.github/workflows/release.yml`'s inline sub-manifests, ALWAYS diff against the live VPS-deployed manifest first. The 3 manifests that need TLS config: inbox-acceptor (server_tls), api-handler (client_tls, auto_handshake=false), smtp-handler (server_tls).
+- **TOML triple-quote nesting**: `sentinel/inbox-acceptor.template.toml`'s `initial_state` is a single-line literal `'...'` (not multi-line `'''...'''`). The sentinel outer manifest wraps the entire template body in a triple-quote literal; nested triple-quotes have no TOML escape and close the outer string early. Don't "improve readability" by re-introducing multi-line.
+- **Phase 3.3 secret-validation regex**: matches the doubled-underscore placeholder pattern literally anywhere in the template body, including in comments. Don't write `__EXAMPLE_PLACEHOLDER__` as a literal in any doc text — use prose or angle-bracketed examples instead.
