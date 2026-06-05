@@ -11,6 +11,7 @@
 //!   {
 //!     "bearer_token":           "<API bearer or comma-separated rotation list>",
 //!     "dkim_private_key":       "<PEM, newlines as \\n escapes inside JSON>",
+//!     "listen_addr":            "<host:port to bind the HTTP listener, e.g. 0.0.0.0:443 or 127.0.0.1:8443>",
 //!     "api_handler_manifest":   "<theater resolve_reference: file:/https:/store:>",
 //!     "mailbox_manifest":       "<same>",
 //!     "router_manifest":        "<same>",
@@ -18,10 +19,11 @@
 //!   }
 //!
 //! Backward-compat: if initial_state is NOT JSON, accept the legacy
-//! "<bearer-line>\n<DKIM PEM>" shape and use built-in default file-path
-//! references for the 4 sub-manifests (matching what the systemd
-//! build_manifest.py script on the VPS currently emits). Keeps the
-//! systemd path working through the refactor → cutover window.
+//! "<bearer-line>\n<DKIM PEM>" shape, use built-in default file-path
+//! references for the 4 sub-manifests, and default the listen address
+//! to 0.0.0.0:443 (matching what the systemd build_manifest.py script
+//! on the VPS currently emits). Keeps the systemd path working through
+//! the refactor → cutover window.
 
 #![no_std]
 extern crate alloc;
@@ -87,7 +89,9 @@ fn supervisor_stop_child(child_id: String) -> Result<(), String>;
 #[import(module = "theater:simple/store", name = "store-at-label")]
 fn store_store_at_label(store_id: String, label: String, content: Vec<u8>) -> Result<String, String>;
 
-const LISTEN_ADDR: &str = "0.0.0.0:443";
+// Default listen address used by the legacy backward-compat init path.
+// JSON-config deploys (sentinel-driven) supply listen_addr explicitly.
+const DEFAULT_LISTEN_ADDR: &str = "0.0.0.0:443";
 
 // Default sub-manifest references — used ONLY by the backward-compat
 // branch of init() when initial_state is in the legacy line-prefix shape.
@@ -110,6 +114,10 @@ const BEARER_TOKEN_LABEL: &str = "api-bearer-token";
 struct Config {
     bearer_token: String,
     dkim_private_key: String,
+    // host:port the HTTPS API listener binds. Sentinel substitutes
+    // this per-deploy so the frontdoor cutover can move the backend
+    // to a loopback port without a code change.
+    listen_addr: String,
     api_handler_manifest: String,
     mailbox_manifest: String,
     router_manifest: String,
@@ -143,6 +151,7 @@ fn init(state: Value) -> Result<(AcceptorState, ()), String> {
     let (
         bearer_token,
         dkim_private_key,
+        listen_addr,
         api_handler_manifest,
         mailbox_manifest,
         router_manifest,
@@ -157,6 +166,9 @@ fn init(state: Value) -> Result<(AcceptorState, ()), String> {
         if cfg.dkim_private_key.is_empty() {
             return Err(String::from("dkim_private_key must be non-empty"));
         }
+        if cfg.listen_addr.is_empty() {
+            return Err(String::from("listen_addr must be non-empty"));
+        }
         if cfg.api_handler_manifest.is_empty()
             || cfg.mailbox_manifest.is_empty()
             || cfg.router_manifest.is_empty()
@@ -170,6 +182,7 @@ fn init(state: Value) -> Result<(AcceptorState, ()), String> {
         (
             cfg.bearer_token,
             cfg.dkim_private_key,
+            cfg.listen_addr,
             cfg.api_handler_manifest,
             cfg.mailbox_manifest,
             cfg.router_manifest,
@@ -180,12 +193,15 @@ fn init(state: Value) -> Result<(AcceptorState, ()), String> {
         // Backward-compat: legacy "<bearer-line>\n<DKIM PEM>" shape used by
         // the systemd build_manifest.py on the VPS. Default the four
         // sub-manifest references to the hardcoded file paths that shape
-        // implicitly relies on. smtp_handler_manifest is None — smtp-acceptor
-        // receives a plain router_id string and uses its own default.
+        // implicitly relies on, and default listen_addr to 0.0.0.0:443 —
+        // the systemd path binds public :443 directly, no frontdoor.
+        // smtp_handler_manifest is None — smtp-acceptor receives a plain
+        // router_id string and uses its own default.
         match raw.split_once('\n') {
             Some((t, rest)) if !t.is_empty() => (
                 t.to_string(),
                 rest.to_string(),
+                String::from(DEFAULT_LISTEN_ADDR),
                 String::from(DEFAULT_API_HANDLER_MANIFEST),
                 String::from(DEFAULT_MAILBOX_MANIFEST),
                 String::from(DEFAULT_ROUTER_MANIFEST),
@@ -225,11 +241,11 @@ fn init(state: Value) -> Result<(AcceptorState, ()), String> {
     .map_err(|e| format!("spawn router failed: {}", e))?;
     log(format!("[inbox-acceptor] spawned mailbox-router {}", router_id));
 
-    let listener_id = tcp_listen(String::from(LISTEN_ADDR))
+    let listener_id = tcp_listen(listen_addr.clone())
         .map_err(|e| format!("listen failed: {}", e))?;
     log(format!(
         "[inbox-acceptor] HTTP listening on {} (id={})",
-        LISTEN_ADDR, listener_id
+        listen_addr, listener_id
     ));
 
     // Spawn the SMTP acceptor. When we have a smtp_handler_manifest
