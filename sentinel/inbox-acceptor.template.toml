@@ -17,6 +17,7 @@
 #       secrets: {
 #         "BEARER_TOKEN":            "...",
 #         "DKIM_PRIVATE_KEY":        "...",
+#         "LISTEN_ADDR":             "...",
 #         "API_HANDLER_MANIFEST":    "...",
 #         "MAILBOX_MANIFEST":        "...",
 #         "ROUTER_MANIFEST":         "...",
@@ -41,6 +42,14 @@
 #   list ("<new>,<old>"). api-handler accepts any token in the list (see
 #   api-handler/src/lib.rs:311). Set BEARER_TOKEN as a single-line string;
 #   no escape needed.
+#
+# OPERATOR NOTE — LISTEN_ADDR:
+#   host:port string the HTTPS API binds on this host. Pre-frontdoor:
+#   "0.0.0.0:443" (public bind). Post-frontdoor cutover: "127.0.0.1:8443"
+#   (loopback; frontdoor takes the public :443 and SNI-routes the raw
+#   encrypted stream to this backend). The backend still terminates TLS
+#   using the cert/key paths in [handler.server_tls] below, regardless of
+#   bind address.
 #
 # OPERATOR NOTE — MANIFEST REFERENCES:
 #   *_MANIFEST values are opaque references that theater's
@@ -79,13 +88,14 @@ package = "__PACKAGE__"
 #   {
 #     "bearer_token":           "<token or comma-separated rotation list>",
 #     "dkim_private_key":       "<PEM, newlines as \n escapes>",
+#     "listen_addr":            "<host:port for HTTPS bind>",
 #     "api_handler_manifest":   "<reference>",
 #     "mailbox_manifest":       "<reference>",
 #     "router_manifest":        "<reference>",
 #     "smtp_acceptor_manifest": "<reference>",
 #     "smtp_handler_manifest":  "<reference>"
 #   }
-initial_state = '{"bearer_token":"__BEARER_TOKEN__","dkim_private_key":"__DKIM_PRIVATE_KEY__","api_handler_manifest":"__API_HANDLER_MANIFEST__","mailbox_manifest":"__MAILBOX_MANIFEST__","router_manifest":"__ROUTER_MANIFEST__","smtp_acceptor_manifest":"__SMTP_ACCEPTOR_MANIFEST__","smtp_handler_manifest":"__SMTP_HANDLER_MANIFEST__"}'
+initial_state = '{"bearer_token":"__BEARER_TOKEN__","dkim_private_key":"__DKIM_PRIVATE_KEY__","listen_addr":"__LISTEN_ADDR__","api_handler_manifest":"__API_HANDLER_MANIFEST__","mailbox_manifest":"__MAILBOX_MANIFEST__","router_manifest":"__ROUTER_MANIFEST__","smtp_acceptor_manifest":"__SMTP_ACCEPTOR_MANIFEST__","smtp_handler_manifest":"__SMTP_HANDLER_MANIFEST__"}'
 
 [[handler]]
 type = "runtime"
