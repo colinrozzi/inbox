@@ -7,5 +7,5 @@ edition = "2021"
 crate-type = ["cdylib"]
 
 [dependencies]
-packr-guest = { version = "0.6.2", features = ["derive"] }
+packr-guest = { version = "0.7", features = ["derive"] }
 base64 = { version = "0.22", default-features = false, features = ["alloc"] }
