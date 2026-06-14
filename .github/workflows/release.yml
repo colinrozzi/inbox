@@ -82,6 +82,7 @@ jobs:
           name = "inbox-api-handler"
           version = "0.1.0"
           package = "${API_HANDLER_WASM_URL}"
+          static_package = true
 
           [[handler]]
           type = "runtime"
@@ -113,6 +114,7 @@ jobs:
           name = "inbox-mailbox"
           version = "0.1.0"
           package = "${MAILBOX_WASM_URL}"
+          static_package = true
 
           [[handler]]
           type = "runtime"
@@ -130,6 +132,7 @@ jobs:
           name = "inbox-mailbox-router"
           version = "0.1.0"
           package = "${ROUTER_WASM_URL}"
+          static_package = true
 
           [[handler]]
           type = "runtime"
@@ -153,6 +156,7 @@ jobs:
           name = "inbox-smtp-acceptor"
           version = "0.1.0"
           package = "${SMTP_ACCEPTOR_WASM_URL}"
+          static_package = true
 
           [[handler]]
           type = "runtime"
@@ -174,6 +178,7 @@ jobs:
           name = "inbox-smtp-handler"
           version = "0.1.0"
           package = "${SMTP_HANDLER_WASM_URL}"
+          static_package = true
 
           [[handler]]
           type = "runtime"
