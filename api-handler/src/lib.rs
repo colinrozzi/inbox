@@ -136,6 +136,12 @@ struct PutMessageRequest {
     subject: String,
     #[serde(default)]
     body: String,
+    #[serde(default)]
+    message_id: String,
+    #[serde(default)]
+    in_reply_to: String,
+    #[serde(default)]
+    references: String,
 }
 
 #[derive(Serialize)]
@@ -157,6 +163,13 @@ struct SendRequest {
     body: String,
     #[serde(default)]
     smtp_server: Option<String>,
+    /// RFC 5322 threading headers. When set, they're written verbatim onto the
+    /// outbound message (and folded into the DKIM signed-header set) so the
+    /// recipient's client groups the message into the existing conversation.
+    #[serde(default)]
+    in_reply_to: Option<String>,
+    #[serde(default)]
+    references: Option<String>,
 }
 
 /// `to` accepts either a single string or a list of strings, per the
@@ -200,6 +213,14 @@ struct InboxMessage {
     subject: String,
     body: String,
     received_at: u64,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    message_id: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    in_reply_to: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    references: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    thread_id: String,
 }
 
 #[derive(Serialize)]
@@ -489,6 +510,9 @@ fn handle_post_message(request_str: &str, mailbox_id: &str) -> Vec<u8> {
             Value::String(req.to),
             Value::String(req.subject),
             Value::String(req.body),
+            Value::String(req.message_id),
+            Value::String(req.in_reply_to),
+            Value::String(req.references),
         ]),
         Value::Tuple(alloc::vec![]),
     );
@@ -553,6 +577,8 @@ fn handle_send(request_str: &str, from: &str, dkim_private_key_pem: &str) -> Vec
         }
     }
 
+    let in_reply_to = req.in_reply_to.as_deref().unwrap_or("");
+    let references = req.references.as_deref().unwrap_or("");
     for (server, group_rcpts) in &groups {
         match smtp_deliver(
             server,
@@ -562,6 +588,8 @@ fn handle_send(request_str: &str, from: &str, dkim_private_key_pem: &str) -> Vec
             &req.cc,
             &req.subject,
             &req.body,
+            in_reply_to,
+            references,
             dkim_private_key_pem,
         ) {
             Ok(()) => delivered.extend(group_rcpts.iter().cloned()),
@@ -628,6 +656,8 @@ fn smtp_deliver(
     header_cc: &[String],
     subject: &str,
     body: &str,
+    in_reply_to: &str,
+    references: &str,
     dkim_private_key_pem: &str,
 ) -> Result<(), String> {
     let conn = tcp_connect(server_addr.to_string())
@@ -648,6 +678,8 @@ fn smtp_deliver(
         header_cc,
         subject,
         body,
+        in_reply_to,
+        references,
         dkim_private_key_pem,
     );
     let _ = tcp_close(conn);
@@ -663,6 +695,8 @@ fn smtp_session(
     header_cc: &[String],
     subject: &str,
     body: &str,
+    in_reply_to: &str,
+    references: &str,
     dkim_private_key_pem: &str,
 ) -> Result<(), String> {
     let ehlo_resp = smtp_command_get_body(conn, "EHLO inbox.local\r\n", 250)?;
@@ -699,6 +733,15 @@ fn smtp_session(
     headers.push_str(&format!("Subject: {}\r\n", subject));
     headers.push_str(&format!("Date: {}\r\n", rfc2822::format_date(now_ms)));
     headers.push_str(&format!("Message-ID: <{}>\r\n", message_id));
+    // Threading: chain this message onto the conversation it replies to. Gmail
+    // groups on the References/In-Reply-To chain, so these are what stop a
+    // reply from opening a fresh thread. Written before the DKIM sign below.
+    if !in_reply_to.is_empty() {
+        headers.push_str(&format!("In-Reply-To: {}\r\n", in_reply_to));
+    }
+    if !references.is_empty() {
+        headers.push_str(&format!("References: {}\r\n", references));
+    }
     headers.push_str("MIME-Version: 1.0\r\n");
     headers.push_str("Content-Type: text/plain; charset=utf-8\r\n");
 
@@ -709,17 +752,28 @@ fn smtp_session(
         body_crlf.push_str("\r\n");
     }
 
-    let signed_headers: &[&str] = if header_cc.is_empty() {
-        &["from", "to", "subject", "date", "message-id"]
-    } else {
-        &["from", "to", "cc", "subject", "date", "message-id"]
-    };
+    // Sign every header we actually wrote. Cc / In-Reply-To / References are
+    // only present when non-empty, and gmail only trusts the threading chain
+    // when it's covered by the DKIM signature.
+    let mut signed_headers: Vec<&str> = alloc::vec!["from", "to"];
+    if !header_cc.is_empty() {
+        signed_headers.push("cc");
+    }
+    signed_headers.push("subject");
+    signed_headers.push("date");
+    signed_headers.push("message-id");
+    if !in_reply_to.is_empty() {
+        signed_headers.push("in-reply-to");
+    }
+    if !references.is_empty() {
+        signed_headers.push("references");
+    }
 
     let dkim_signature = dkim::sign_message(
         dkim_private_key_pem,
         dkim::SELECTOR,
         dkim::DOMAIN,
-        signed_headers,
+        &signed_headers,
         &headers,
         body_crlf.as_bytes(),
     )?;
@@ -937,6 +991,10 @@ fn message_value_to_json(msg: &Value) -> InboxMessage {
         subject: String::new(),
         body: String::new(),
         received_at: 0,
+        message_id: String::new(),
+        in_reply_to: String::new(),
+        references: String::new(),
+        thread_id: String::new(),
     };
     if let Value::Record { fields, .. } = msg {
         for (k, v) in fields {
@@ -948,6 +1006,16 @@ fn message_value_to_json(msg: &Value) -> InboxMessage {
                 ("body", Value::String(s)) => out.body = s.clone(),
                 ("received-at", Value::U64(n)) | ("received_at", Value::U64(n)) => {
                     out.received_at = *n
+                }
+                ("message-id", Value::String(s)) | ("message_id", Value::String(s)) => {
+                    out.message_id = s.clone()
+                }
+                ("in-reply-to", Value::String(s)) | ("in_reply_to", Value::String(s)) => {
+                    out.in_reply_to = s.clone()
+                }
+                ("references", Value::String(s)) => out.references = s.clone(),
+                ("thread-id", Value::String(s)) | ("thread_id", Value::String(s)) => {
+                    out.thread_id = s.clone()
                 }
                 _ => {}
             }

@@ -56,8 +56,15 @@ commands:
                                              (--full bypasses the quoted-history strip)
   send <from> --to T [--to T2 ...] [--cc C ...] [--bcc B ...]
                 [--subject S] [--body B] [--smtp HOST:PORT]
+                [--in-reply-to MID] [--references "MID1 MID2"]
                                              send a message; --to/--cc/--bcc
                                              may each be repeated
+  reply <from> <id> --to T [--to T2 ...] [--cc C ...] [--bcc B ...]
+                [--subject S] [--body B] [--smtp HOST:PORT]
+                                             reply to message <id> in <from>'s
+                                             mailbox; auto-fills In-Reply-To +
+                                             References so it threads, and
+                                             defaults the subject to "Re: ..."
   forward <from> <id> --to T [--to T2 ...] [--cc C ...] [--note N]
                                              forward a message you've received
                                              (from your <from> mailbox) to one
@@ -166,6 +173,35 @@ case "$cmd" in
     [ $# -lt 1 ] && usage
     from=$1; shift
     to=() cc=() bcc=()
+    subject= body= smtp= inreplyto= references=
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --to) to+=("$2"); shift 2 ;;
+        --cc) cc+=("$2"); shift 2 ;;
+        --bcc) bcc+=("$2"); shift 2 ;;
+        --subject) subject=$2; shift 2 ;;
+        --body) body=$2; shift 2 ;;
+        --smtp) smtp=$2; shift 2 ;;
+        --in-reply-to) inreplyto=$2; shift 2 ;;
+        --references) references=$2; shift 2 ;;
+        *) usage ;;
+      esac
+    done
+    [ ${#to[@]} -lt 1 ] && { echo "send: at least one --to required" >&2; exit 2; }
+    to_json=$(json_array "${to[@]}")
+    cc_json=$(json_array ${cc[@]+"${cc[@]}"})
+    bcc_json=$(json_array ${bcc[@]+"${bcc[@]}"})
+    args=(address "$from" raw:to "$to_json" raw:cc "$cc_json" raw:bcc "$bcc_json"
+          subject "$subject" body "$body")
+    [ -n "$smtp" ] && args+=(smtp_server "$smtp")
+    [ -n "$inreplyto" ] && args+=(in_reply_to "$inreplyto")
+    [ -n "$references" ] && args+=(references "$references")
+    state=$(build_state send "${args[@]}")
+    ;;
+  reply)
+    [ $# -lt 2 ] && usage
+    from=$1; id=$2; shift 2
+    to=() cc=() bcc=()
     subject= body= smtp=
     while [ $# -gt 0 ]; do
       case "$1" in
@@ -178,14 +214,16 @@ case "$cmd" in
         *) usage ;;
       esac
     done
-    [ ${#to[@]} -lt 1 ] && { echo "send: at least one --to required" >&2; exit 2; }
+    [ ${#to[@]} -lt 1 ] && { echo "reply: at least one --to required" >&2; exit 2; }
     to_json=$(json_array "${to[@]}")
     cc_json=$(json_array ${cc[@]+"${cc[@]}"})
     bcc_json=$(json_array ${bcc[@]+"${bcc[@]}"})
-    args=(address "$from" raw:to "$to_json" raw:cc "$cc_json" raw:bcc "$bcc_json"
-          subject "$subject" body "$body")
+    args=(address "$from" raw:id "$id" raw:to "$to_json" raw:cc "$cc_json" raw:bcc "$bcc_json"
+          body "$body")
+    # Only pass subject when set, so the CLI computes "Re: <original>".
+    [ -n "$subject" ] && args+=(subject "$subject")
     [ -n "$smtp" ] && args+=(smtp_server "$smtp")
-    state=$(build_state send "${args[@]}")
+    state=$(build_state reply "${args[@]}")
     ;;
   *)
     usage
