@@ -52,6 +52,7 @@ pack_types! {
         theater:simple/tcp {
             listen: func(address: string) -> result<string, string>,
             transfer: func(connection-id: string, target-actor: string) -> result<_, string>,
+            transfer-async: func(connection-id: string, target-actor: string) -> result<_, string>,
         }
         theater:simple/supervisor {
             spawn: func(manifest: string, init-state: option<value>, wasm-bytes: option<list<u8>>) -> result<string, string>,
@@ -75,6 +76,9 @@ fn tcp_listen(address: String) -> Result<String, String>;
 
 #[import(module = "theater:simple/tcp", name = "transfer")]
 fn tcp_transfer(connection_id: String, target_actor: String) -> Result<(), String>;
+
+#[import(module = "theater:simple/tcp", name = "transfer-async")]
+fn tcp_transfer_async(connection_id: String, target_actor: String) -> Result<(), String>;
 
 #[import(module = "theater:simple/supervisor", name = "spawn")]
 fn supervisor_spawn(
@@ -316,11 +320,16 @@ fn try_handle_connection(state: &AcceptorState, connection_id: &str) -> Result<(
     )
     .map_err(|e| format!("spawn api-handler failed: {}", e))?;
 
-    if let Err(e) = tcp_transfer(connection_id.to_string(), handler_id.clone()) {
-        // Transfer failed — the api-handler is sitting there with no
-        // connection to handle. Stop it so we don't leak actors.
+    // Non-blocking hand-off: transfer-async flips connection ownership to the
+    // handler and returns immediately, instead of awaiting the handler's whole
+    // request lifecycle the way transfer does. That keeps this acceptor from
+    // serializing on each connection (the accept-loop wedge root cause). A
+    // synchronous Err here means the hand-off itself failed (bad handler / conn
+    // gone) — the handler was spawned but got no connection, so stop it. Handler
+    // failures *after* hand-off are cleaned up by the runtime, not returned here.
+    if let Err(e) = tcp_transfer_async(connection_id.to_string(), handler_id.clone()) {
         let _ = supervisor_stop_child(handler_id);
-        return Err(format!("transfer failed: {}", e));
+        return Err(format!("transfer-async failed: {}", e));
     }
     Ok(())
 }
