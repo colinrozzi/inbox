@@ -15,7 +15,13 @@ The CLI is *in this repo* and is what you'd dogfood:
 # reply / send  (--to/--cc/--bcc may each be repeated;
 #                cross-domain CC works — server routes per recipient)
 ./cli/inbox send inbox-dev@colinrozzi.com --to <addr> [--cc <addr>] [--bcc <addr>] \
-    --subject "..." --body "..."
+    --subject "..." --body "..." [--in-reply-to "<mid>"] [--references "<m1> <m2>"]
+
+# reply to a received message — auto-threads (In-Reply-To/References filled from
+# the original) so Gmail keeps it in ONE conversation; subject defaults to
+# "Re: <original>". Prefer this over hand-assembling a threaded `send`.
+./cli/inbox reply inbox-dev@colinrozzi.com <id> --to <addr> [--cc <addr>] [--bcc <addr>] \
+    [--subject "..."] --body "..."
 
 # forward a message you've received (preserves original from/subject/body)
 ./cli/inbox forward inbox-dev@colinrozzi.com <id> --to <addr> [--cc <addr>] [--note "..."]

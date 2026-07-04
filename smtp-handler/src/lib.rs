@@ -155,7 +155,7 @@ fn run_session(conn: &str, router_id: &str) -> Result<(), String> {
                 send_line(conn, "354 Start mail input; end with <CRLF>.<CRLF>")?;
 
                 let raw = read_data_block(conn)?;
-                let (subject, body) = parse_headers_and_body(&raw);
+                let parsed = parse_headers_and_body(&raw);
                 let from = mail_from.clone().unwrap_or_default();
 
                 // Store on each recipient's mailbox.
@@ -166,8 +166,11 @@ fn run_session(conn: &str, router_id: &str) -> Result<(), String> {
                         Value::Tuple(alloc::vec![
                             Value::String(from.clone()),
                             Value::String(to.clone()),
-                            Value::String(subject.clone()),
-                            Value::String(body.clone()),
+                            Value::String(parsed.subject.clone()),
+                            Value::String(parsed.body.clone()),
+                            Value::String(parsed.message_id.clone()),
+                            Value::String(parsed.in_reply_to.clone()),
+                            Value::String(parsed.references.clone()),
                         ]),
                         Value::Tuple(alloc::vec![]),
                     );
@@ -274,15 +277,31 @@ fn read_data_block(conn: &str) -> Result<String, String> {
     }
 }
 
-/// Parse the RFC 822 message: pull out `Subject`, find the content-type, and
-/// extract a clean body. For `multipart/*` messages the first `text/plain`
-/// part wins; for plain messages the whole post-header section is the body.
-/// Handles `quoted-printable` and `base64` Content-Transfer-Encoding.
-fn parse_headers_and_body(raw: &str) -> (String, String) {
+/// A parsed inbound message: the display fields plus the RFC 5322 threading
+/// headers (`Message-ID` / `In-Reply-To` / `References`) so a reply can chain
+/// back into the same conversation. Threading headers are empty when the
+/// sender didn't set them.
+struct ParsedMessage {
+    subject: String,
+    body: String,
+    message_id: String,
+    in_reply_to: String,
+    references: String,
+}
+
+/// Parse the RFC 822 message: pull out `Subject`, the threading headers, find
+/// the content-type, and extract a clean body. For `multipart/*` messages the
+/// first `text/plain` part wins; for plain messages the whole post-header
+/// section is the body. Handles `quoted-printable` and `base64`
+/// Content-Transfer-Encoding.
+fn parse_headers_and_body(raw: &str) -> ParsedMessage {
     let mut header_end = 0usize;
     let mut subject = String::new();
     let mut content_type = String::new();
     let mut content_encoding = String::new();
+    let mut message_id = String::new();
+    let mut in_reply_to = String::new();
+    let mut references = String::new();
     let mut last_header_name: Option<String> = None;
 
     for line in raw.split_inclusive('\n') {
@@ -292,7 +311,8 @@ fn parse_headers_and_body(raw: &str) -> (String, String) {
             break;
         }
         // Header folding: a continuation line starts with WSP and belongs to
-        // the previous header's value.
+        // the previous header's value. `References` in particular is routinely
+        // folded across several lines.
         if (line.starts_with(' ') || line.starts_with('\t')) && last_header_name.is_some() {
             match last_header_name.as_deref() {
                 Some(n) if n.eq_ignore_ascii_case("subject") => {
@@ -306,6 +326,18 @@ fn parse_headers_and_body(raw: &str) -> (String, String) {
                 Some(n) if n.eq_ignore_ascii_case("content-transfer-encoding") => {
                     content_encoding.push(' ');
                     content_encoding.push_str(stripped.trim());
+                }
+                Some(n) if n.eq_ignore_ascii_case("message-id") => {
+                    message_id.push(' ');
+                    message_id.push_str(stripped.trim());
+                }
+                Some(n) if n.eq_ignore_ascii_case("in-reply-to") => {
+                    in_reply_to.push(' ');
+                    in_reply_to.push_str(stripped.trim());
+                }
+                Some(n) if n.eq_ignore_ascii_case("references") => {
+                    references.push(' ');
+                    references.push_str(stripped.trim());
                 }
                 _ => {}
             }
@@ -321,6 +353,12 @@ fn parse_headers_and_body(raw: &str) -> (String, String) {
                 content_type = value;
             } else if name.eq_ignore_ascii_case("content-transfer-encoding") {
                 content_encoding = value;
+            } else if name.eq_ignore_ascii_case("message-id") {
+                message_id = value;
+            } else if name.eq_ignore_ascii_case("in-reply-to") {
+                in_reply_to = value;
+            } else if name.eq_ignore_ascii_case("references") {
+                references = value;
             }
             last_header_name = Some(name);
         }
@@ -335,7 +373,13 @@ fn parse_headers_and_body(raw: &str) -> (String, String) {
             .trim_end()
             .to_string()
     };
-    (subject, body)
+    ParsedMessage {
+        subject,
+        body,
+        message_id,
+        in_reply_to,
+        references,
+    }
 }
 
 /// If `Content-Type: multipart/...; boundary=...`, return the boundary value.

@@ -10,9 +10,17 @@ POST /v1/mailboxes                          → register a new address (explicit
 GET  /v1/mailboxes                          → list registered addresses
 GET  /v1/mailboxes/<addr>                   → look up an address (returns mailbox_id)
 
-GET  /v1/mailboxes/<addr>/inbox?since=<n>   → list messages with id ≥ n
+GET  /v1/mailboxes/<addr>/inbox?since=<n>   → list messages with id ≥ n.
+                                              Each message carries id/from/to/
+                                              subject/body/received_at, plus
+                                              message_id/in_reply_to/references/
+                                              thread_id when the inbound mail had
+                                              threading headers (omitted when
+                                              empty).
 POST /v1/mailboxes/<addr>/messages          → direct insert (testing/admin)
-                                              body: {"from","to","subject","body"}
+                                              body: {"from","to","subject","body",
+                                                     "message_id","in_reply_to",
+                                                     "references"  // all optional}
 POST /v1/mailboxes/<addr>/send              → SMTP-deliver from <addr>. No
                                               sender-copy is recorded; Bcc
                                               yourself if you want one (it
@@ -23,7 +31,14 @@ POST /v1/mailboxes/<addr>/send              → SMTP-deliver from <addr>. No
                                                      "cc":[...],   // optional
                                                      "bcc":[...],  // optional
                                                      "subject","body",
-                                                     "smtp_server":"..."  // optional fallback}
+                                                     "smtp_server":"...",  // optional fallback
+                                                     "in_reply_to":"<mid>",   // optional
+                                                     "references":"<m1> <m2>"} // optional
+                                              in_reply_to/references, when set,
+                                              are written as RFC 5322 threading
+                                              headers and folded into the DKIM
+                                              signed-header set, so the reply
+                                              groups into the same conversation.
                                               `to` also accepts a bare string
                                               for one recipient. Recipients are
                                               grouped by destination — the
@@ -126,10 +141,21 @@ Then:
 ./cli/inbox send alice@yourdomain.com --to bob@example.com \
                   [--to carol@example.com]... [--cc dan@example.com]... \
                   [--bcc eve@example.com]... \
-                  --subject "hi" --body "hello"
+                  --subject "hi" --body "hello" \
+                  [--in-reply-to "<mid>"] [--references "<m1> <m2>"]
+./cli/inbox reply alice@yourdomain.com <id> --to bob@example.com \
+                  [--cc carol@example.com]... [--bcc eve@example.com]... \
+                  [--subject "..."] --body "hello"
 ./cli/inbox forward alice@yourdomain.com <id> --to bob@example.com \
                   [--cc carol@example.com]... [--note "fwd note"]
 ```
+
+`reply` looks up message `<id>` in `<from>`'s mailbox and sends a reply that
+auto-fills the RFC 5322 threading chain: `In-Reply-To` = the original's
+`Message-ID`, `References` = the original's `References` plus its `Message-ID`.
+The subject defaults to `Re: <original-subject>` (override with `--subject`).
+This is the ergonomic path — agents shouldn't hand-assemble chains; `send`'s
+raw `--in-reply-to`/`--references` flags exist only for manual control.
 
 `forward` looks up message `<id>` in `<from>`'s mailbox and resends it as
 `Fwd: <original-subject>` to the `--to`/`--cc` recipients. `--note` adds
@@ -196,7 +222,8 @@ For a real deployment (real domain, real internet mail, systemd, GC roots), see 
 - [ ] Per-mailbox tokens (currently one shared token authorizes every route)
 - [ ] STARTTLS on SMTP (inbound :25 + outbound to receiving MX)
 - [ ] Theater-side: graceful TLS shutdown on `tcp.close` (currently the CLI works around it by stopping at Content-Length)
-- [ ] Threads (group messages by `In-Reply-To` chain, expose `thread_id`)
+- [x] Threading headers end-to-end (emit + persist `In-Reply-To`/`References`/`Message-ID`; `cli reply` auto-threads; `thread_id` stored)
+- [ ] Threads read-side view (group messages by `thread_id` in `read` output)
 - [ ] Async outbound delivery (relay actor instead of synchronous from api-handler)
 - [ ] DKIM verification on inbound (currently only signs outbound; verified-sender flag)
 

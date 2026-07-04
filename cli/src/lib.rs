@@ -143,6 +143,10 @@ struct CliCommand {
     id: u64,
     #[serde(default)]
     note: Option<String>,
+    #[serde(default)]
+    in_reply_to: Option<String>,
+    #[serde(default)]
+    references: Option<String>,
 }
 
 fn default_api() -> String {
@@ -202,6 +206,10 @@ struct InboxMessage {
     body: String,
     #[serde(default)]
     received_at: u64,
+    #[serde(default)]
+    message_id: String,
+    #[serde(default)]
+    references: String,
 }
 
 // ============================================================================
@@ -215,6 +223,7 @@ fn run(req: &CliCommand) -> Result<(), String> {
         "lookup" => run_lookup(req),
         "read" => run_read(req),
         "send" => run_send(req),
+        "reply" => run_reply(req),
         "forward" => run_forward(req),
         other => Err(format!("unknown cmd: {}", other)),
     }
@@ -282,6 +291,10 @@ fn run_send(req: &CliCommand) -> Result<(), String> {
         body: &'a str,
         #[serde(skip_serializing_if = "Option::is_none")]
         smtp_server: Option<&'a str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        in_reply_to: Option<&'a str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        references: Option<&'a str>,
     }
 
     let body_json = serde_json::to_string(&SendBody {
@@ -291,6 +304,8 @@ fn run_send(req: &CliCommand) -> Result<(), String> {
         subject: req.subject.as_deref().unwrap_or(""),
         body: req.body.as_deref().unwrap_or(""),
         smtp_server: req.smtp_server.as_deref(),
+        in_reply_to: req.in_reply_to.as_deref(),
+        references: req.references.as_deref(),
     })
     .map_err(|e| format!("encode body: {}", e))?;
 
@@ -298,6 +313,119 @@ fn run_send(req: &CliCommand) -> Result<(), String> {
     let body = http(req, "POST", &path, Some(&body_json))?;
     out(&format!("{}\n", body));
     Ok(())
+}
+
+/// `./cli/inbox reply <from> <id> --to T... [--cc C...] [--bcc B...]
+/// [--subject S] [--body B] [--smtp HOST:PORT]`.
+///
+/// Reply to message `<id>` in `<from>`'s mailbox, auto-filling the RFC 5322
+/// threading chain so the reply lands in the same conversation. `In-Reply-To`
+/// becomes the original's `Message-ID`; `References` becomes the original's
+/// `References` plus its `Message-ID`. Subject defaults to `Re: <original>`
+/// unless `--subject` overrides it. Routing reuses the normal /send path.
+fn run_reply(req: &CliCommand) -> Result<(), String> {
+    let addr = req.address.as_ref().ok_or("reply: <from> required")?;
+    if req.to.is_empty() {
+        return Err(String::from("reply: at least one --to required"));
+    }
+
+    // Pull the original from the replier's mailbox (since=0 scans everything;
+    // cheap for typical inbox sizes, same pattern as `forward`).
+    let inbox_path = format!("/v1/mailboxes/{}/inbox?since=0", url_encode(addr));
+    let body = http(req, "GET", &inbox_path, None)?;
+    let page: InboxPage = serde_json::from_str(&body)
+        .map_err(|e| format!("parse /inbox response: {}", e))?;
+    let original = page
+        .messages
+        .iter()
+        .find(|m| m.id == req.id)
+        .ok_or_else(|| format!("no message id={} in {}'s mailbox", req.id, addr))?;
+
+    // Subject: honor an explicit --subject, else prefix Re: unless already there.
+    let new_subject = match req.subject.as_deref().filter(|s| !s.is_empty()) {
+        Some(s) => s.to_string(),
+        None => {
+            if original.subject.to_ascii_lowercase().starts_with("re:") {
+                original.subject.clone()
+            } else {
+                format!("Re: {}", original.subject)
+            }
+        }
+    };
+
+    // Threading chain. Missing parent Message-ID (e.g. a pre-migration
+    // message) just means no chain — the send still goes, it just won't group.
+    let parent_id = original.message_id.trim();
+    let in_reply_to = if parent_id.is_empty() {
+        None
+    } else {
+        Some(ensure_angle(parent_id))
+    };
+    let references = build_references(&original.references, parent_id);
+
+    #[derive(Serialize)]
+    struct SendBody<'a> {
+        to: &'a [String],
+        #[serde(skip_serializing_if = "<[String]>::is_empty")]
+        cc: &'a [String],
+        #[serde(skip_serializing_if = "<[String]>::is_empty")]
+        bcc: &'a [String],
+        subject: &'a str,
+        body: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        smtp_server: Option<&'a str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        in_reply_to: Option<&'a str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        references: Option<&'a str>,
+    }
+
+    let body_json = serde_json::to_string(&SendBody {
+        to: &req.to,
+        cc: &req.cc,
+        bcc: &req.bcc,
+        subject: &new_subject,
+        body: req.body.as_deref().unwrap_or(""),
+        smtp_server: req.smtp_server.as_deref(),
+        in_reply_to: in_reply_to.as_deref(),
+        references: references.as_deref(),
+    })
+    .map_err(|e| format!("encode body: {}", e))?;
+
+    let send_path = format!("/v1/mailboxes/{}/send", url_encode(addr));
+    let resp = http(req, "POST", &send_path, Some(&body_json))?;
+    out(&format!("{}\n", resp));
+    Ok(())
+}
+
+/// Wrap a bare message-id in angle brackets if it isn't already. RFC 5322
+/// msg-ids in In-Reply-To / References are always angle-bracketed.
+fn ensure_angle(id: &str) -> String {
+    let t = id.trim();
+    if t.starts_with('<') && t.ends_with('>') {
+        t.to_string()
+    } else {
+        format!("<{}>", t)
+    }
+}
+
+/// Build the reply's `References` value: the parent's References (each token
+/// preserved) followed by the parent's own Message-ID. Returns `None` when
+/// there's nothing to chain.
+fn build_references(parent_refs: &str, parent_msgid: &str) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+    for tok in parent_refs.split_whitespace() {
+        parts.push(tok.to_string());
+    }
+    let pid = parent_msgid.trim();
+    if !pid.is_empty() {
+        parts.push(ensure_angle(pid));
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(" "))
+    }
 }
 
 /// `./cli/inbox forward <from> <id> --to T... [--cc C...] [--note N]`.
