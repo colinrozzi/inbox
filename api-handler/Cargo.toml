@@ -7,7 +7,7 @@ edition = "2021"
 crate-type = ["cdylib"]
 
 [dependencies]
-packr-guest = { version = "0.7", features = ["derive"] }
+packr-guest = { version = "0.8.1", features = ["derive", "pic"] }
 # DKIM signing: RSA-SHA256, relaxed/relaxed canonicalization.
 # rsa 0.9 supports no_std+alloc; PKCS#1 v1.5 sign is deterministic so no RNG needed,
 # but the crate still references getrandom transitively — register a custom backend.

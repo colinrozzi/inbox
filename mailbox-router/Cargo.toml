@@ -7,4 +7,4 @@ edition = "2021"
 crate-type = ["cdylib"]
 
 [dependencies]
-packr-guest = { version = "0.7", features = ["derive"] }
+packr-guest = { version = "0.8.1", features = ["derive", "pic"] }
