@@ -17,10 +17,6 @@ GET  /v1/mailboxes/<addr>/inbox?since=<n>   → list messages with id ≥ n.
                                               thread_id when the inbound mail had
                                               threading headers (omitted when
                                               empty).
-POST /v1/mailboxes/<addr>/messages          → direct insert (testing/admin)
-                                              body: {"from","to","subject","body",
-                                                     "message_id","in_reply_to",
-                                                     "references"  // all optional}
 POST /v1/mailboxes/<addr>/send              → SMTP-deliver from <addr>. No
                                               sender-copy is recorded; Bcc
                                               yourself if you want one (it
