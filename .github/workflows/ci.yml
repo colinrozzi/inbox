@@ -1,0 +1,37 @@
+name: CI
+
+# Machine-compile every branch change WITHOUT cutting a release. `release.yml`
+# only fires on `release-*` tags, so until now PRs merged un-compiled — a
+# change could break `nix build` and nobody would know until release time.
+# This runs the same workspace build as the release's sanity-check step, on
+# pull requests and on pushes to main, so a broken build blocks the PR.
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Read-only: this workflow only builds, it never publishes or tags.
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  build:
+    name: Build workspace (nix build)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: DeterminateSystems/nix-installer-action@main
+
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+
+      # Same build the release job uses as its gate. Produces result/ with the
+      # seven wasm actors; fails (and blocks the PR) if the workspace does not
+      # compile.
+      - name: Build workspace
+        run: nix build
