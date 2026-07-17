@@ -11,7 +11,12 @@
     crane.url = "github:ipetkov/crane";
 
     theater = {
-      url = "github:colinrozzi/theater";
+      # Canonical fleet rev (post-`theater compose`, theater PR #141): the ONE
+      # rev every actor's theater input pins AND the rev the prod binary is cut
+      # from (the atomic-flip contract). theaterBin from here ships `theater
+      # compose`. Manager bumps flake.lock's narHash on the dev box (container
+      # agents can't nix-flake-update).
+      url = "github:colinrozzi/theater/7daab2ada0051f0517bf8cf3de9719fc2d75e0f6";
       inputs.nixpkgs.follows = "nixpkgs";
       inputs.rust-overlay.follows = "rust-overlay";
       inputs.crane.follows = "crane";
@@ -79,31 +84,36 @@
         theaterBin = theater.packages.${system}.default;
 
       in {
-        # nix build — produces all seven cargo-built .wasm MEMBERS in $out.
+        # nix build — produces all seven self-contained COMPOSITES in $out as
+        # inbox_<actor>.composite.wasm (the deployable 0.10.2 artifacts).
         #
-        # ⚠️ 0.10.2 cutover, STILL PENDING: these are bare fixed-base members,
-        # NOT the deployable self-contained composites. theater's 0.10.x loader
-        # (assert_self_contained) REJECTS a bare member. The composite = member +
-        # packr bundled allocator, fused via packr::link (`wasm-merge`), verified
-        # with wasm-tools (residual imports must be host theater:simple/* only).
-        # This flake does not yet run that compose step because it needs (a) the
-        # `theater` input bumped to the 0.10.2 rev so theaterBin ships the
-        # compose tooling, and (b) a crane-friendly way to invoke it on a
-        # prebuilt member (the shipped `theater build` re-runs cargo; there is no
-        # standalone `theater compose <member>` CLI yet). Tracked with theater-dev.
-        # Until then, `nix build` validates ONLY that the members compile under
-        # 0.10.2 + the fixed-base recipe — it does not emit loadable artifacts.
+        # crane builds the bare fixed-base members; `theater compose` then fuses
+        # each member + packr's bundled allocator into an own-memory composite
+        # (single-package, base 0x50000) and verifies it (residual imports must
+        # be host theater:simple/* only — no env.memory / pack:alloc /
+        # __linear_memory). theater's 0.10.x loader (assert_self_contained)
+        # rejects a bare member, so ONLY the composites are installed. `theater
+        # compose` verifies by default and fails the build on a non-self-contained
+        # artifact, so a bad member never installs. Needs theaterBin (0.10.2 rev,
+        # pinned above) + wasm-merge (binaryen) + wasm-tools on PATH.
         packages.default = craneLib.buildPackage (commonArgs // {
           inherit cargoArtifacts;
+          nativeBuildInputs = [ theaterBin pkgs.binaryen pkgs.wasm-tools ];
           installPhaseCommand = ''
             mkdir -p $out
-            cp target/wasm32-unknown-unknown/release/inbox_acceptor.wasm $out/
-            cp target/wasm32-unknown-unknown/release/inbox_api_handler.wasm $out/
-            cp target/wasm32-unknown-unknown/release/inbox_cli.wasm $out/
-            cp target/wasm32-unknown-unknown/release/inbox_mailbox.wasm $out/
-            cp target/wasm32-unknown-unknown/release/inbox_mailbox_router.wasm $out/
-            cp target/wasm32-unknown-unknown/release/inbox_smtp_acceptor.wasm $out/
-            cp target/wasm32-unknown-unknown/release/inbox_smtp_handler.wasm $out/
+            for name in \
+              inbox_acceptor \
+              inbox_api_handler \
+              inbox_cli \
+              inbox_mailbox \
+              inbox_mailbox_router \
+              inbox_smtp_acceptor \
+              inbox_smtp_handler
+            do
+              theater compose \
+                "target/wasm32-unknown-unknown/release/$name.wasm" \
+                -o "$out/$name.composite.wasm"
+            done
           '';
         });
 
