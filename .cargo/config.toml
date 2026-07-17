@@ -1,2 +1,22 @@
+# Fixed-base self-contained member (packr 0.10.2). Replaces the old 0.8.1 PIC
+# side-module flags entirely (no relocation-model=pic / --experimental-pic /
+# -shared / --export=__wasm_call_ctors). packr::link (via `theater build` /
+# `theater compose`) internalizes pack:alloc + memory into an own-memory
+# composite; these flags build each member at a fixed absolute base so its data
+# needs no relocation. --global-base=327680 (0x50000) is the first package slot
+# for a SINGLE-package actor — all seven inbox actors are single-package (no
+# [[link]] edges), so they share this base. --no-merge-data-segments keeps the
+# CGRF __pack_types metadata as its own segment so packr's read_surface finds it.
+#
+# NOTE: crane does NOT honor this file (kept for devshell / plain-cargo builds);
+# flake.nix passes the same flags via CARGO_ENCODED_RUSTFLAGS. Keep the two in sync.
 [target.wasm32-unknown-unknown]
-rustflags = ["-C","relocation-model=pic","-C","link-arg=--experimental-pic","-C","link-arg=-shared","-C","link-arg=--import-memory","-C","link-arg=--export=__wasm_call_ctors"]
+rustflags = [
+    "-C", "link-arg=--import-memory",
+    "-C", "link-arg=--initial-memory=8388608",
+    "-C", "link-arg=--stack-first",
+    "-C", "link-arg=-zstack-size=262144",
+    "-C", "link-arg=--global-base=327680",
+    "-C", "link-arg=--no-entry",
+    "-C", "link-arg=--no-merge-data-segments",
+]

@@ -11,7 +11,12 @@
     crane.url = "github:ipetkov/crane";
 
     theater = {
-      url = "github:colinrozzi/theater";
+      # Canonical fleet rev (post-`theater compose`, theater PR #141): the ONE
+      # rev every actor's theater input pins AND the rev the prod binary is cut
+      # from (the atomic-flip contract). theaterBin from here ships `theater
+      # compose`. Manager bumps flake.lock's narHash on the dev box (container
+      # agents can't nix-flake-update).
+      url = "github:colinrozzi/theater/7daab2ada0051f0517bf8cf3de9719fc2d75e0f6";
       inputs.nixpkgs.follows = "nixpkgs";
       inputs.rust-overlay.follows = "rust-overlay";
       inputs.crane.follows = "crane";
@@ -39,20 +44,26 @@
             (type == "directory");
         };
 
-        # PIC side-module link flags (packr 0.8.x recipe). These MUST reach
+        # Fixed-base self-contained member link flags (packr 0.10.2 recipe;
+        # supersedes the 0.8.1 PIC side-module flags — PIC is gone). MUST reach
         # the real cargo invocation. crane does NOT honor the repo
         # .cargo/config.toml (kept in-tree for devshell / plain-cargo builds),
         # so pass them via CARGO_ENCODED_RUSTFLAGS — highest cargo precedence,
         # cannot be shadowed by config. Flags are joined by 0x1f (ASCII unit
         # separator), cargo's encoded-rustflags delimiter, produced here via
         # fromJSON's  escape.
-        picSep = builtins.fromJSON "\"\\u001f\"";
-        picRustflags = builtins.concatStringsSep picSep [
-          "-C" "relocation-model=pic"
-          "-C" "link-arg=--experimental-pic"
-          "-C" "link-arg=-shared"
+        # Keep this list identical to .cargo/config.toml. --global-base=327680
+        # (0x50000) is the single-package base; all seven inbox actors are
+        # single-package (no [[link]] edges) so it applies to every member.
+        rfSep = builtins.fromJSON "\"\\u001f\"";
+        fixedBaseRustflags = builtins.concatStringsSep rfSep [
           "-C" "link-arg=--import-memory"
-          "-C" "link-arg=--export=__wasm_call_ctors"
+          "-C" "link-arg=--initial-memory=8388608"
+          "-C" "link-arg=--stack-first"
+          "-C" "link-arg=-zstack-size=262144"
+          "-C" "link-arg=--global-base=327680"
+          "-C" "link-arg=--no-entry"
+          "-C" "link-arg=--no-merge-data-segments"
         ];
 
         commonArgs = {
@@ -61,31 +72,48 @@
           version = "0.1.0";
           cargoExtraArgs = "--target wasm32-unknown-unknown";
           CARGO_BUILD_TARGET = "wasm32-unknown-unknown";
-          CARGO_ENCODED_RUSTFLAGS = picRustflags;
+          CARGO_ENCODED_RUSTFLAGS = fixedBaseRustflags;
           doCheck = false;
         };
 
-        # No buildDepsOnly: with the PIC link flags, crane's synthetic
-        # deps-only dummy crate fails to link (-shared needs __heap_base/
-        # __data_end, which only the real crates get from packr-guest's
-        # `pic` feature). Build everything in one buildPackage pass instead.
+        # cargoArtifacts=null: per the recipe's crane note, keep the wasm member
+        # build off a shared host cargoArtifacts (don't share host artifacts into
+        # the wasm32-unknown-unknown build). One buildPackage pass.
         cargoArtifacts = null;
 
         theaterBin = theater.packages.${system}.default;
 
       in {
-        # nix build — produces all six .wasm artifacts in $out
+        # nix build — produces all seven self-contained COMPOSITES in $out as
+        # inbox_<actor>.composite.wasm (the deployable 0.10.2 artifacts).
+        #
+        # crane builds the bare fixed-base members; `theater compose` then fuses
+        # each member + packr's bundled allocator into an own-memory composite
+        # (single-package, base 0x50000) and verifies it (residual imports must
+        # be host theater:simple/* only — no env.memory / pack:alloc /
+        # __linear_memory). theater's 0.10.x loader (assert_self_contained)
+        # rejects a bare member, so ONLY the composites are installed. `theater
+        # compose` verifies by default and fails the build on a non-self-contained
+        # artifact, so a bad member never installs. Needs theaterBin (0.10.2 rev,
+        # pinned above) + wasm-merge (binaryen) + wasm-tools on PATH.
         packages.default = craneLib.buildPackage (commonArgs // {
           inherit cargoArtifacts;
+          nativeBuildInputs = [ theaterBin pkgs.binaryen pkgs.wasm-tools ];
           installPhaseCommand = ''
             mkdir -p $out
-            cp target/wasm32-unknown-unknown/release/inbox_acceptor.wasm $out/
-            cp target/wasm32-unknown-unknown/release/inbox_api_handler.wasm $out/
-            cp target/wasm32-unknown-unknown/release/inbox_cli.wasm $out/
-            cp target/wasm32-unknown-unknown/release/inbox_mailbox.wasm $out/
-            cp target/wasm32-unknown-unknown/release/inbox_mailbox_router.wasm $out/
-            cp target/wasm32-unknown-unknown/release/inbox_smtp_acceptor.wasm $out/
-            cp target/wasm32-unknown-unknown/release/inbox_smtp_handler.wasm $out/
+            for name in \
+              inbox_acceptor \
+              inbox_api_handler \
+              inbox_cli \
+              inbox_mailbox \
+              inbox_mailbox_router \
+              inbox_smtp_acceptor \
+              inbox_smtp_handler
+            do
+              theater compose \
+                "target/wasm32-unknown-unknown/release/$name.wasm" \
+                -o "$out/$name.composite.wasm"
+            done
           '';
         });
 
@@ -104,12 +132,14 @@
         };
 
         devShells.default = craneLib.devShell {
-          packages = [ rustToolchain theaterBin ];
+          # binaryen (wasm-merge) + wasm-tools are required by `theater build`
+          # to compose + verify the self-contained composite (packr 0.10.2).
+          packages = [ rustToolchain theaterBin pkgs.binaryen pkgs.wasm-tools ];
           shellHook = ''
             echo "inbox dev environment"
-            echo "  cargo build --release --target wasm32-unknown-unknown"
-            echo "  theater start acceptor/manifest.toml"
-            echo "  curl http://localhost:8080/v1/inbox"
+            echo "  cargo build --release --target wasm32-unknown-unknown   # bare member"
+            echo "  theater build --release <actor-dir>                     # self-contained composite (needs theater 0.10.2)"
+            echo "  theater spawn acceptor/manifest.toml"
           '';
         };
       });

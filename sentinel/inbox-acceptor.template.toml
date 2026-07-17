@@ -13,7 +13,7 @@
 #   children: {
 #     "inbox-acceptor": {
 #       manifest_template: <contents of this file>,
-#       default_package:   "<canonical inbox_acceptor.wasm URL>",
+#       default_package:   "<canonical inbox_acceptor-<tag>.composite.wasm URL>",
 #       secrets: {
 #         "BEARER_TOKEN":            "...",
 #         "DKIM_PRIVATE_KEY":        "...",

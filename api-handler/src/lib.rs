@@ -8,7 +8,6 @@
 //!   POST /v1/mailboxes                              → register an address
 //!   GET  /v1/mailboxes/<addr>                       → look up the mailbox record
 //!   GET  /v1/mailboxes/<addr>/inbox?since=<n>       → list messages since cursor n
-//!   POST /v1/mailboxes/<addr>/messages              → store a message
 //!   POST /v1/mailboxes/<addr>/send                  → send a message from this address
 
 #![no_std]
@@ -126,27 +125,6 @@ struct MailboxInfo {
 #[derive(Serialize)]
 struct MailboxList {
     mailboxes: Vec<String>,
-}
-
-#[derive(Deserialize)]
-struct PutMessageRequest {
-    from: String,
-    to: String,
-    #[serde(default)]
-    subject: String,
-    #[serde(default)]
-    body: String,
-    #[serde(default)]
-    message_id: String,
-    #[serde(default)]
-    in_reply_to: String,
-    #[serde(default)]
-    references: String,
-}
-
-#[derive(Serialize)]
-struct MessageStored {
-    id: u64,
 }
 
 #[derive(Deserialize)]
@@ -383,7 +361,6 @@ fn route(
                 },
             ),
             ("GET", "inbox") => handle_inbox(query, &mailbox_id),
-            ("POST", "messages") => handle_post_message(request_str, &mailbox_id),
             ("POST", "send") => handle_send(request_str, &address, dkim_private_key_pem),
             _ => error_response(404, "not found"),
         };
@@ -491,38 +468,6 @@ fn handle_inbox(query: &str, mailbox_id: &str) -> Vec<u8> {
         None => return error_response(500, "mailbox rpc failed"),
     };
     json_response(200, &page_value_to_json(&page))
-}
-
-fn handle_post_message(request_str: &str, mailbox_id: &str) -> Vec<u8> {
-    let req: PutMessageRequest = match parse_body(request_str) {
-        Ok(r) => r,
-        Err(resp) => return resp,
-    };
-    if req.from.is_empty() || req.to.is_empty() {
-        return error_response(400, "from and to are required");
-    }
-
-    let result = rpc_call(
-        mailbox_id.to_string(),
-        String::from("theater:inbox/mailbox.put-message"),
-        Value::Tuple(alloc::vec![
-            Value::String(req.from),
-            Value::String(req.to),
-            Value::String(req.subject),
-            Value::String(req.body),
-            Value::String(req.message_id),
-            Value::String(req.in_reply_to),
-            Value::String(req.references),
-        ]),
-        Value::Tuple(alloc::vec![]),
-    );
-
-    let id = match unwrap_rpc_result(result) {
-        Some(Value::U64(n)) => n,
-        _ => return error_response(500, "mailbox rpc failed"),
-    };
-
-    json_response(201, &MessageStored { id })
 }
 
 /// `POST /v1/mailboxes/<addr>/send` — deliver a message via SMTP. The
