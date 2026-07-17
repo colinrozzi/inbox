@@ -65,7 +65,11 @@ jobs:
             inbox_smtp_handler \
             inbox_cli
           do
-            cp "$(realpath result)/${actor}.wasm" "${actor}-${STAGE_TAG}.wasm"
+            # nix build emits self-contained composites (packr 0.10.2); the
+            # deployable artifact is <actor>.composite.wasm, not a bare member.
+            # Asset filename kept as <actor>-<tag>.wasm (a composite IS a wasm)
+            # so the sub-manifest package URLs below need no change.
+            cp "$(realpath result)/${actor}.composite.wasm" "${actor}-${STAGE_TAG}.wasm"
             chmod +w "${actor}-${STAGE_TAG}.wasm"
             ASSETS+=("${actor}-${STAGE_TAG}.wasm")
           done
@@ -200,7 +204,7 @@ jobs:
           TOML
           ASSETS+=("${SMTP_HANDLER_MANIFEST_FILE}")
 
-          # 3) Bundle of all seven wasms (humans / local use) + sha256.
+          # 3) Bundle of all seven composites (humans / local use) + sha256.
           STAGE="inbox-${STAGE_TAG}-wasm32"
           mkdir -p "$STAGE"
           for actor in \
@@ -212,7 +216,7 @@ jobs:
             inbox_smtp_handler \
             inbox_cli
           do
-            cp "$(realpath result)/${actor}.wasm" "$STAGE/"
+            cp "$(realpath result)/${actor}.composite.wasm" "$STAGE/"
           done
           chmod -R +w "$STAGE"
           tar -czf "$STAGE.tar.gz" "$STAGE"
