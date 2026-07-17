@@ -67,11 +67,11 @@ jobs:
           do
             # nix build emits self-contained composites (packr 0.10.2); the
             # deployable artifact is <actor>.composite.wasm, not a bare member.
-            # Asset filename kept as <actor>-<tag>.wasm (a composite IS a wasm)
-            # so the sub-manifest package URLs below need no change.
-            cp "$(realpath result)/${actor}.composite.wasm" "${actor}-${STAGE_TAG}.wasm"
-            chmod +w "${actor}-${STAGE_TAG}.wasm"
-            ASSETS+=("${actor}-${STAGE_TAG}.wasm")
+            # Release assets + the sub-manifest package URLs below use the
+            # <actor>-<tag>.composite.wasm name so the deployable is unambiguous.
+            cp "$(realpath result)/${actor}.composite.wasm" "${actor}-${STAGE_TAG}.composite.wasm"
+            chmod +w "${actor}-${STAGE_TAG}.composite.wasm"
+            ASSETS+=("${actor}-${STAGE_TAG}.composite.wasm")
           done
 
           # 2) Sub-manifest TOMLs for the five sub-actors that
@@ -81,7 +81,7 @@ jobs:
           #    The handler stanzas mirror the in-repo manifests.
 
           API_HANDLER_MANIFEST_FILE="inbox-api-handler-${STAGE_TAG}.toml"
-          API_HANDLER_WASM_URL="https://github.com/${REPO}/releases/download/${TAG}/inbox_api_handler-${STAGE_TAG}.wasm"
+          API_HANDLER_WASM_URL="https://github.com/${REPO}/releases/download/${TAG}/inbox_api_handler-${STAGE_TAG}.composite.wasm"
           cat > "${API_HANDLER_MANIFEST_FILE}" <<TOML
           name = "inbox-api-handler"
           version = "0.1.0"
@@ -113,7 +113,7 @@ jobs:
           ASSETS+=("${API_HANDLER_MANIFEST_FILE}")
 
           MAILBOX_MANIFEST_FILE="inbox-mailbox-${STAGE_TAG}.toml"
-          MAILBOX_WASM_URL="https://github.com/${REPO}/releases/download/${TAG}/inbox_mailbox-${STAGE_TAG}.wasm"
+          MAILBOX_WASM_URL="https://github.com/${REPO}/releases/download/${TAG}/inbox_mailbox-${STAGE_TAG}.composite.wasm"
           cat > "${MAILBOX_MANIFEST_FILE}" <<TOML
           name = "inbox-mailbox"
           version = "0.1.0"
@@ -131,7 +131,7 @@ jobs:
           ASSETS+=("${MAILBOX_MANIFEST_FILE}")
 
           ROUTER_MANIFEST_FILE="inbox-mailbox-router-${STAGE_TAG}.toml"
-          ROUTER_WASM_URL="https://github.com/${REPO}/releases/download/${TAG}/inbox_mailbox_router-${STAGE_TAG}.wasm"
+          ROUTER_WASM_URL="https://github.com/${REPO}/releases/download/${TAG}/inbox_mailbox_router-${STAGE_TAG}.composite.wasm"
           cat > "${ROUTER_MANIFEST_FILE}" <<TOML
           name = "inbox-mailbox-router"
           version = "0.1.0"
@@ -155,7 +155,7 @@ jobs:
           ASSETS+=("${ROUTER_MANIFEST_FILE}")
 
           SMTP_ACCEPTOR_MANIFEST_FILE="inbox-smtp-acceptor-${STAGE_TAG}.toml"
-          SMTP_ACCEPTOR_WASM_URL="https://github.com/${REPO}/releases/download/${TAG}/inbox_smtp_acceptor-${STAGE_TAG}.wasm"
+          SMTP_ACCEPTOR_WASM_URL="https://github.com/${REPO}/releases/download/${TAG}/inbox_smtp_acceptor-${STAGE_TAG}.composite.wasm"
           cat > "${SMTP_ACCEPTOR_MANIFEST_FILE}" <<TOML
           name = "inbox-smtp-acceptor"
           version = "0.1.0"
@@ -177,7 +177,7 @@ jobs:
           ASSETS+=("${SMTP_ACCEPTOR_MANIFEST_FILE}")
 
           SMTP_HANDLER_MANIFEST_FILE="inbox-smtp-handler-${STAGE_TAG}.toml"
-          SMTP_HANDLER_WASM_URL="https://github.com/${REPO}/releases/download/${TAG}/inbox_smtp_handler-${STAGE_TAG}.wasm"
+          SMTP_HANDLER_WASM_URL="https://github.com/${REPO}/releases/download/${TAG}/inbox_smtp_handler-${STAGE_TAG}.composite.wasm"
           cat > "${SMTP_HANDLER_MANIFEST_FILE}" <<TOML
           name = "inbox-smtp-handler"
           version = "0.1.0"
