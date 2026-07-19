@@ -1,0 +1,112 @@
+name: repro-acceptor-hang
+
+# Cutover-debug repro (workflow_dispatch). Reproduces the 0.10.2 mail-spine flip
+# failure OFF the VPS: spawn inbox composites on the pinned 0.10.2 theater
+# (7daab2ad) under RUST_LOG=trace with a hard timeout, and report which reach
+# their guest init log line vs hang before it.
+#
+#   acceptor: the failing actor (biggest pact surface, raw state:value init,
+#             biggest initial_state). Expected: HANGS before "[inbox-acceptor] init".
+#   mailbox : contrast (same state:value + GraphValue-return shape, SMALLER
+#             surface + simpler handlers). Boots -> surface/decode-size
+#             correlated; also hangs -> systemic to inbox value-init composites.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  repro:
+    name: Spawn inbox composites on theater 0.10.2 (trace + timeout)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: DeterminateSystems/nix-installer-action@main
+
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+
+      - name: Build composites + the pinned 0.10.2 theater binary
+        run: |
+          nix build .#default -o result-composites
+          nix build .#theater -o result-theater
+          echo "=== composites ==="; ls -la result-composites/
+          echo "=== theater version ==="; ./result-theater/bin/theater --version || true
+
+      - name: Spawn acceptor + mailbox with trace + 60s timeout
+        run: |
+          set -uo pipefail
+          THEATER="$PWD/result-theater/bin/theater"
+          COMP="$PWD/result-composites"
+          WORK="$RUNNER_TEMP/repro"; mkdir -p "$WORK/store"
+          # Dummy JSON initial_state (shape acceptor expects). The hang is BEFORE
+          # init's body reads this, so exact values do not matter; sub-manifest
+          # refs point at nonexistent paths on purpose (init would only reach
+          # them well after its first log line).
+          DUMMY='{"bearer_token":"x","dkim_private_key":"y","listen_addr":"127.0.0.1:0","api_handler_manifest":"/tmp/nope.toml","mailbox_manifest":"/tmp/nope.toml","router_manifest":"/tmp/nope.toml","smtp_acceptor_manifest":"/tmp/nope.toml","smtp_handler_manifest":"/tmp/nope.toml"}'
+
+          run_one () {
+            name="$1"; comp="$2"; marker="$3"; handlers="$4"
+            man="$WORK/$name.manifest.toml"
+            {
+              echo "name = \"inbox-$name\""
+              echo "version = \"0.1.0\""
+              echo "package = \"$comp\""
+              echo "initial_state = '$DUMMY'"
+              printf '%s\n' "$handlers"
+            } > "$man"
+            echo "==================== $name ===================="
+            echo "--- manifest ---"; cat "$man"
+            log="$WORK/$name.log"
+            echo "--- spawn (RUST_LOG=trace, timeout 60s KILL) ---"
+            timeout --signal=KILL 60 env RUST_LOG=trace "$THEATER" spawn "$man" > "$log" 2>&1
+            rc=$?
+            echo "exit=$rc  (137 => killed by timeout => did not return)"
+            if grep -qF "$marker" "$log"; then
+              echo "RESULT[$name]: FOUND init marker '$marker' -> guest init BODY RAN"
+            else
+              echo "RESULT[$name]: NO init marker '$marker' -> HUNG BEFORE the init body (packr entry/decode/alloc)"
+            fi
+            echo "--- last 60 log lines ($name) ---"; tail -60 "$log" || true
+            echo
+          }
+
+          run_one acceptor "$COMP/inbox_acceptor.composite.wasm" "[inbox-acceptor] init" \
+'[[handler]]
+type = "runtime"
+[[handler]]
+type = "tcp"
+[[handler]]
+type = "supervisor"
+[[handler]]
+type = "rpc"
+[[handler]]
+type = "store"
+base_path = "'"$WORK/store"'"
+store_id = "inbox"'
+
+          run_one mailbox "$COMP/inbox_mailbox.composite.wasm" "[inbox-mailbox]" \
+'[[handler]]
+type = "runtime"
+[[handler]]
+type = "store"
+base_path = "'"$WORK/store"'"
+store_id = "inbox"'
+
+          echo "==================== SUMMARY ===================="
+          for a in acceptor mailbox; do
+            if grep -qF "$([ "$a" = acceptor ] && echo '[inbox-acceptor] init' || echo '[inbox-mailbox]')" "$WORK/$a.log"; then
+              echo "$a: init body ran"
+            else
+              echo "$a: HUNG before init body"
+            fi
+          done
+
+      - name: Upload spawn logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: repro-spawn-logs
+          path: ${{ runner.temp }}/repro/*.log
+          retention-days: 7
