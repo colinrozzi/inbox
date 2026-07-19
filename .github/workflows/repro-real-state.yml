@@ -1,0 +1,92 @@
+name: repro-real-state
+
+# Decoder-hang repro (workflow_dispatch) on the manager's exact deployed
+# initial_state SHAPE: one JSON string whose dominant field is a \n-escaped
+# ~1.7KB PKCS8 PEM (-----BEGIN PRIVATE KEY-----). Earlier synthetics (flat
+# filler / RSA header) BOOTED at every size, so this tests whether the real
+# PKCS8-PEM structure (many \n escapes) is what trips packr::abi::decode.
+#
+# If repro/initial_state.json exists in the repo, it is used verbatim (drop the
+# EXACT deployed dummy-keyed state there to reproduce ground-truth); otherwise a
+# realistic PKCS8-shaped dummy is generated.
+#   reached_init=YES -> decoded + init body ran (fast). NO + rc=137 -> HUNG in decode.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  repro:
+    name: Spawn acceptor on the real-state shape (theater 0.10.2, trace)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+
+      - name: Build acceptor composite + theater
+        run: |
+          nix build .#default -o result-composites
+          nix build .#theater -o result-theater
+
+      - name: Spawn with the PKCS8-PEM initial_state
+        run: |
+          set -uo pipefail
+          set +e
+          THEATER="$PWD/result-theater/bin/theater"
+          COMP="$PWD/result-composites/inbox_acceptor.composite.wasm"
+          WORK="$RUNNER_TEMP/repro"; mkdir -p "$WORK/store"
+
+          if [ -f repro/initial_state.json ]; then
+            echo "Using committed repro/initial_state.json (exact deployed shape)"
+            STATE="$(cat repro/initial_state.json)"
+          else
+            echo "Generating realistic PKCS8-PEM dummy initial_state"
+            L="MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQDummyKEYbase64X"  # 64 base64-ish chars
+            PEM='-----BEGIN PRIVATE KEY-----'
+            for i in $(seq 1 26); do PEM="$PEM\\n$L"; done
+            PEM="$PEM\\nAgMBAAECggEAdummyTAILbase64lineZZZZZZZZZZZZZZZZZZZZZZZZ0123456789\\n-----END PRIVATE KEY-----\\n"
+            STATE="{\"bearer_token\":\"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\",\"dkim_private_key\":\"$PEM\",\"listen_addr\":\"127.0.0.1:8443\",\"api_handler_manifest\":\"/var/lib/inbox/manifests/api-handler.toml\",\"mailbox_manifest\":\"/var/lib/inbox/manifests/mailbox.toml\",\"router_manifest\":\"/var/lib/inbox/manifests/router.toml\",\"smtp_acceptor_manifest\":\"/var/lib/inbox/manifests/smtp-acceptor.toml\",\"smtp_handler_manifest\":\"/var/lib/inbox/manifests/smtp-handler.toml\"}"
+          fi
+          echo "initial_state size = ${#STATE} bytes; \\n-escape count = $(printf '%s' "$STATE" | grep -o '\\\\n' | wc -l)"
+
+          man="$WORK/acceptor.manifest.toml"
+          { echo 'name = "inbox-acceptor"'; echo 'version = "0.1.0"'; echo "package = \"$COMP\""
+            echo "initial_state = '$STATE'"
+            printf '%s\n' '[[handler]]
+          type = "runtime"
+          [[handler]]
+          type = "tcp"
+          [[handler]]
+          type = "supervisor"
+          [[handler]]
+          type = "rpc"
+          [[handler]]
+          type = "store"
+          base_path = "'"$WORK/store"'"
+          store_id = "inbox"'
+          } > "$man"
+
+          log="$WORK/acceptor.log"
+          t0=$(date +%s%3N)
+          timeout --signal=KILL 180 env RUST_LOG=trace "$THEATER" spawn "$man" > "$log" 2>&1
+          rc=$?
+          t1=$(date +%s%3N)
+          echo "exit=$rc  elapsed=$((t1-t0))ms"
+          if grep -qF "[inbox-acceptor] init" "$log"; then
+            echo "RESULT: reached_init=YES -> DECODED + init body ran (did NOT reproduce the hang)"
+          else
+            echo "RESULT: reached_init=NO (rc=$rc) -> HUNG in packr::abi::decode (REPRODUCED)"
+          fi
+          echo "--- last theater frames (init/export/invoke/decode/memory) ---"
+          grep -iE "init|export|invoke|decode|memory|actor|spawn" "$log" | tail -25
+          echo "--- tail ---"; tail -25 "$log"
+
+      - name: Upload log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: repro-real-state-log
+          path: ${{ runner.temp }}/repro/*.log
+          retention-days: 7
