@@ -1,0 +1,53 @@
+name: check-rodata
+
+# Confirms pack-dev's fixed-alloc_base-overrun root cause on the REAL inbox
+# members: build each member with the fixed-base recipe and report end-of-data
+# (__data_end) vs the packr bundled-allocator heap base 0xE0000 (917504). A
+# member whose static data (esp. big crypto .rodata: rsa/sha2/der) ends past
+# 0xE0000 overruns the alloc base -> the composite thrashes at init.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: __data_end vs alloc_base 0xE0000 for all 7 members
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+
+      - name: Build members (fixed-base recipe) + measure __data_end
+        run: |
+          set -uo pipefail
+          # Plain cargo honors .cargo/config.toml's fixed-base rustflags (crane
+          # is not used here). Builds the 7 bare members into target/.
+          nix develop --command cargo build --release --target wasm32-unknown-unknown
+
+          ALLOC_BASE=917504   # 0xE0000, packr DEFAULT_ALLOCATOR heap base
+          printf 'alloc_base = 0x%X (%d)\n\n' "$ALLOC_BASE" "$ALLOC_BASE"
+          printf '%-24s %14s %14s %s\n' member end_of_data alloc_base verdict
+
+          for a in inbox_acceptor inbox_api_handler inbox_mailbox inbox_mailbox_router inbox_smtp_acceptor inbox_smtp_handler inbox_cli; do
+            f="target/wasm32-unknown-unknown/release/$a.wasm"
+            # end-of-data = max(segment init offset + segment size) over data segments.
+            eod=$(nix shell nixpkgs#wabt --command wasm-objdump -x "$f" 2>/dev/null \
+              | awk '
+                  /- segment\[/ {
+                    off=-1; sz=-1
+                    if (match($0, /init i32=[0-9]+/)) off=substr($0, RSTART+9, RLENGTH-9)
+                    if (match($0, /size=[0-9]+/))     sz=substr($0, RSTART+5, RLENGTH-5)
+                    if (off>=0 && sz>=0) { e=off+sz; if (e>max) max=e }
+                  }
+                  END { print max+0 }')
+            if [ "${eod:-0}" -gt "$ALLOC_BASE" ]; then verdict="OVERRUN (> alloc_base)"; else verdict="fits"; fi
+            printf '%-24s %14d %14d %s  (0x%X)\n' "$a" "${eod:-0}" "$ALLOC_BASE" "$verdict" "${eod:-0}"
+          done
+
+          echo
+          echo "OVERRUN => this member's rodata pushes past the fixed alloc_base, so its"
+          echo "composite's allocator heap starts inside static data -> init thrash (pack-dev's"
+          echo "root cause). fit_layout (packr 0.10.3) sizes alloc_base past __data_end to fix it."
