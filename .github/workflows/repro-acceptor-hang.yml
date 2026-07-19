@@ -43,6 +43,10 @@ jobs:
       - name: Spawn matrix (tiny vs full acceptor state + mailbox contrast)
         run: |
           set -uo pipefail
+          # GitHub Actions injects `set -e`; disable it so a timeout-killed spawn
+          # (exit 137) or an init-Err spawn (exit 1) doesn't abort the step before
+          # we record each case's result and run the remaining cases.
+          set +e
           THEATER="$PWD/result-theater/bin/theater"
           COMP="$PWD/result-composites"
           WORK="$RUNNER_TEMP/repro"; mkdir -p "$WORK/store"
