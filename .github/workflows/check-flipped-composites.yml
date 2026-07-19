@@ -1,0 +1,60 @@
+name: check-flipped-composites
+
+# Fleet-wide latent-risk check (workflow_dispatch): do the ALREADY-FLIPPED
+# 0.10.2-composed composites (inbox-ui + frontdoor) overrun metadata_base
+# 0x51400? Downloads each release-asset composite and reports its max
+# data-segment extent (a proxy for the member's __data_end — the member's
+# .data/.rodata is the dominant data segment, placed at package base 0x50000)
+# vs metadata_base 0x51400 and alloc_base 0xE0000.
+#   > 0x51400 => member data overlaps the allocator metadata region [0x51400,
+#   0x90000) — same latent overrun as inbox's members; boots only because light
+#   init/runtime under-allocates the corrupted region.
+# NOTE: authoritative __data_end is the owning dev's MEMBER build; this composite
+# extent is a cross-check on the actual deployed bytes. sentinel is a nix store
+# path (no URL), so sentinel-dev must check its member.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: flipped composites __data_end vs 0x51400
+    runs-on: ubuntu-latest
+    steps:
+      - uses: DeterminateSystems/nix-installer-action@main
+
+      - name: Download flipped composites + measure data extent
+        run: |
+          set -uo pipefail
+          set +e
+          META=333824    # 0x51400 metadata_base
+          ALLOC=917504   # 0xE0000 alloc_base
+
+          names=(inbox-ui-acceptor inbox-ui-handler frontdoor)
+          urls=(
+            "https://github.com/colinrozzi/inbox-ui/releases/download/release-20260717-d887a10/inbox-ui-acceptor-20260717-d887a10.composite.wasm"
+            "https://github.com/colinrozzi/inbox-ui/releases/download/release-20260717-d887a10/inbox-ui-handler-20260717-d887a10.composite.wasm"
+            "https://github.com/colinrozzi/frontdoor/releases/download/release-20260719-4b55ed0/frontdoor-20260719-4b55ed0.composite.wasm"
+          )
+
+          printf 'metadata_base=0x%X (%d)  alloc_base=0x%X (%d)\n\n' "$META" "$META" "$ALLOC" "$ALLOC"
+          printf '%-20s %12s %10s   %-18s %-16s\n' composite data_extent hex "vs_metadata_0x51400" "vs_alloc_0xE0000"
+          for i in "${!names[@]}"; do
+            n="${names[$i]}"; u="${urls[$i]}"
+            if ! curl -fsSL "$u" -o "$n.wasm"; then printf '%-20s   DOWNLOAD FAILED (%s)\n' "$n" "$u"; continue; fi
+            eod=$(nix shell nixpkgs#wabt --command wasm-objdump -x "$n.wasm" 2>/dev/null | awk '
+              /- segment\[/ {
+                off=-1; sz=-1
+                if (match($0, /init i32=[0-9]+/)) off=substr($0, RSTART+9, RLENGTH-9)
+                if (match($0, /size=[0-9]+/))     sz=substr($0, RSTART+5, RLENGTH-5)
+                if (off>=0 && sz>=0) { e=off+sz; if (e>max) max=e }
+              } END { print max+0 }')
+            vm=$([ "${eod:-0}" -gt "$META" ]  && echo "OVERRUN (+$((eod-META)))" || echo "fits")
+            va=$([ "${eod:-0}" -gt "$ALLOC" ] && echo "OVERRUN" || echo "fits")
+            printf '%-20s %12d %10s   %-18s %-16s\n' "$n" "${eod:-0}" "$(printf 0x%X "${eod:-0}")" "$vm" "$va"
+          done
+          echo
+          echo "OVERRUN vs 0x51400 => this flipped composite's member data overlaps the allocator"
+          echo "metadata region — same latent overrun as inbox. Confirms/denies the fleet-wide scope."
