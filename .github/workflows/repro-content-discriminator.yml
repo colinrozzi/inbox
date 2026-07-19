@@ -1,0 +1,96 @@
+name: repro-content-discriminator
+
+# Pins the composite_abi string-decode trigger. Spawns the real acceptor
+# composite with the initial_state = a single ~1.7KB Value::String (theater wraps
+# it, spawn.rs:289) of DIFFERENT content profiles, same length. Which HANG (no
+# init log, killed at 180s) vs BOOT (init log, fast) characterizes the exact
+# trigger of theater-dev's suspected substring/DAG dedup:
+#   random  -> non-repetitive (expect boot)
+#   allA    -> uniform single-char run (my prior sweep: booted)
+#   repline -> one 64-char base64 line REPEATED, \n-joined (PEM body pattern)
+#   nlrun   -> literal backslash-n repeated (the escape pattern)
+#   pem     -> realistic \n-escaped PKCS8 PEM
+# Content is generated with VERIFIED bytes (hexdump sample printed) so results
+# are trustworthy — no bash-escaping ambiguity. No JSON wrapper: the hang is in
+# decoding the Value::String, before acceptor's own serde parse.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  disc:
+    name: string-content discriminator (theater 0.10.2)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+
+      - name: Build acceptor composite + theater
+        run: |
+          nix build .#default -o result-composites
+          nix build .#theater -o result-theater
+
+      - name: Discriminate string content
+        run: |
+          set -uo pipefail
+          set +e
+          THEATER="$PWD/result-theater/bin/theater"
+          COMP="$PWD/result-composites/inbox_acceptor.composite.wasm"
+          WORK="$RUNNER_TEMP/disc"; mkdir -p "$WORK/store"
+          NL='\n'                         # literal backslash-n (2 bytes: 5c 6e)
+          # A fixed pool of RANDOM base64 (distinct bytes), reused so the flat vs
+          # lines cases have IDENTICAL underlying bytes — the ONLY difference is
+          # the \n every 64 chars. That isolates "\n-delimited distinct tokens"
+          # as the variable.
+          POOL="$(head -c 2600 /dev/urandom | base64 | tr -d '\n=+/' | head -c 1664)"
+          lineify () { i=0; s=""; while [ $i -lt ${#POOL} ]; do s="${s}${POOL:$i:64}${NL}"; i=$((i+64)); done; printf '%s' "$s"; }
+
+          gen () {  # $1 = profile -> prints content to stdout
+            case "$1" in
+              allA)         head -c 1664 /dev/zero | tr '\0' 'A' ;;
+              random_flat)  printf '%s' "$POOL" ;;                       # distinct bytes, NO \n
+              random_lines) lineify ;;                                   # SAME bytes + \n every 64 (SUSPECT)
+              nlrun)        s=""; for i in $(seq 1 832); do s="${s}${NL}"; done; printf '%s' "$s" ;;
+              pem)          printf '%s' "-----BEGIN PRIVATE KEY-----${NL}$(lineify)-----END PRIVATE KEY-----${NL}" ;;
+            esac
+          }
+
+          for prof in allA random_flat random_lines nlrun pem; do
+            content="$(gen "$prof")"
+            echo "==================== $prof ===================="
+            echo "len=${#content}  first-32-bytes-hex:"; printf '%s' "$content" | head -c 32 | xxd | head -1
+            man="$WORK/$prof.manifest.toml"
+            { echo 'name = "inbox-acceptor"'; echo 'version = "0.1.0"'; echo "package = \"$COMP\""
+              echo "initial_state = '$content'"
+              printf '%s\n' '[[handler]]
+          type = "runtime"
+          [[handler]]
+          type = "tcp"
+          [[handler]]
+          type = "supervisor"
+          [[handler]]
+          type = "rpc"
+          [[handler]]
+          type = "store"
+          base_path = "'"$WORK/store"'"
+          store_id = "inbox"'
+            } > "$man"
+            log="$WORK/$prof.log"
+            t0=$(date +%s%3N)
+            timeout --signal=KILL 180 env RUST_LOG=info "$THEATER" spawn "$man" > "$log" 2>&1
+            rc=$?; t1=$(date +%s%3N)
+            if grep -qF "[inbox-acceptor] init" "$log"; then r="BOOT (decoded)"; else r="HANG (decode did not return)"; fi
+            printf 'RESULT %-8s len=%d rc=%s elapsed=%dms -> %s\n' "$prof" "${#content}" "$rc" "$((t1-t0))" "$r"
+            echo
+          done
+
+          echo "==================== SUMMARY ===================="
+          for prof in allA random_flat random_lines nlrun pem; do
+            if grep -qF "[inbox-acceptor] init" "$WORK/$prof.log"; then echo "$prof: BOOT"; else echo "$prof: HANG"; fi
+          done
+          echo "KEY PAIR: random_flat vs random_lines have IDENTICAL bytes; the only difference is"
+          echo "\\n every 64 chars. If random_lines HANGS and random_flat BOOTS => the trigger is"
+          echo "\\n-delimited distinct tokens (substring dedup), definitively. pem confirms on real shape."
