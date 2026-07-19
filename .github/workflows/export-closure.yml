@@ -1,0 +1,71 @@
+name: export-closure
+
+# Manual, cutover-support workflow. Builds the inbox 0.10.2 self-contained
+# composites (nix build .#default), verifies all 7 are self-contained, then
+# exports the derivation's nix closure to a file:// binary cache and uploads it
+# as a downloadable artifact. The manager pulls the artifact and
+# `nix copy --from file://<dir>`s it onto the VPS store, then repoints
+# gc-roots/inbox at the store path (printed below + in STORE_PATH.txt).
+#
+# This is the deployable-artifact delivery for the 0.8.1 -> 0.10.2 mail-spine
+# cutover (analogous to how theater's binary closure was delivered).
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    name: Export inbox 0.10.2 composite closure
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: DeterminateSystems/nix-installer-action@main
+
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+
+      - name: Build composites
+        run: nix build .#default
+
+      - name: Assert 7 composites, all self-contained
+        run: |
+          nix develop --command bash -c '
+            set -euo pipefail; shopt -s nullglob; n=0
+            for c in result/*.composite.wasm; do
+              n=$((n+1)); wasm-tools validate "$c"
+              bad=$(wasm-tools print "$c" | grep -E "^[[:space:]]*\(import " | grep -v "theater:simple/" || true)
+              [ -z "$bad" ] || { echo "::error::$c is NOT self-contained:"; echo "$bad"; exit 1; }
+              echo "$c: host imports only"
+            done
+            [ "$n" = 7 ] || { echo "::error::expected 7 composites, found $n"; exit 1; }
+            echo "all $n composites verified self-contained"
+          '
+
+      - name: Export closure to a file:// binary cache
+        run: |
+          set -euo pipefail
+          STORE_PATH=$(nix path-info ./result)
+          echo "### inbox 0.10.2 derivation store path"
+          echo "$STORE_PATH" | tee STORE_PATH.txt
+          echo "### closure size"
+          nix path-info --closure-size -h ./result || true
+          echo "### composite contents"
+          ls -la result/
+          mkdir -p closure
+          nix copy --to "file://$PWD/closure" "$STORE_PATH"
+          cp STORE_PATH.txt closure/STORE_PATH.txt
+          {
+            echo "## inbox 0.10.2 closure"
+            echo '```'
+            cat STORE_PATH.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload closure artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: inbox-0.10.2-closure
+          path: closure
+          retention-days: 7
