@@ -117,6 +117,43 @@
           '';
         });
 
+        # Debug-only variant for the 0.10.2 acceptor-hang repro (theater-dev's
+        # test C): identical to packages.default but --initial-memory bumped
+        # 8MiB -> 64MiB. Discriminates the init spin: boots with headroom =>
+        # memory-grow-thrash (interim --initial-memory bump could unblock the
+        # flip); still thrashes at 64MiB => algorithmic O(n^2) decode/alloc that
+        # only pack-dev's fix resolves. NOT a deploy artifact — packages.default
+        # (the deployable) is unchanged.
+        packages.composites-64m = craneLib.buildPackage (commonArgs // {
+          inherit cargoArtifacts;
+          CARGO_ENCODED_RUSTFLAGS = builtins.concatStringsSep rfSep [
+            "-C" "link-arg=--import-memory"
+            "-C" "link-arg=--initial-memory=67108864"
+            "-C" "link-arg=--stack-first"
+            "-C" "link-arg=-zstack-size=262144"
+            "-C" "link-arg=--global-base=327680"
+            "-C" "link-arg=--no-entry"
+            "-C" "link-arg=--no-merge-data-segments"
+          ];
+          nativeBuildInputs = [ theaterBin pkgs.binaryen pkgs.wasm-tools ];
+          installPhaseCommand = ''
+            mkdir -p $out
+            for name in \
+              inbox_acceptor \
+              inbox_api_handler \
+              inbox_cli \
+              inbox_mailbox \
+              inbox_mailbox_router \
+              inbox_smtp_acceptor \
+              inbox_smtp_handler
+            do
+              theater compose \
+                "target/wasm32-unknown-unknown/release/$name.wasm" \
+                -o "$out/$name.composite.wasm"
+            done
+          '';
+        });
+
         # nix build .#theater — exposes the pinned theater binary used at runtime
         packages.theater = theaterBin;
 
