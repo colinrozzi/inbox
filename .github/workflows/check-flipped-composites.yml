@@ -29,8 +29,10 @@ jobs:
         run: |
           set -uo pipefail
           set +e
-          META=333824    # 0x51400 metadata_base
-          ALLOC=917504   # 0xE0000 alloc_base
+          META=332800    # 0x51400 metadata_base (0x51400-0x50000 = 0x1400 = 5120B budget)
+          ALLOC=917504   # 0xE0000 alloc_base; the fused bundled allocator's own data sits
+                         # at 0xE0000+ in every composite, so recover the MEMBER __data_end
+                         # from the max data-segment extent BELOW 0xE0000.
 
           names=(inbox-ui-acceptor inbox-ui-handler frontdoor)
           urls=(
@@ -44,17 +46,21 @@ jobs:
           for i in "${!names[@]}"; do
             n="${names[$i]}"; u="${urls[$i]}"
             if ! curl -fsSL "$u" -o "$n.wasm"; then printf '%-20s   DOWNLOAD FAILED (%s)\n' "$n" "$u"; continue; fi
-            eod=$(nix shell nixpkgs#wabt --command wasm-objdump -x "$n.wasm" 2>/dev/null | awk '
+            dump=$(nix shell nixpkgs#wabt --command wasm-objdump -x "$n.wasm" 2>/dev/null)
+            # member __data_end = max(offset+size) over data segments BELOW alloc_base
+            # 0xE0000; segments at >=0xE0000 are the fused allocator, not the member.
+            member_eod=$(printf '%s' "$dump" | awk -v alloc="$ALLOC" '
               /- segment\[/ {
                 off=-1; sz=-1
                 if (match($0, /init i32=[0-9]+/)) off=substr($0, RSTART+9, RLENGTH-9)
                 if (match($0, /size=[0-9]+/))     sz=substr($0, RSTART+5, RLENGTH-5)
-                if (off>=0 && sz>=0) { e=off+sz; if (e>max) max=e }
+                if (off>=0 && sz>=0 && off < alloc) { e=off+sz; if (e>max) max=e }
               } END { print max+0 }')
-            vm=$([ "${eod:-0}" -gt "$META" ]  && echo "OVERRUN (+$((eod-META)))" || echo "fits")
-            va=$([ "${eod:-0}" -gt "$ALLOC" ] && echo "OVERRUN" || echo "fits")
-            printf '%-20s %12d %10s   %-18s %-16s\n' "$n" "${eod:-0}" "$(printf 0x%X "${eod:-0}")" "$vm" "$va"
+            vm=$([ "${member_eod:-0}" -gt "$META" ] && echo "OVERRUN (+$((member_eod-META)))" || echo "fits")
+            printf '%-20s member__data_end=%d (0x%X)  vs metadata_base 0x51400: %s\n' "$n" "${member_eod:-0}" "${member_eod:-0}" "$vm"
+            echo "    (all data segments, for transparency:)"
+            printf '%s' "$dump" | grep -E "- segment\[" | sed 's/^/      /' | head -40
+            echo
           done
-          echo
-          echo "OVERRUN vs 0x51400 => this flipped composite's member data overlaps the allocator"
-          echo "metadata region — same latent overrun as inbox. Confirms/denies the fleet-wide scope."
+          echo "OVERRUN vs 0x51400 => this flipped composite's MEMBER data overlaps the allocator"
+          echo "metadata region [0x51400,0x90000) — same latent overrun as inbox's 7. Confirms scope."
