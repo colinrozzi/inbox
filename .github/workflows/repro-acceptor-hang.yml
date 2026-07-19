@@ -1,15 +1,19 @@
 name: repro-acceptor-hang
 
-# Cutover-debug repro (workflow_dispatch). Reproduces the 0.10.2 mail-spine flip
-# failure OFF the VPS: spawn inbox composites on the pinned 0.10.2 theater
-# (7daab2ad) under RUST_LOG=trace with a hard timeout, and report which reach
-# their guest init log line vs hang before it.
+# Cutover-debug repro (workflow_dispatch) for the 0.10.2 mail-spine flip failure.
+# Spawns inbox composites on the pinned 0.10.2 theater (7daab2ad) under
+# RUST_LOG=trace with a hard timeout and reports which reach their guest init
+# log line vs hang before it. Runs theater-dev's discriminating matrix:
 #
-#   acceptor: the failing actor (biggest pact surface, raw state:value init,
-#             biggest initial_state). Expected: HANGS before "[inbox-acceptor] init".
-#   mailbox : contrast (same state:value + GraphValue-return shape, SMALLER
-#             surface + simpler handlers). Boots -> surface/decode-size
-#             correlated; also hangs -> systemic to inbox value-init composites.
+#   B (highest signal): acceptor's REAL composite with a TINY vs a FULL
+#     (~1.7KB DKIM-sized) initial_state, SAME surface. tiny boots + full hangs
+#     => the spin is composite_abi Value-decode cost scaling with state size.
+#   A (surface contrast): mailbox (same state:value + GraphValue-return shape,
+#     SMALLER surface + simpler handlers). Boots => not surface-driven.
+#
+# The last theater-side trace frame should be the actor.init export call
+# (handoff clean) — printed below so theater-dev can confirm the hang is
+# bounded to the guest entry.
 on:
   workflow_dispatch:
 
@@ -27,81 +31,97 @@ jobs:
 
       - uses: DeterminateSystems/magic-nix-cache-action@main
 
-      - name: Build composites + the pinned 0.10.2 theater binary
+      - name: Build composites (8MiB + 64MiB) + the pinned 0.10.2 theater binary
         run: |
-          nix build .#default -o result-composites
-          nix build .#theater -o result-theater
-          echo "=== composites ==="; ls -la result-composites/
+          nix build .#default        -o result-composites       # 8MiB  (deployable)
+          nix build .#composites-64m -o result-composites-64m    # 64MiB (test C only)
+          nix build .#theater        -o result-theater
+          echo "=== 8MiB composites ==="; ls -la result-composites/
+          echo "=== 64MiB composites ==="; ls -la result-composites-64m/
           echo "=== theater version ==="; ./result-theater/bin/theater --version || true
 
-      - name: Spawn acceptor + mailbox with trace + 60s timeout
+      - name: Spawn matrix (tiny vs full acceptor state + mailbox contrast)
         run: |
           set -uo pipefail
           THEATER="$PWD/result-theater/bin/theater"
           COMP="$PWD/result-composites"
           WORK="$RUNNER_TEMP/repro"; mkdir -p "$WORK/store"
-          # Dummy JSON initial_state (shape acceptor expects). The hang is BEFORE
-          # init's body reads this, so exact values do not matter; sub-manifest
-          # refs point at nonexistent paths on purpose (init would only reach
-          # them well after its first log line).
-          DUMMY='{"bearer_token":"x","dkim_private_key":"y","listen_addr":"127.0.0.1:0","api_handler_manifest":"/tmp/nope.toml","mailbox_manifest":"/tmp/nope.toml","router_manifest":"/tmp/nope.toml","smtp_acceptor_manifest":"/tmp/nope.toml","smtp_handler_manifest":"/tmp/nope.toml"}'
 
-          run_one () {
-            name="$1"; comp="$2"; marker="$3"; handlers="$4"
-            man="$WORK/$name.manifest.toml"
+          # initial_state JSON with a parameterized dkim_private_key size. The
+          # hang is BEFORE init's body reads any of this, so values/validity do
+          # not matter — only the encoded value SIZE that composite_abi decodes.
+          mkstate () {
+            printf '{"bearer_token":"x","dkim_private_key":"%s","listen_addr":"127.0.0.1:0","api_handler_manifest":"/tmp/n.toml","mailbox_manifest":"/tmp/n.toml","router_manifest":"/tmp/n.toml","smtp_acceptor_manifest":"/tmp/n.toml","smtp_handler_manifest":"/tmp/n.toml"}' "$1"
+          }
+          TINY_DKIM="y"
+          FULL_DKIM="$(head -c 1700 < /dev/zero | tr '\0' 'A')"   # ~1.7KB, prod DKIM PEM size
+
+          ACCEPTOR_HANDLERS='[[handler]]
+          type = "runtime"
+          [[handler]]
+          type = "tcp"
+          [[handler]]
+          type = "supervisor"
+          [[handler]]
+          type = "rpc"
+          [[handler]]
+          type = "store"
+          base_path = "'"$WORK/store"'"
+          store_id = "inbox"'
+
+          MAILBOX_HANDLERS='[[handler]]
+          type = "runtime"
+          [[handler]]
+          type = "store"
+          base_path = "'"$WORK/store"'"
+          store_id = "inbox"'
+
+          run_case () {
+            label="$1"; comp="$2"; marker="$3"; handlers="$4"; state="$5"
+            man="$WORK/$label.manifest.toml"
             {
-              echo "name = \"inbox-$name\""
+              echo "name = \"$label\""
               echo "version = \"0.1.0\""
               echo "package = \"$comp\""
-              echo "initial_state = '$DUMMY'"
+              echo "initial_state = '$state'"
               printf '%s\n' "$handlers"
             } > "$man"
-            echo "==================== $name ===================="
-            echo "--- manifest ---"; cat "$man"
-            log="$WORK/$name.log"
-            echo "--- spawn (RUST_LOG=trace, timeout 60s KILL) ---"
-            timeout --signal=KILL 60 env RUST_LOG=trace "$THEATER" spawn "$man" > "$log" 2>&1
+            echo "==================== CASE: $label (state ${#state} bytes) ===================="
+            log="$WORK/$label.log"
+            timeout --signal=KILL 90 env RUST_LOG=trace "$THEATER" spawn "$man" > "$log" 2>&1
             rc=$?
-            echo "exit=$rc  (137 => killed by timeout => did not return)"
+            echo "exit=$rc  (137 => killed by timeout => did not return in 90s)"
             if grep -qF "$marker" "$log"; then
-              echo "RESULT[$name]: FOUND init marker '$marker' -> guest init BODY RAN"
+              echo "RESULT[$label]: init marker '$marker' FOUND -> guest init body RAN"
             else
-              echo "RESULT[$name]: NO init marker '$marker' -> HUNG BEFORE the init body (packr entry/decode/alloc)"
+              echo "RESULT[$label]: init marker '$marker' ABSENT -> HUNG before init body"
             fi
-            echo "--- last 60 log lines ($name) ---"; tail -60 "$log" || true
+            echo "--- last theater-side frames (init/export/invoke/spawn/actor) ---"
+            grep -iE "init|export|invoke|spawn|actor|load|memory|grow" "$log" | tail -25 || true
+            echo "--- last 30 raw log lines ---"; tail -30 "$log" || true
             echo
           }
 
-          run_one acceptor "$COMP/inbox_acceptor.composite.wasm" "[inbox-acceptor] init" \
-'[[handler]]
-type = "runtime"
-[[handler]]
-type = "tcp"
-[[handler]]
-type = "supervisor"
-[[handler]]
-type = "rpc"
-[[handler]]
-type = "store"
-base_path = "'"$WORK/store"'"
-store_id = "inbox"'
+          COMP64="$PWD/result-composites-64m"
 
-          run_one mailbox "$COMP/inbox_mailbox.composite.wasm" "[inbox-mailbox]" \
-'[[handler]]
-type = "runtime"
-[[handler]]
-type = "store"
-base_path = "'"$WORK/store"'"
-store_id = "inbox"'
+          # B: fixed surface (real acceptor composite, 8MiB), vary state size.
+          run_case acceptor-TINY    "$COMP/inbox_acceptor.composite.wasm"   "[inbox-acceptor] init" "$ACCEPTOR_HANDLERS" "$(mkstate "$TINY_DKIM")"
+          run_case acceptor-FULL    "$COMP/inbox_acceptor.composite.wasm"   "[inbox-acceptor] init" "$ACCEPTOR_HANDLERS" "$(mkstate "$FULL_DKIM")"
+          # A: surface contrast (smaller surface, 8MiB, tiny state).
+          run_case mailbox-TINY     "$COMP/inbox_mailbox.composite.wasm"    "[inbox-mailbox]"       "$MAILBOX_HANDLERS"  "$(mkstate "$TINY_DKIM")"
+          # C: full state on the 64MiB-memory acceptor composite — headroom vs algorithmic.
+          run_case acceptor-FULL-64m "$COMP64/inbox_acceptor.composite.wasm" "[inbox-acceptor] init" "$ACCEPTOR_HANDLERS" "$(mkstate "$FULL_DKIM")"
 
           echo "==================== SUMMARY ===================="
-          for a in acceptor mailbox; do
-            if grep -qF "$([ "$a" = acceptor ] && echo '[inbox-acceptor] init' || echo '[inbox-mailbox]')" "$WORK/$a.log"; then
-              echo "$a: init body ran"
-            else
-              echo "$a: HUNG before init body"
-            fi
+          for c in acceptor-TINY acceptor-FULL mailbox-TINY acceptor-FULL-64m; do
+            m="[inbox-acceptor] init"; [ "$c" = mailbox-TINY ] && m="[inbox-mailbox]"
+            if grep -qF "$m" "$WORK/$c.log"; then echo "$c: init body RAN"; else echo "$c: HUNG before init body"; fi
           done
+          echo "INTERPRETATION:"
+          echo "  acceptor-TINY boots + acceptor-FULL hangs => decode cost scales with state size (B)"
+          echo "  mailbox-TINY boots                        => not surface-driven (A)"
+          echo "  acceptor-FULL-64m boots                   => memory-grow-thrash; interim --initial-memory bump can unblock the flip (C)"
+          echo "  acceptor-FULL-64m still hangs             => algorithmic O(n^2); mail spine waits for pack-dev's fix (C)"
 
       - name: Upload spawn logs
         if: always()
