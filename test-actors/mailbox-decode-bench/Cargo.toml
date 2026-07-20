@@ -11,7 +11,9 @@ edition = "2021"
 crate-type = ["cdylib"]
 
 [dependencies]
-packr-guest = { version = "0.10.2", features = ["derive"] }
+# Pin EXACTLY 0.10.2 to match prod's mailbox + the 0.10.2 compose/runtime
+# (avoid resolving 0.10.3 and an ABI mismatch with the pinned theater).
+packr-guest = { version = "=0.10.2", features = ["derive"] }
 
 [profile.release]
 opt-level = "s"

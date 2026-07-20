@@ -26,11 +26,16 @@ jobs:
         run: |
           set -uo pipefail
           nix build .#theater -o result-theater
-          # Build the bench member (plain cargo honors its .cargo/config.toml fixed-base flags).
-          nix develop --command bash -c 'cd test-actors/mailbox-decode-bench && cargo build --release --target wasm32-unknown-unknown'
           MEMBER=test-actors/mailbox-decode-bench/target/wasm32-unknown-unknown/release/mailbox_decode_bench.wasm
-          ls -la "$MEMBER"
-          ./result-theater/bin/theater compose "$MEMBER" -o bench.composite.wasm
+          # Build the member AND compose inside `nix develop` so the fixed-base
+          # rustflags (.cargo/config.toml) apply AND wasm-merge (binaryen) +
+          # wasm-tools are on PATH for `theater compose`.
+          nix develop --command bash -c "
+            set -e
+            (cd test-actors/mailbox-decode-bench && cargo build --release --target wasm32-unknown-unknown)
+            ls -la '$MEMBER'
+            ./result-theater/bin/theater compose '$MEMBER' -o bench.composite.wasm
+          "
           ls -la bench.composite.wasm
 
       - name: Sweep N (decode curve)
