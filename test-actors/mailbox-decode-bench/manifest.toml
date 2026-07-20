@@ -1,0 +1,7 @@
+name = "mailbox-decode-bench"
+version = "0.1.0"
+package = "PLACEHOLDER"   # workflow rewrites to the composed .composite.wasm path
+initial_state = "100"     # N (message count); workflow overrides per sweep point
+
+[[handler]]
+type = "runtime"

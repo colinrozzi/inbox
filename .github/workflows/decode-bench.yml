@@ -1,0 +1,83 @@
+name: decode-bench
+
+# Shareable synthetic reproduction of the 0.10.2 mail-spine hang, in ONE actor,
+# no real data. Builds the mailbox-decode-bench actor (byte-identical Message/
+# MailboxState GraphValue types to the real mailbox), then spawns it once per N
+# on the pinned 0.10.2 theater. Each run builds a MailboxState of N synthetic
+# messages, encodes it (as mailbox save_state), and decodes it (as load_state) —
+# logging in-guest encode_ms/decode_ms. Sweeping N gives pack-dev the quadratic
+# curve of packr_guest::decode on a high-node-count Vec<Message>.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  bench:
+    name: mailbox decode curve (N = 50..800) on theater 0.10.2
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+
+      - name: Build theater 0.10.2 + the bench member + compose
+        run: |
+          set -uo pipefail
+          nix build .#theater -o result-theater
+          # Build the bench member (plain cargo honors its .cargo/config.toml fixed-base flags).
+          nix develop --command bash -c 'cd test-actors/mailbox-decode-bench && cargo build --release --target wasm32-unknown-unknown'
+          MEMBER=test-actors/mailbox-decode-bench/target/wasm32-unknown-unknown/release/mailbox_decode_bench.wasm
+          ls -la "$MEMBER"
+          ./result-theater/bin/theater compose "$MEMBER" -o bench.composite.wasm
+          ls -la bench.composite.wasm
+
+      - name: Sweep N (decode curve)
+        run: |
+          set -uo pipefail
+          set +e
+          THEATER="$PWD/result-theater/bin/theater"
+          COMP="$PWD/bench.composite.wasm"
+          WORK="$RUNNER_TEMP/bench"; mkdir -p "$WORK"
+
+          run_n () {
+            N="$1"
+            man="$WORK/bench-$N.manifest.toml"
+            { echo 'name = "mailbox-decode-bench"'; echo 'version = "0.1.0"'
+              echo "package = \"$COMP\""; echo "initial_state = \"$N\""
+              echo '[[handler]]'; echo 'type = "runtime"'; } > "$man"
+            log="$WORK/bench-$N.log"
+            # Spawn in background; a successful bench idles after init, so poll the
+            # log for BENCH_RESULT (in-guest decode_ms) then kill. A hung decode
+            # never logs BENCH_RESULT -> we kill at the deadline.
+            env RUST_LOG=info "$THEATER" spawn "$man" > "$log" 2>&1 &
+            pid=$!
+            done=no
+            for _ in $(seq 1 200); do
+              if grep -q "BENCH_RESULT" "$log" 2>/dev/null; then done=yes; break; fi
+              if ! kill -0 "$pid" 2>/dev/null; then break; fi
+              sleep 1
+            done
+            kill -KILL "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
+            if [ "$done" = yes ]; then
+              grep "BENCH_RESULT" "$log" | tail -1
+            else
+              echo "BENCH_RESULT N=$N decode_ms=HUNG (no result within 200s) -- last log:"
+              grep -E "bench:" "$log" | tail -2
+            fi
+          }
+
+          echo "==================== DECODE CURVE ===================="
+          for N in 50 100 200 400 800; do run_n "$N"; done
+          echo "====================================================="
+          echo "READ: if decode_ms grows super-linearly with N (or HANGs), that's the"
+          echo "high-node-count quadratic in packr_guest::decode. Synthetic mail, no real data."
+
+      - name: Upload bench logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: decode-bench-logs
+          path: ${{ runner.temp }}/bench/*.log
+          retention-days: 7
