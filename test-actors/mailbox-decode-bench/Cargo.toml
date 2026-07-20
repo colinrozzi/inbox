@@ -1,0 +1,18 @@
+[package]
+name = "mailbox-decode-bench"
+version = "0.1.0"
+edition = "2021"
+
+# Standalone: detach from the inbox workspace so this test bench never ships as
+# a deployable actor.
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+packr-guest = { version = "0.10.2", features = ["derive"] }
+
+[profile.release]
+opt-level = "s"
+lto = true
