@@ -11,9 +11,9 @@ edition = "2021"
 crate-type = ["cdylib"]
 
 [dependencies]
-# Pin EXACTLY 0.10.2 to match prod's mailbox + the 0.10.2 compose/runtime
-# (avoid resolving 0.10.3 and an ABI mismatch with the pinned theater).
-packr-guest = { version = "=0.10.2", features = ["derive"] }
+# 0.10.4 = the decoder fix (transient peak-clone ~7x -> ~2.2x). The bench sweep
+# should now FLATTEN where 0.10.2 hit the ~7.4MB capped-heap cliff at N~800.
+packr-guest = { version = "=0.10.4", features = ["derive"] }
 
 [profile.release]
 opt-level = "s"
