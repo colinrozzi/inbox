@@ -11,12 +11,14 @@
     crane.url = "github:ipetkov/crane";
 
     theater = {
-      # Canonical fleet rev (post-`theater compose`, theater PR #141): the ONE
-      # rev every actor's theater input pins AND the rev the prod binary is cut
-      # from (the atomic-flip contract). theaterBin from here ships `theater
-      # compose`. Manager bumps flake.lock's narHash on the dev box (container
-      # agents can't nix-flake-update).
-      url = "github:colinrozzi/theater/7daab2ada0051f0517bf8cf3de9719fc2d75e0f6";
+      # Fleet rev = theater packr 0.10.4 host (PR #147): the ONE rev every actor's
+      # theater input pins AND the rev the prod binary is cut from (the atomic-flip
+      # contract). 0.10.4 = the decoder peak-mem fix; the host bump is alignment
+      # (host runs uncapped), the load-bearing fix is the guest packr-guest 0.10.4
+      # bump (the actor Cargo.tomls). theaterBin from here does `theater compose`.
+      # Manager bumps flake.lock's narHash on the dev box (container agents can't
+      # nix-flake-update).
+      url = "github:colinrozzi/theater/6f04a4dc72e3efce067997d2ec0d763f9ea0362b";
       inputs.nixpkgs.follows = "nixpkgs";
       inputs.rust-overlay.follows = "rust-overlay";
       inputs.crane.follows = "crane";
