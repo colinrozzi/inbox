@@ -1,0 +1,77 @@
+name: router-encode-bench
+
+# Reproduces the re-flip #2 post-load 98% spin (router finalization / save_bindings
+# encode) in one actor, no real data. Builds a RouterState of N Bindings
+# (byte-identical types to the real router) and runs the two encode paths
+# save_bindings does + the RouterState return encode, with in-guest timing.
+# prod has 17 bindings; if PATH A/B hangs at N=17 (or scales), it's pinned.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  bench:
+    name: router encode (N bindings) on theater 0.10.4
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+
+      - name: Build theater + the bench member + compose
+        run: |
+          set -uo pipefail
+          nix build .#theater -o result-theater
+          MEMBER=test-actors/router-encode-bench/target/wasm32-unknown-unknown/release/router_encode_bench.wasm
+          nix develop --command bash -c "
+            set -e
+            (cd test-actors/router-encode-bench && cargo build --release --target wasm32-unknown-unknown)
+            ls -la '$MEMBER'
+            ./result-theater/bin/theater compose '$MEMBER' -o router-bench.composite.wasm
+          "
+          ls -la router-bench.composite.wasm
+
+      - name: Sweep N bindings
+        run: |
+          set -uo pipefail
+          set +e
+          THEATER="$PWD/result-theater/bin/theater"
+          COMP="$PWD/router-bench.composite.wasm"
+          WORK="$RUNNER_TEMP/rbench"; mkdir -p "$WORK"
+          run_n () {
+            N="$1"
+            man="$WORK/rb-$N.manifest.toml"
+            { echo 'name = "router-encode-bench"'; echo 'version = "0.1.0"'
+              echo "package = \"$COMP\""; echo "initial_state = \"$N\""
+              echo '[[handler]]'; echo 'type = "runtime"'; } > "$man"
+            log="$WORK/rb-$N.log"
+            env RUST_LOG=info "$THEATER" spawn "$man" > "$log" 2>&1 &
+            pid=$!
+            done=no
+            for _ in $(seq 1 150); do
+              if grep -q "ROUTER_BENCH_RESULT" "$log" 2>/dev/null; then done=yes; break; fi
+              if ! kill -0 "$pid" 2>/dev/null; then break; fi
+              sleep 1
+            done
+            kill -KILL "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
+            if [ "$done" = yes ]; then
+              grep "ROUTER_BENCH_RESULT" "$log" | tail -1
+            else
+              echo "ROUTER_BENCH N=$N -> HUNG (no result in 150s). Last log line pins the path:"
+              grep "router-bench:" "$log" | tail -2
+            fi
+          }
+          echo "==================== ROUTER ENCODE SWEEP ===================="
+          for N in 17 34 68 136; do run_n "$N"; done
+          echo "READ: prod has 17 bindings. If a PATH hangs at N=17, that encode call is the spin;"
+          echo "the last 'router-bench: ... PATH X ...' line names save_bindings (A) vs RouterState-return (B)."
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: router-encode-bench-logs
+          path: ${{ runner.temp }}/rbench/*.log
+          retention-days: 7

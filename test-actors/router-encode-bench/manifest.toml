@@ -1,0 +1,7 @@
+name = "router-encode-bench"
+version = "0.1.0"
+package = "PLACEHOLDER"
+initial_state = "17"
+
+[[handler]]
+type = "runtime"

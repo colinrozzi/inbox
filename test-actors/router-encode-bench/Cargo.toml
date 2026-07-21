@@ -1,0 +1,18 @@
+[package]
+name = "router-encode-bench"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# =0.10.4 = the current re-flip guest; reproduces the post-load router
+# finalization spin (save_bindings encode / RouterState) if it's here.
+packr-guest = { version = "=0.10.4", features = ["derive"] }
+
+[profile.release]
+opt-level = "s"
+lto = true
