@@ -11,14 +11,16 @@
     crane.url = "github:ipetkov/crane";
 
     theater = {
-      # Fleet rev = theater packr 0.10.4 host (PR #147): the ONE rev every actor's
-      # theater input pins AND the rev the prod binary is cut from (the atomic-flip
-      # contract). 0.10.4 = the decoder peak-mem fix; the host bump is alignment
-      # (host runs uncapped), the load-bearing fix is the guest packr-guest 0.10.4
-      # bump (the actor Cargo.tomls). theaterBin from here does `theater compose`.
-      # Manager bumps flake.lock's narHash on the dev box (container agents can't
-      # nix-flake-update).
-      url = "github:colinrozzi/theater/6f04a4dc72e3efce067997d2ec0d763f9ea0362b";
+      # Fleet rev = theater packr 0.10.6 host (PR #148, main 516c4b7e): the ONE rev
+      # every actor's theater input pins AND the rev the prod binary is cut from
+      # (the atomic-flip contract). 0.10.6 = packr instantiate default u64::MAX/2
+      # (no epoch overflow) + epoch guardrail ARMED (set_epoch_deadline @60s init /
+      # 300s otherwise) + 1/sec ticker + init-watchdog. Pairs with the lazy-spawn
+      # router hedge (#60) — spine binds without eager mailbox spawns, epoch is the
+      # backstop. Guest packr-guest is bumped to =0.10.6 (the actor Cargo.tomls) to
+      # ABI-match. theaterBin from here does `theater compose`. Manager bumps
+      # flake.lock's narHash on the dev box (container agents can't nix-flake-update).
+      url = "github:colinrozzi/theater/516c4b7eec38998b18158e1ea9720cbf0716685a";
       inputs.nixpkgs.follows = "nixpkgs";
       inputs.rust-overlay.follows = "rust-overlay";
       inputs.crane.follows = "crane";
