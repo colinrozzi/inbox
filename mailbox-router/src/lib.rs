@@ -132,32 +132,26 @@ fn init(state: Value) -> Result<(RouterState, ()), String> {
             "mailbox-router init: expected init_state = string (mailbox manifest path)",
         )),
     };
-    log(format!("[mailbox-router] init (manifest={})", mailbox_manifest));
+    log(format!("[mailbox-router] init (manifest={}) — lazy mailbox spawn", mailbox_manifest));
 
+    // LAZY SPAWN (do NOT eager-restore mailboxes here). Eager, synchronous
+    // multi-spawn during the router's OWN auto-init triggers a theater
+    // supervisor spin on the 2nd nested spawn (the router is itself being
+    // spawned synchronously by the acceptor; spawning a 2nd child from inside
+    // that auto-init wedges). So we keep the known addresses but spawn each
+    // mailbox on its FIRST lookup instead (a single spawn from a normal RPC
+    // context, not nested-in-init). That lets the acceptor's spawn(router)
+    // return -> the spine binds. Mailbox actor ids are fresh per process
+    // anyway, so the persisted mailbox_id is not authoritative; an empty
+    // mailbox_id here means "known address, not yet spawned this process".
     let saved = load_bindings();
-    let mut bindings: Vec<Binding> = Vec::with_capacity(saved.len());
-    for b in &saved {
-        match spawn_mailbox(&mailbox_manifest, &b.address) {
-            Ok(new_id) => {
-                log(format!(
-                    "[mailbox-router] restored {} -> {} (was {})",
-                    b.address, new_id, b.mailbox_id
-                ));
-                bindings.push(Binding {
-                    address: b.address.clone(),
-                    mailbox_id: new_id,
-                });
-            }
-            Err(e) => log(format!(
-                "[mailbox-router] failed to restore {}: {}",
-                b.address, e
-            )),
-        }
-    }
-
-    if !bindings.is_empty() {
-        save_bindings(&bindings);
-    }
+    let bindings: Vec<Binding> = saved
+        .into_iter()
+        .map(|b| Binding {
+            address: b.address,
+            mailbox_id: String::new(),
+        })
+        .collect();
 
     let _ = ValueType::Bool; // silence unused
     Ok((
@@ -169,13 +163,29 @@ fn init(state: Value) -> Result<(RouterState, ()), String> {
     ))
 }
 
+/// Ensure the mailbox for `bindings[idx]` is spawned in THIS process; spawn it
+/// lazily if not (empty mailbox_id). Returns its current actor id. A single
+/// spawn from an RPC context (lookup/register) — not the eager-in-init path.
+fn ensure_spawned(state: &mut RouterState, idx: usize) -> Result<String, String> {
+    if state.bindings[idx].mailbox_id.is_empty() {
+        let address = state.bindings[idx].address.clone();
+        let id = spawn_mailbox(&state.mailbox_manifest, &address)?;
+        log(format!("[mailbox-router] lazily spawned {} -> {}", address, id));
+        state.bindings[idx].mailbox_id = id.clone();
+        Ok(id)
+    } else {
+        Ok(state.bindings[idx].mailbox_id.clone())
+    }
+}
+
 #[export(name = "theater:inbox/router.register")]
 fn register(state: RouterState, address: String) -> Result<(RouterState, String), String> {
     let mut state = state;
 
-    if let Some(b) = state.bindings.iter().find(|b| b.address == address) {
-        // Idempotent: registering an existing address returns its current id.
-        let mailbox_id = b.mailbox_id.clone();
+    if let Some(idx) = state.bindings.iter().position(|b| b.address == address) {
+        // Idempotent: known address. Ensure its mailbox is spawned this process
+        // (lazy spawn if it hasn't been looked up yet) and return the id.
+        let mailbox_id = ensure_spawned(&mut state, idx)?;
         return Ok((state, mailbox_id));
     }
 
@@ -195,12 +205,15 @@ fn register(state: RouterState, address: String) -> Result<(RouterState, String)
 
 #[export(name = "theater:inbox/router.lookup")]
 fn lookup(state: RouterState, address: String) -> Result<(RouterState, Option<String>), String> {
-    let id = state
-        .bindings
-        .iter()
-        .find(|b| b.address == address)
-        .map(|b| b.mailbox_id.clone());
-    Ok((state, id))
+    let mut state = state;
+    match state.bindings.iter().position(|b| b.address == address) {
+        // Known address: spawn its mailbox lazily on first lookup this process.
+        Some(idx) => {
+            let id = ensure_spawned(&mut state, idx).ok();
+            Ok((state, id))
+        }
+        None => Ok((state, None)),
+    }
 }
 
 #[export(name = "theater:inbox/router.list")]
