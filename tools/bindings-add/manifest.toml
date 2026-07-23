@@ -1,0 +1,25 @@
+# bindings-add one-shot ops actor — manifest TEMPLATE.
+#
+# Edit `package` to the built wasm path, and `initial_state` to the addresses.
+# initial_state grammar:  "[WRITE:]addr1,addr2,..."   (no WRITE: prefix = DRY RUN)
+#
+# The store handler MUST match the prod router's: base_path + store_id below map
+# store-id "inbox" to the live store at /mnt/main-volume/inbox/store/inbox, i.e.
+# the SAME blob the router reads. Run this only while the router is stopped
+# (0.11.0 flip staging).
+name = "bindings-add"
+version = "0.1.0"
+package = "/home/colin/work/actors/inbox/tools/bindings-add/target/wasm32-unknown-unknown/release/bindings_add.wasm"
+static_package = true
+
+# DRY RUN by default — reports what it would do, writes nothing. To apply, change
+# to:  initial_state = "WRITE:claude@colinrozzi.com,manager@colinrozzi.com,theater-dev@colinrozzi.com"
+initial_state = "claude@colinrozzi.com,manager@colinrozzi.com,theater-dev@colinrozzi.com"
+
+[[handler]]
+type = "runtime"
+
+[[handler]]
+type = "store"
+base_path = "/mnt/main-volume/inbox/store"
+store_id = "inbox"

@@ -1,0 +1,23 @@
+[package]
+name = "bindings-add"
+version = "0.1.0"
+edition = "2021"
+
+# Standalone workspace: this is an OPS TOOL, not a deploy actor. It is NOT a
+# member of the root inbox workspace and NOT built by `nix build .#default`
+# (the 7-actor deploy set). Build it separately with the plain 0.11.0 recipe
+# (see README.md).
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# Same packr-guest line as the spine actors — this is load-bearing: the tool
+# MUST encode/decode the router-bindings blob byte-identically to the router,
+# so it uses the exact same crate + derive.
+packr-guest = { version = "0.11.0", features = ["derive"] }
+
+[profile.release]
+opt-level = "s"
+lto = true

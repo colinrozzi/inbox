@@ -1,0 +1,6 @@
+# Plain self-contained actor (packr 0.11.0) — same recipe as the spine actors.
+[target.wasm32-unknown-unknown]
+rustflags = [
+    "-C", "link-arg=--export-memory",
+    "-C", "link-arg=--no-entry",
+]
