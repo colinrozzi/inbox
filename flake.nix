@@ -11,15 +11,17 @@
     crane.url = "github:ipetkov/crane";
 
     theater = {
-      # Fleet rev = theater packr 0.10.6 host (PR #148, main 516c4b7e): the ONE rev
-      # every actor's theater input pins AND the rev the prod binary is cut from
-      # (the atomic-flip contract). 0.10.6 = packr instantiate default u64::MAX/2
-      # (no epoch overflow) + epoch guardrail ARMED (set_epoch_deadline @60s init /
-      # 300s otherwise) + 1/sec ticker + init-watchdog. Pairs with the lazy-spawn
-      # router hedge (#60) — spine binds without eager mailbox spawns, epoch is the
-      # backstop. Guest packr-guest is bumped to =0.10.6 (the actor Cargo.tomls) to
-      # ABI-match. theaterBin from here does `theater compose`. Manager bumps
-      # flake.lock's narHash on the dev box (container agents can't nix-flake-update).
+      # Runtime host reference (packages.theater + devShell only). As of the
+      # packr 0.11.0 plain-build migration the composite build no longer uses
+      # theaterBin at all (no `theater compose` step), so this input does NOT
+      # gate `nix build .#default` — nix's lazy eval never forces theaterBin for
+      # the default package. Still pinned at the 0.10.6 host (516c4b7e, #148) so
+      # packages.theater/devShell resolve; the bump to the 0.11.0 host
+      # (theater PR #149, 73a4540b) is a FOLLOW-UP gated on theater-dev cutting +
+      # verifying the 0.11.0 host binary (a 0.10.6 host cannot load 0.11.0
+      # plain-build actors, so local `theater spawn` in the devShell is stale
+      # until that bump). Manager bumps flake.lock's narHash on the dev box
+      # (container agents can't nix-flake-update).
       url = "github:colinrozzi/theater/516c4b7eec38998b18158e1ea9720cbf0716685a";
       inputs.nixpkgs.follows = "nixpkgs";
       inputs.rust-overlay.follows = "rust-overlay";
@@ -48,26 +50,24 @@
             (type == "directory");
         };
 
-        # Fixed-base self-contained member link flags (packr 0.10.2 recipe;
-        # supersedes the 0.8.1 PIC side-module flags — PIC is gone). MUST reach
-        # the real cargo invocation. crane does NOT honor the repo
-        # .cargo/config.toml (kept in-tree for devshell / plain-cargo builds),
-        # so pass them via CARGO_ENCODED_RUSTFLAGS — highest cargo precedence,
-        # cannot be shadowed by config. Flags are joined by 0x1f (ASCII unit
-        # separator), cargo's encoded-rustflags delimiter, produced here via
-        # fromJSON's  escape.
-        # Keep this list identical to .cargo/config.toml. --global-base=327680
-        # (0x50000) is the single-package base; all seven inbox actors are
-        # single-package (no [[link]] edges) so it applies to every member.
+        # Plain self-contained actor link flags (packr 0.11.0 recipe; supersedes
+        # the 0.10.2 fixed-base/compose recipe entirely — no fixed base, no fused
+        # allocator, no compose step. packr 0.11.0 links the allocator + growable
+        # own-memory into the cdylib directly). MUST reach the real cargo
+        # invocation. crane does NOT honor the repo .cargo/config.toml (kept
+        # in-tree for devshell / plain-cargo builds), so pass them via
+        # CARGO_ENCODED_RUSTFLAGS — highest cargo precedence, cannot be shadowed
+        # by config. Flags are joined by 0x1f (ASCII unit separator), cargo's
+        # encoded-rustflags delimiter, produced via fromJSON's escape. Keep this
+        # list identical to .cargo/config.toml.
+        #   --export-memory : export the cdylib's own growable linear memory (the
+        #                     growable heap retires the 0.10.2 capped-heap decode
+        #                     OOM class that blocked the mail-spine flip).
+        #   --no-entry      : wasm reactor, no _start.
         rfSep = builtins.fromJSON "\"\\u001f\"";
-        fixedBaseRustflags = builtins.concatStringsSep rfSep [
-          "-C" "link-arg=--import-memory"
-          "-C" "link-arg=--initial-memory=8388608"
-          "-C" "link-arg=--stack-first"
-          "-C" "link-arg=-zstack-size=262144"
-          "-C" "link-arg=--global-base=327680"
+        plainRustflags = builtins.concatStringsSep rfSep [
+          "-C" "link-arg=--export-memory"
           "-C" "link-arg=--no-entry"
-          "-C" "link-arg=--no-merge-data-segments"
         ];
 
         commonArgs = {
@@ -76,33 +76,31 @@
           version = "0.1.0";
           cargoExtraArgs = "--target wasm32-unknown-unknown";
           CARGO_BUILD_TARGET = "wasm32-unknown-unknown";
-          CARGO_ENCODED_RUSTFLAGS = fixedBaseRustflags;
+          CARGO_ENCODED_RUSTFLAGS = plainRustflags;
           doCheck = false;
         };
 
-        # cargoArtifacts=null: per the recipe's crane note, keep the wasm member
-        # build off a shared host cargoArtifacts (don't share host artifacts into
-        # the wasm32-unknown-unknown build). One buildPackage pass.
+        # cargoArtifacts=null: per the recipe's crane note, keep the wasm build
+        # off a shared host cargoArtifacts (don't share host artifacts into the
+        # wasm32-unknown-unknown build). One buildPackage pass.
         cargoArtifacts = null;
 
         theaterBin = theater.packages.${system}.default;
 
       in {
-        # nix build — produces all seven self-contained COMPOSITES in $out as
-        # inbox_<actor>.composite.wasm (the deployable 0.10.2 artifacts).
+        # nix build — produces all seven plain self-contained actor modules in
+        # $out as inbox_<actor>.wasm (the deployable 0.11.0 artifacts).
         #
-        # crane builds the bare fixed-base members; `theater compose` then fuses
-        # each member + packr's bundled allocator into an own-memory composite
-        # (single-package, base 0x50000) and verifies it (residual imports must
-        # be host theater:simple/* only — no env.memory / pack:alloc /
-        # __linear_memory). theater's 0.10.x loader (assert_self_contained)
-        # rejects a bare member, so ONLY the composites are installed. `theater
-        # compose` verifies by default and fails the build on a non-self-contained
-        # artifact, so a bad member never installs. Needs theaterBin (0.10.2 rev,
-        # pinned above) + wasm-merge (binaryen) + wasm-tools on PATH.
+        # packr 0.11.0 links each cdylib into a directly-loadable module: NO
+        # `theater compose` step, NO binaryen/wasm-merge. crane builds the plain
+        # members; the install phase asserts each is self-contained (every
+        # `(import ...)` must be a host `theater:simple/*` — any env.memory,
+        # pack:alloc, or __linear_memory import means the plain-build recipe was
+        # not applied) and installs the bare $name.wasm. Only wasm-tools is
+        # needed on PATH.
         packages.default = craneLib.buildPackage (commonArgs // {
           inherit cargoArtifacts;
-          nativeBuildInputs = [ theaterBin pkgs.binaryen pkgs.wasm-tools ];
+          nativeBuildInputs = [ pkgs.wasm-tools ];
           installPhaseCommand = ''
             mkdir -p $out
             for name in \
@@ -114,51 +112,23 @@
               inbox_smtp_acceptor \
               inbox_smtp_handler
             do
-              theater compose \
-                "target/wasm32-unknown-unknown/release/$name.wasm" \
-                -o "$out/$name.composite.wasm"
+              wasm="target/wasm32-unknown-unknown/release/$name.wasm"
+              wasm-tools validate "$wasm"
+              bad=$(wasm-tools print "$wasm" | grep -E '^[[:space:]]*\(import ' | grep -v 'theater:simple/' || true)
+              if [ -n "$bad" ]; then
+                echo "ERROR: $name is NOT self-contained (non-host imports):"
+                echo "$bad"
+                exit 1
+              fi
+              cp "$wasm" "$out/$name.wasm"
+              echo "$name.wasm: host imports only"
             done
           '';
         });
 
-        # Debug-only variant for the 0.10.2 acceptor-hang repro (theater-dev's
-        # test C): identical to packages.default but --initial-memory bumped
-        # 8MiB -> 64MiB. Discriminates the init spin: boots with headroom =>
-        # memory-grow-thrash (interim --initial-memory bump could unblock the
-        # flip); still thrashes at 64MiB => algorithmic O(n^2) decode/alloc that
-        # only pack-dev's fix resolves. NOT a deploy artifact — packages.default
-        # (the deployable) is unchanged.
-        packages.composites-64m = craneLib.buildPackage (commonArgs // {
-          inherit cargoArtifacts;
-          CARGO_ENCODED_RUSTFLAGS = builtins.concatStringsSep rfSep [
-            "-C" "link-arg=--import-memory"
-            "-C" "link-arg=--initial-memory=67108864"
-            "-C" "link-arg=--stack-first"
-            "-C" "link-arg=-zstack-size=262144"
-            "-C" "link-arg=--global-base=327680"
-            "-C" "link-arg=--no-entry"
-            "-C" "link-arg=--no-merge-data-segments"
-          ];
-          nativeBuildInputs = [ theaterBin pkgs.binaryen pkgs.wasm-tools ];
-          installPhaseCommand = ''
-            mkdir -p $out
-            for name in \
-              inbox_acceptor \
-              inbox_api_handler \
-              inbox_cli \
-              inbox_mailbox \
-              inbox_mailbox_router \
-              inbox_smtp_acceptor \
-              inbox_smtp_handler
-            do
-              theater compose \
-                "target/wasm32-unknown-unknown/release/$name.wasm" \
-                -o "$out/$name.composite.wasm"
-            done
-          '';
-        });
-
-        # nix build .#theater — exposes the pinned theater binary used at runtime
+        # nix build .#theater — exposes the pinned theater binary. NOTE: still the
+        # 0.10.6 host (see the `theater` input comment); the 0.11.0 host bump is a
+        # follow-up. Not used by packages.default.
         packages.theater = theaterBin;
 
         packages.clippy = craneLib.cargoClippy (commonArgs // {
@@ -173,14 +143,15 @@
         };
 
         devShells.default = craneLib.devShell {
-          # binaryen (wasm-merge) + wasm-tools are required by `theater build`
-          # to compose + verify the self-contained composite (packr 0.10.2).
-          packages = [ rustToolchain theaterBin pkgs.binaryen pkgs.wasm-tools ];
+          # packr 0.11.0 plain build: only wasm-tools is needed to build + verify
+          # (no binaryen/wasm-merge — the compose step is gone). theaterBin is
+          # kept for local `theater spawn`, but note it is still the 0.10.6 host
+          # until the 0.11.0 host bump lands, so it cannot spawn a 0.11.0 actor.
+          packages = [ rustToolchain theaterBin pkgs.wasm-tools ];
           shellHook = ''
-            echo "inbox dev environment"
-            echo "  cargo build --release --target wasm32-unknown-unknown   # bare member"
-            echo "  theater build --release <actor-dir>                     # self-contained composite (needs theater 0.10.2)"
-            echo "  theater spawn acceptor/manifest.toml"
+            echo "inbox dev environment (packr 0.11.0 plain build)"
+            echo "  cargo build --release --target wasm32-unknown-unknown   # directly-loadable <actor>.wasm, no compose"
+            echo "  wasm-tools print <actor>.wasm | grep '(import'          # verify: host theater:simple/* only"
           '';
         };
       });
