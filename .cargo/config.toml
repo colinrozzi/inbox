@@ -1,22 +1,20 @@
-# Fixed-base self-contained member (packr 0.10.2). Replaces the old 0.8.1 PIC
-# side-module flags entirely (no relocation-model=pic / --experimental-pic /
-# -shared / --export=__wasm_call_ctors). packr::link (via `theater build` /
-# `theater compose`) internalizes pack:alloc + memory into an own-memory
-# composite; these flags build each member at a fixed absolute base so its data
-# needs no relocation. --global-base=327680 (0x50000) is the first package slot
-# for a SINGLE-package actor — all seven inbox actors are single-package (no
-# [[link]] edges), so they share this base. --no-merge-data-segments keeps the
-# CGRF __pack_types metadata as its own segment so packr's read_surface finds it.
+# Plain self-contained actor (packr 0.11.0). Supersedes the 0.10.2 fixed-base
+# recipe entirely — no compose, no fused allocator, no fixed base. packr 0.11.0
+# links the allocator + growable own-memory into the cdylib directly, so the
+# only link-args needed are:
+#   --export-memory : export the module's own linear memory (growable; the
+#                     growable heap is what retires the 0.10.2 capped-heap decode
+#                     OOM class that blocked the mail-spine flip).
+#   --no-entry      : wasm reactor, no _start.
+# The resulting target/wasm32-unknown-unknown/release/<name>.wasm is directly
+# loadable by theater 0.11.0 — there is NO `theater compose` step and no
+# binaryen/wasm-merge dependency.
 #
 # NOTE: crane does NOT honor this file (kept for devshell / plain-cargo builds);
-# flake.nix passes the same flags via CARGO_ENCODED_RUSTFLAGS. Keep the two in sync.
+# flake.nix passes the same two link-args via CARGO_ENCODED_RUSTFLAGS. Keep the
+# two in sync.
 [target.wasm32-unknown-unknown]
 rustflags = [
-    "-C", "link-arg=--import-memory",
-    "-C", "link-arg=--initial-memory=8388608",
-    "-C", "link-arg=--stack-first",
-    "-C", "link-arg=-zstack-size=262144",
-    "-C", "link-arg=--global-base=327680",
+    "-C", "link-arg=--export-memory",
     "-C", "link-arg=--no-entry",
-    "-C", "link-arg=--no-merge-data-segments",
 ]
