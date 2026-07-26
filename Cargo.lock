@@ -146,7 +146,7 @@ dependencies = [
 name = "inbox-acceptor"
 version = "0.1.0"
 dependencies = [
- "packr-guest",
+ "packr-guest 0.11.0",
  "serde",
  "serde_json",
 ]
@@ -157,7 +157,7 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "getrandom",
- "packr-guest",
+ "packr-guest 0.11.0",
  "rsa",
  "serde",
  "serde_json",
@@ -168,7 +168,7 @@ dependencies = [
 name = "inbox-cli"
 version = "0.1.0"
 dependencies = [
- "packr-guest",
+ "packr-guest 0.11.0",
  "serde",
  "serde_json",
 ]
@@ -177,21 +177,21 @@ dependencies = [
 name = "inbox-mailbox"
 version = "0.1.0"
 dependencies = [
- "packr-guest",
+ "packr-guest 0.12.5",
 ]
 
 [[package]]
 name = "inbox-mailbox-router"
 version = "0.1.0"
 dependencies = [
- "packr-guest",
+ "packr-guest 0.11.0",
 ]
 
 [[package]]
 name = "inbox-smtp-acceptor"
 version = "0.1.0"
 dependencies = [
- "packr-guest",
+ "packr-guest 0.11.0",
  "serde",
  "serde_json",
 ]
@@ -201,7 +201,7 @@ name = "inbox-smtp-handler"
 version = "0.1.0"
 dependencies = [
  "base64",
- "packr-guest",
+ "packr-guest 0.11.0",
 ]
 
 [[package]]
@@ -299,10 +299,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "packr-abi"
+version = "0.12.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c4d5a49ea8f4baa1d3d05d0582b5bdd8513ea181e852a25b29c0bc29b6994030"
+dependencies = [
+ "hashbrown",
+ "sha2",
+]
+
+[[package]]
 name = "packr-derive"
 version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ccb45eee67375a3692f0b43a53d20e05f56f9999d9f9e18af35bc837e405404"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
+name = "packr-derive"
+version = "0.12.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8474d5611a32438c1a61163406c7af0a2c96e2e48e6a596861484adb1eb109d8"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -316,9 +337,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "426c9284fea3778c68bacd7efab31da00f475bbada8fb5c1cb1f2e532e5daadc"
 dependencies = [
  "dlmalloc",
- "packr-abi",
- "packr-derive",
- "packr-guest-macros",
+ "packr-abi 0.11.0",
+ "packr-derive 0.11.0",
+ "packr-guest-macros 0.11.0",
+]
+
+[[package]]
+name = "packr-guest"
+version = "0.12.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "551879a2cb9639fbec63a8f1033ec6d4eda578466e37e23486b237d91c8b643c"
+dependencies = [
+ "dlmalloc",
+ "packr-abi 0.12.5",
+ "packr-derive 0.12.5",
+ "packr-guest-macros 0.12.5",
 ]
 
 [[package]]
@@ -327,7 +360,19 @@ version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bbce0a3cdbb0b91b1cda6e3eedb4e18967fd6d335694a44287bc754e4ae819a9"
 dependencies = [
- "packr-abi",
+ "packr-abi 0.11.0",
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
+name = "packr-guest-macros"
+version = "0.12.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4dadc4781793c36cad368a5a58853e13cd3f9b06780a4a6db525e5fa573f5ac5"
+dependencies = [
+ "packr-abi 0.12.5",
  "proc-macro2",
  "quote",
  "syn",

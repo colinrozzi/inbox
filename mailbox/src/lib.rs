@@ -18,8 +18,21 @@ packr_guest::setup_guest!();
 
 const STORE_ID: &str = "inbox";
 
+// `forward_compatible`: make record decode tolerant of field-set changes so a
+// store field-add is ROLLBACK-SAFE. A NAMED record decodes by name and the attr
+// (a) ignores EXTRA fields (an old build reads new data — the one-way-door fix)
+// and (b) DEFAULTS missing fields (a new build reads old data — this supersedes
+// the hand-written migrate_threading_fields). Encode is unchanged (no wire
+// change). MUST be live BEFORE the next field is appended (see deploy sequence:
+// this attr ships first, schema-neutral; the cc-add follows, rollback-safe).
+// NOTE separate #[graph(...)] attrs, NOT combined: on 0.12.5 the combined form
+// `#[graph(crate = "...", forward_compatible)]` mis-parses the crate arg and
+// silently defaults it to packr_abi (wrong ABI for a composite_abi guest). The
+// derive scans all attrs, so two lines is correct. (0.12.6 fixes the combined
+// form; adopt it later — pure UX.)
 #[derive(Clone, GraphValue)]
 #[graph(crate = "packr_guest::composite_abi")]
+#[graph(forward_compatible)]
 pub struct Message {
     pub id: u64,
     pub from: String,
@@ -39,8 +52,11 @@ pub struct Message {
     pub thread_id: String,
 }
 
+// forward_compatible (see Message) — covers MailboxState's own future growth.
+// Separate attrs, not combined (see Message note).
 #[derive(Clone, GraphValue)]
 #[graph(crate = "packr_guest::composite_abi")]
+#[graph(forward_compatible)]
 pub struct MailboxState {
     /// The email address this mailbox is for; used as the store label suffix.
     pub address: String,
