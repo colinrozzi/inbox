@@ -158,31 +158,19 @@ fn run_session(conn: &str, router_id: &str) -> Result<(), String> {
                 let parsed = parse_headers_and_body(&raw);
                 let from = mail_from.clone().unwrap_or_default();
 
-                // Store on each recipient's mailbox. Every copy carries the TRUE
-                // envelope To/Cc (from the DATA headers), NOT the recipient's own
-                // RCPT-TO leg (`_leg`) — so a cc-d reader sees the real recipient
-                // set and knows they were cc-d, not mis-addressed. Fall back to the
-                // leg only if the message carried no To: header (e.g. bcc-only), so
-                // `to` is never blank.
-                let header_to = if parsed.to.trim().is_empty() {
-                    None
-                } else {
-                    Some(parsed.to.clone())
-                };
-                for (leg, mbox_id) in &rcpts {
-                    let to = header_to.clone().unwrap_or_else(|| leg.clone());
+                // Store on each recipient's mailbox.
+                for (to, mbox_id) in &rcpts {
                     let _ = rpc_call(
                         mbox_id.clone(),
                         String::from("theater:inbox/mailbox.put-message"),
                         Value::Tuple(alloc::vec![
                             Value::String(from.clone()),
-                            Value::String(to),
+                            Value::String(to.clone()),
                             Value::String(parsed.subject.clone()),
                             Value::String(parsed.body.clone()),
                             Value::String(parsed.message_id.clone()),
                             Value::String(parsed.in_reply_to.clone()),
                             Value::String(parsed.references.clone()),
-                            Value::String(parsed.cc.clone()),
                         ]),
                         Value::Tuple(alloc::vec![]),
                     );
@@ -294,11 +282,6 @@ fn read_data_block(conn: &str) -> Result<String, String> {
 /// back into the same conversation. Threading headers are empty when the
 /// sender didn't set them.
 struct ParsedMessage {
-    /// The message's true `To` / `Cc` headers (verbatim, comma-joined multi-
-    /// recipient lists) — the real envelope, so each stored per-mailbox copy can
-    /// show the full recipient set rather than that mailbox's own delivery leg.
-    to: String,
-    cc: String,
     subject: String,
     body: String,
     message_id: String,
@@ -313,8 +296,6 @@ struct ParsedMessage {
 /// Content-Transfer-Encoding.
 fn parse_headers_and_body(raw: &str) -> ParsedMessage {
     let mut header_end = 0usize;
-    let mut to = String::new();
-    let mut cc = String::new();
     let mut subject = String::new();
     let mut content_type = String::new();
     let mut content_encoding = String::new();
@@ -334,14 +315,6 @@ fn parse_headers_and_body(raw: &str) -> ParsedMessage {
         // folded across several lines.
         if (line.starts_with(' ') || line.starts_with('\t')) && last_header_name.is_some() {
             match last_header_name.as_deref() {
-                Some(n) if n.eq_ignore_ascii_case("to") => {
-                    to.push(' ');
-                    to.push_str(stripped.trim());
-                }
-                Some(n) if n.eq_ignore_ascii_case("cc") => {
-                    cc.push(' ');
-                    cc.push_str(stripped.trim());
-                }
                 Some(n) if n.eq_ignore_ascii_case("subject") => {
                     subject.push(' ');
                     subject.push_str(stripped.trim());
@@ -374,11 +347,7 @@ fn parse_headers_and_body(raw: &str) -> ParsedMessage {
         if let Some(colon) = stripped.find(':') {
             let name = stripped[..colon].trim().to_string();
             let value = stripped[colon + 1..].trim().to_string();
-            if name.eq_ignore_ascii_case("to") {
-                to = value;
-            } else if name.eq_ignore_ascii_case("cc") {
-                cc = value;
-            } else if name.eq_ignore_ascii_case("subject") {
+            if name.eq_ignore_ascii_case("subject") {
                 subject = value;
             } else if name.eq_ignore_ascii_case("content-type") {
                 content_type = value;
@@ -405,8 +374,6 @@ fn parse_headers_and_body(raw: &str) -> ParsedMessage {
             .to_string()
     };
     ParsedMessage {
-        to,
-        cc,
         subject,
         body,
         message_id,
