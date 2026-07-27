@@ -50,6 +50,13 @@ pub struct Message {
     /// store time (see `derive_thread_id`); the read-side grouping view is a
     /// follow-up.
     pub thread_id: String,
+    /// The message's true `Cc` envelope leg (comma-joined), parsed from the DATA
+    /// headers — NOT this mailbox's own delivery leg. With `to` (the true `To`)
+    /// it lets a cc-d reader see the real recipient set and know they were cc-d,
+    /// not mis-addressed. Added AFTER thread_id (trailing) so old messages
+    /// migrate by padding a single trailing field (see `migrate_threading_fields`).
+    /// Empty for messages stored before this field existed.
+    pub cc: String,
 }
 
 // forward_compatible (see Message) — covers MailboxState's own future growth.
@@ -87,7 +94,7 @@ pack_types! {
     exports {
         theater:simple/actor.init: func(state: value) -> result<mailbox-state, string>,
         theater:inbox/mailbox.list-since: func(state: mailbox-state, cursor: u64) -> result<tuple<mailbox-state, inbox-page>, string>,
-        theater:inbox/mailbox.put-message: func(state: mailbox-state, from: string, to: string, subject: string, body: string, message-id: string, in-reply-to: string, references: string) -> result<tuple<mailbox-state, u64>, string>,
+        theater:inbox/mailbox.put-message: func(state: mailbox-state, from: string, to: string, subject: string, body: string, message-id: string, in-reply-to: string, references: string, cc: string) -> result<tuple<mailbox-state, u64>, string>,
     }
 }
 
@@ -140,7 +147,7 @@ fn migrate_threading_fields(value: &mut Value) {
         if let Value::List { items, .. } = v {
             for item in items.iter_mut() {
                 if let Value::Record { fields: mf, .. } = item {
-                    for key in ["message_id", "in_reply_to", "references", "thread_id"] {
+                    for key in ["message_id", "in_reply_to", "references", "thread_id", "cc"] {
                         if !mf.iter().any(|(n, _)| n.as_str() == key) {
                             mf.push((String::from(key), Value::String(String::new())));
                         }
@@ -226,6 +233,7 @@ fn put_message(
     message_id: String,
     in_reply_to: String,
     references: String,
+    cc: String,
 ) -> Result<(MailboxState, u64), String> {
     let mut state = state;
     let id = state.messages.len() as u64;
@@ -241,6 +249,7 @@ fn put_message(
         in_reply_to,
         references,
         thread_id,
+        cc,
     };
     state.messages.push(msg);
     log(format!("[inbox-mailbox] stored message id={} for {}", id, state.address));
