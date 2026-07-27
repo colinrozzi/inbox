@@ -188,6 +188,8 @@ struct InboxMessage {
     id: u64,
     from: String,
     to: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    cc: String,
     subject: String,
     body: String,
     received_at: u64,
@@ -933,6 +935,7 @@ fn message_value_to_json(msg: &Value) -> InboxMessage {
         id: 0,
         from: String::new(),
         to: String::new(),
+        cc: String::new(),
         subject: String::new(),
         body: String::new(),
         received_at: 0,
@@ -947,6 +950,7 @@ fn message_value_to_json(msg: &Value) -> InboxMessage {
                 ("id", Value::U64(n)) => out.id = *n,
                 ("from", Value::String(s)) => out.from = s.clone(),
                 ("to", Value::String(s)) => out.to = s.clone(),
+                ("cc", Value::String(s)) => out.cc = s.clone(),
                 ("subject", Value::String(s)) => out.subject = s.clone(),
                 ("body", Value::String(s)) => out.body = s.clone(),
                 ("received-at", Value::U64(n)) | ("received_at", Value::U64(n)) => {
