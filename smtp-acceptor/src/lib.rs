@@ -40,6 +40,7 @@ pack_types! {
         theater:simple/tcp {
             listen: func(address: string) -> result<string, string>,
             transfer: func(connection-id: string, target-actor: string) -> result<_, string>,
+            transfer-async: func(connection-id: string, target-actor: string) -> result<_, string>,
         }
         theater:simple/supervisor {
             spawn: func(manifest: string, init-state: option<value>, wasm-bytes: option<list<u8>>) -> result<string, string>,
@@ -60,6 +61,9 @@ fn tcp_listen(address: String) -> Result<String, String>;
 
 #[import(module = "theater:simple/tcp", name = "transfer")]
 fn tcp_transfer(connection_id: String, target_actor: String) -> Result<(), String>;
+
+#[import(module = "theater:simple/tcp", name = "transfer-async")]
+fn tcp_transfer_async(connection_id: String, target_actor: String) -> Result<(), String>;
 
 #[import(module = "theater:simple/supervisor", name = "spawn")]
 fn supervisor_spawn(
@@ -157,9 +161,14 @@ fn try_handle_connection(state: &SmtpAcceptorState, connection_id: &str) -> Resu
     let handler_id = supervisor_spawn(state.smtp_handler_manifest.clone(), init_state, None)
         .map_err(|e| format!("spawn smtp-handler failed: {}", e))?;
 
-    if let Err(e) = tcp_transfer(connection_id.to_string(), handler_id.clone()) {
+    // Non-blocking hand-off: transfer-async flips connection ownership to the
+    // smtp-handler without the accept loop awaiting the whole SMTP session, so a
+    // slow/stalled/malicious client can no longer serialize + wedge the accept
+    // loop and take :25 down (the accept-loop wedge root cause). Mirrors the HTTP
+    // acceptor (acceptor/src/lib.rs).
+    if let Err(e) = tcp_transfer_async(connection_id.to_string(), handler_id.clone()) {
         let _ = supervisor_stop_child(handler_id);
-        return Err(format!("transfer failed: {}", e));
+        return Err(format!("transfer-async failed: {}", e));
     }
     Ok(())
 }
