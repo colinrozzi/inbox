@@ -11,11 +11,13 @@
 #              status code that is not 000) means the accept/read path is
 #              alive; a hang / no response means it is wedged.
 #   2. SEND  — POST /send for a self-addressed loopback probe. This exercises
-#              the full outbound path (api-handler -> router -> SMTP loopback).
-#              A timeout / connection-hang / 0-byte response is the
-#              "delivers-but-hangs" wedge we hit and must catch. Added because
-#              the read probe alone does NOT cover the send path — a wedged
-#              /send slips past a read-only watchdog.
+#              the full outbound path (api-handler -> router -> SMTP loopback to
+#              localhost:25). Healthy = the message actually DELIVERED, i.e. HTTP
+#              2xx (api-handler returns 502 when delivered is empty). This catches
+#              BOTH: (a) the "delivers-but-hangs" wedge (000 / 0-byte body), and
+#              (b) a DEAD smtp-acceptor / :25-down, which returns 502 — the exact
+#              silent-SMTP-outage the read probe cannot see and the old
+#              non-000-is-healthy send check missed for days.
 #
 # WHY TWO SEPARATE FAILCOUNTERS (do not "simplify" into one):
 #   The send-wedge slipped past the old watchdog precisely because a healthy
@@ -127,12 +129,28 @@ else
   send_size="0"
 fi
 
-# Wedge = no HTTP response (000/empty) OR a 0-byte body (delivers-but-hangs).
-if [ -n "$send_code" ] && [ "$send_code" != "000" ] && [ "${send_size:-0}" -gt 0 ] 2>/dev/null; then
-  clear_count "$SEND_FAILCOUNT"
-else
-  bump "$SEND_FAILCOUNT" "send" >/dev/null
-fi
+# Healthy = the loopback message actually DELIVERED, not merely that /send
+# responded. api-handler returns http_status = (delivered.is_empty() ? 502 : 200),
+# so a :25-down loopback -> the recipient fails -> delivered empty -> HTTP 502
+# with a non-empty JSON body ({"status":"failed","failed":[...]}). The OLD check
+# (any non-000 code + body>0) CLEARED on that 502 and thus missed the silent SMTP
+# outage for ~3-4 days. Require a 2xx (delivered); a 502 (delivery failed / :25
+# down), 401 (auth), or 000/empty (hang) all count as failure. Still catches the
+# original delivers-but-hangs wedge (000 / 0-byte body).
+# NOTE: PROBE_ADDR MUST be a REGISTERED mailbox, else an unregistered recipient
+# also 502s (smtp-handler "550 No such recipient") and the probe never clears.
+case "$send_code" in
+  2[0-9][0-9])
+    if [ "${send_size:-0}" -gt 0 ] 2>/dev/null; then
+      clear_count "$SEND_FAILCOUNT"
+    else
+      bump "$SEND_FAILCOUNT" "send" >/dev/null   # 2xx but 0-byte body = hang
+    fi
+    ;;
+  *)
+    bump "$SEND_FAILCOUNT" "send" >/dev/null      # 502 (delivery failed/:25 down), 401, 000 (hang)
+    ;;
+esac
 
 # ----------------------------------------------------------------------------
 # Remediation — restart if EITHER probe has reached the threshold, then clear
