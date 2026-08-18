@@ -183,6 +183,10 @@ fn run_session(conn: &str, router_id: &str) -> Result<(), String> {
                             Value::String(parsed.in_reply_to.clone()),
                             Value::String(parsed.references.clone()),
                             Value::String(parsed.cc.clone()),
+                            // Full raw RFC822 (un-dot-stuffed, terminator stripped
+                            // by read_data_block) — the mailbox persists it as a
+                            // content-addressed blob for future IMAP/client fidelity.
+                            Value::String(raw.clone()),
                         ]),
                         Value::Tuple(alloc::vec![]),
                     );

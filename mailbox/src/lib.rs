@@ -57,6 +57,17 @@ pub struct Message {
     /// migrate by padding a single trailing field (see `migrate_threading_fields`).
     /// Empty for messages stored before this field existed.
     pub cc: String,
+    /// Content-addressed ref to the message's RAW RFC822 bytes in the store
+    /// (stored under label `raw:<address>:<id>`). We keep only the ref here, NOT
+    /// the raw inline, because `save_state` rewrites the WHOLE mailbox on every
+    /// new message — inlining multi-MB raws would re-encode every message's body
+    /// on each delivery. The raw is what a mail client / IMAP needs (full
+    /// headers, MIME parts, attachments, HTML) that the parsed `subject`/`body`
+    /// above discard. Empty for messages stored before this field existed, or
+    /// injected without a raw form (e.g. direct-inject), or if the blob store
+    /// failed (logged; delivery is never dropped for a raw-store failure).
+    /// Fetch with `store.get(STORE_ID, raw_ref)`.
+    pub raw_ref: String,
 }
 
 // forward_compatible (see Message) — covers MailboxState's own future growth.
@@ -94,7 +105,7 @@ pack_types! {
     exports {
         theater:simple/actor.init: func(state: value) -> result<mailbox-state, string>,
         theater:inbox/mailbox.list-since: func(state: mailbox-state, cursor: u64) -> result<tuple<mailbox-state, inbox-page>, string>,
-        theater:inbox/mailbox.put-message: func(state: mailbox-state, from: string, to: string, subject: string, body: string, message-id: string, in-reply-to: string, references: string, cc: string) -> result<tuple<mailbox-state, u64>, string>,
+        theater:inbox/mailbox.put-message: func(state: mailbox-state, from: string, to: string, subject: string, body: string, message-id: string, in-reply-to: string, references: string, cc: string, raw: string) -> result<tuple<mailbox-state, u64>, string>,
     }
 }
 
@@ -147,7 +158,7 @@ fn migrate_threading_fields(value: &mut Value) {
         if let Value::List { items, .. } = v {
             for item in items.iter_mut() {
                 if let Value::Record { fields: mf, .. } = item {
-                    for key in ["message_id", "in_reply_to", "references", "thread_id", "cc"] {
+                    for key in ["message_id", "in_reply_to", "references", "thread_id", "cc", "raw_ref"] {
                         if !mf.iter().any(|(n, _)| n.as_str() == key) {
                             mf.push((String::from(key), Value::String(String::new())));
                         }
@@ -234,10 +245,26 @@ fn put_message(
     in_reply_to: String,
     references: String,
     cc: String,
+    raw: String,
 ) -> Result<(MailboxState, u64), String> {
     let mut state = state;
     let id = state.messages.len() as u64;
     let thread_id = derive_thread_id(&message_id, &in_reply_to, &references);
+    // Persist the raw RFC822 as a content-addressed blob; keep only the ref on
+    // the Message (see Message::raw_ref). A store failure must NOT drop the
+    // message — log and fall back to an empty ref so the parsed fields still land.
+    let raw_ref = if raw.is_empty() {
+        String::new()
+    } else {
+        let label = format!("raw:{}:{}", state.address, id);
+        match store_store_at_label(STORE_ID.into(), label, raw.into_bytes()) {
+            Ok(r) => r,
+            Err(e) => {
+                log(format!("[inbox-mailbox] raw store failed (id={}): {}", id, e));
+                String::new()
+            }
+        }
+    };
     let msg = Message {
         id,
         from,
@@ -250,6 +277,7 @@ fn put_message(
         references,
         thread_id,
         cc,
+        raw_ref,
     };
     state.messages.push(msg);
     log(format!("[inbox-mailbox] stored message id={} for {}", id, state.address));
