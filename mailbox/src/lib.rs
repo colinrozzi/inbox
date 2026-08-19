@@ -57,6 +57,17 @@ pub struct Message {
     /// migrate by padding a single trailing field (see `migrate_threading_fields`).
     /// Empty for messages stored before this field existed.
     pub cc: String,
+    /// Content-addressed ref to the message's RAW RFC822 bytes in the store
+    /// (stored under label `raw:<address>:<id>`). We keep only the ref here, NOT
+    /// the raw inline, because `save_state` rewrites the WHOLE mailbox on every
+    /// new message — inlining multi-MB raws would re-encode every message's body
+    /// on each delivery. The raw is what a mail client / IMAP needs (full
+    /// headers, MIME parts, attachments, HTML) that the parsed `subject`/`body`
+    /// above discard. Empty for messages stored before this field existed, or
+    /// injected without a raw form (e.g. direct-inject), or if the blob store
+    /// failed (logged; delivery is never dropped for a raw-store failure).
+    /// Fetch with `store.get(STORE_ID, raw_ref)`.
+    pub raw_ref: String,
 }
 
 // forward_compatible (see Message) — covers MailboxState's own future growth.
@@ -94,7 +105,8 @@ pack_types! {
     exports {
         theater:simple/actor.init: func(state: value) -> result<mailbox-state, string>,
         theater:inbox/mailbox.list-since: func(state: mailbox-state, cursor: u64) -> result<tuple<mailbox-state, inbox-page>, string>,
-        theater:inbox/mailbox.put-message: func(state: mailbox-state, from: string, to: string, subject: string, body: string, message-id: string, in-reply-to: string, references: string, cc: string) -> result<tuple<mailbox-state, u64>, string>,
+        theater:inbox/mailbox.put-message: func(state: mailbox-state, from: string, to: string, subject: string, body: string, message-id: string, in-reply-to: string, references: string, cc: string, raw: string) -> result<tuple<mailbox-state, u64>, string>,
+        theater:inbox/mailbox.backfill-raw: func(state: mailbox-state) -> result<tuple<mailbox-state, u64>, string>,
     }
 }
 
@@ -147,7 +159,7 @@ fn migrate_threading_fields(value: &mut Value) {
         if let Value::List { items, .. } = v {
             for item in items.iter_mut() {
                 if let Value::Record { fields: mf, .. } = item {
-                    for key in ["message_id", "in_reply_to", "references", "thread_id", "cc"] {
+                    for key in ["message_id", "in_reply_to", "references", "thread_id", "cc", "raw_ref"] {
                         if !mf.iter().any(|(n, _)| n.as_str() == key) {
                             mf.push((String::from(key), Value::String(String::new())));
                         }
@@ -234,10 +246,26 @@ fn put_message(
     in_reply_to: String,
     references: String,
     cc: String,
+    raw: String,
 ) -> Result<(MailboxState, u64), String> {
     let mut state = state;
     let id = state.messages.len() as u64;
     let thread_id = derive_thread_id(&message_id, &in_reply_to, &references);
+    // Persist the raw RFC822 as a content-addressed blob; keep only the ref on
+    // the Message (see Message::raw_ref). A store failure must NOT drop the
+    // message — log and fall back to an empty ref so the parsed fields still land.
+    let raw_ref = if raw.is_empty() {
+        String::new()
+    } else {
+        let label = format!("raw:{}:{}", state.address, id);
+        match store_store_at_label(STORE_ID.into(), label, raw.into_bytes()) {
+            Ok(r) => r,
+            Err(e) => {
+                log(format!("[inbox-mailbox] raw store failed (id={}): {}", id, e));
+                String::new()
+            }
+        }
+    };
     let msg = Message {
         id,
         from,
@@ -250,9 +278,73 @@ fn put_message(
         references,
         thread_id,
         cc,
+        raw_ref,
     };
     state.messages.push(msg);
     log(format!("[inbox-mailbox] stored message id={} for {}", id, state.address));
     save_state(&state);
     Ok((state, id))
+}
+
+/// Synthesize a plain-text RFC822 message from a Message's parsed fields, for
+/// backfilling messages stored before raw retention (see `backfill_raw`). LOSSY
+/// by construction — the original raw (attachments, HTML parts, the full header
+/// set) was discarded at receive time and cannot be recovered; we reconstruct
+/// only what we kept. Marked `X-Inbox-Reconstructed: 1` so it's never a mystery.
+/// Line endings are `\n`, matching `read_data_block`'s normalization of real raws.
+fn reconstruct_raw(m: &Message) -> String {
+    fn header(out: &mut String, name: &str, value: &str) {
+        if !value.trim().is_empty() {
+            out.push_str(name);
+            out.push_str(": ");
+            out.push_str(value.trim());
+            out.push('\n');
+        }
+    }
+    let mut s = String::new();
+    header(&mut s, "From", &m.from);
+    header(&mut s, "To", &m.to);
+    header(&mut s, "Cc", &m.cc);
+    header(&mut s, "Subject", &m.subject);
+    header(&mut s, "Message-ID", &m.message_id);
+    header(&mut s, "In-Reply-To", &m.in_reply_to);
+    header(&mut s, "References", &m.references);
+    s.push_str("X-Inbox-Reconstructed: 1\n");
+    s.push('\n'); // header/body separator
+    s.push_str(&m.body);
+    s
+}
+
+/// One-shot, idempotent backfill: give every message a `raw_ref`. For each
+/// message still missing one (stored before raw retention), synthesize a
+/// reconstructed raw (see `reconstruct_raw`), persist it as a content-addressed
+/// blob under `raw:<address>:<id>`, and set the ref. Re-runnable — messages that
+/// already have a `raw_ref` are skipped, so it's safe to call repeatedly and
+/// across restarts. This lets the future read path be uniform (always fetch
+/// `raw_ref`) with no permanent per-message fallback. Returns the count filled.
+#[export(name = "theater:inbox/mailbox.backfill-raw")]
+fn backfill_raw(state: MailboxState) -> Result<(MailboxState, u64), String> {
+    let mut state = state;
+    let mut n: u64 = 0;
+    let mut i = 0;
+    while i < state.messages.len() {
+        if state.messages[i].raw_ref.is_empty() {
+            let raw = reconstruct_raw(&state.messages[i]);
+            let id = state.messages[i].id;
+            let label = format!("raw:{}:{}", state.address, id);
+            match store_store_at_label(STORE_ID.into(), label, raw.into_bytes()) {
+                Ok(r) => {
+                    state.messages[i].raw_ref = r;
+                    n += 1;
+                }
+                Err(e) => log(format!("[inbox-mailbox] backfill store failed id={}: {}", id, e)),
+            }
+        }
+        i += 1;
+    }
+    if n > 0 {
+        save_state(&state);
+    }
+    log(format!("[inbox-mailbox] backfill-raw: {} reconstructed for {}", n, state.address));
+    Ok((state, n))
 }

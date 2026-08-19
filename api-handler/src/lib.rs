@@ -9,6 +9,7 @@
 //!   GET  /v1/mailboxes/<addr>                       → look up the mailbox record
 //!   GET  /v1/mailboxes/<addr>/inbox?since=<n>       → list messages since cursor n
 //!   POST /v1/mailboxes/<addr>/send                  → send a message from this address
+//!   POST /v1/mailboxes/<addr>/backfill-raw          → backfill raw_ref on old messages (idempotent)
 
 #![no_std]
 extern crate alloc;
@@ -210,6 +211,11 @@ struct InboxPageJson {
 }
 
 #[derive(Serialize)]
+struct BackfillResponse {
+    backfilled: u64,
+}
+
+#[derive(Serialize)]
 struct ErrorBody<'a> {
     error: &'a str,
 }
@@ -364,6 +370,7 @@ fn route(
             ),
             ("GET", "inbox") => handle_inbox(query, &mailbox_id),
             ("POST", "send") => handle_send(request_str, &address, dkim_private_key_pem),
+            ("POST", "backfill-raw") => handle_backfill(&mailbox_id),
             _ => error_response(404, "not found"),
         };
     }
@@ -470,6 +477,23 @@ fn handle_inbox(query: &str, mailbox_id: &str) -> Vec<u8> {
         None => return error_response(500, "mailbox rpc failed"),
     };
     json_response(200, &page_value_to_json(&page))
+}
+
+/// `POST /v1/mailboxes/<addr>/backfill-raw` — one-shot, idempotent maintenance:
+/// give every already-stored message a raw_ref by reconstructing one from its
+/// parsed fields (see the mailbox's `backfill-raw`). Resolving the address spawns
+/// the mailbox if needed. Safe to re-run; returns how many were filled this call.
+fn handle_backfill(mailbox_id: &str) -> Vec<u8> {
+    let result = rpc_call(
+        mailbox_id.to_string(),
+        String::from("theater:inbox/mailbox.backfill-raw"),
+        Value::Tuple(alloc::vec![]),
+        Value::Tuple(alloc::vec![]),
+    );
+    match unwrap_rpc_result(result) {
+        Some(Value::U64(n)) => json_response(200, &BackfillResponse { backfilled: n }),
+        _ => error_response(500, "mailbox rpc failed"),
+    }
 }
 
 /// `POST /v1/mailboxes/<addr>/send` — deliver a message via SMTP. The
