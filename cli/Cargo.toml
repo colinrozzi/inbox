@@ -7,6 +7,8 @@ edition = "2021"
 crate-type = ["cdylib"]
 
 [dependencies]
-packr-guest = "0.11.0"
+packr-guest = { version = "0.24", features = ["derive"] }
+packr-abi = { version = "0.24", default-features = false }
+theater-guest = { git = "https://github.com/colinrozzi/theater", rev = "00b0bf93fe69a231463d3ba918fa435c5f2a517d" }
 serde = { version = "1", default-features = false, features = ["alloc", "derive"] }
 serde_json = { version = "1", default-features = false, features = ["alloc"] }

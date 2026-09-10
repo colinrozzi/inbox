@@ -4,7 +4,7 @@ package = "/home/colin/work/actors/inbox/target/wasm32-unknown-unknown/release/i
 static_package = true
 
 [[handler]]
-type = "runtime"
+type = "self"
 
 [[handler]]
 type = "supervisor"
@@ -16,3 +16,6 @@ type = "rpc"
 type = "store"
 base_path = "/mnt/main-volume/inbox/store"
 store_id = "inbox"
+
+[permission_policy.supervisor]
+type = "inherit"
