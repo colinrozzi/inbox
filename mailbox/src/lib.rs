@@ -72,6 +72,7 @@ pub struct MailboxState {
 }
 
 #[derive(Clone, GraphValue)]
+#[graph(forward_compatible)]
 pub struct InboxPage {
     pub messages: Vec<Message>,
     pub next_cursor: u64,
@@ -281,7 +282,7 @@ fn put_message(
             raw_ref,
         });
     });
-    save_state(&MAILBOX.with(|s| s.clone()));
+    MAILBOX.with(|s| save_state(s));
     log(format!("[inbox-mailbox] stored message id={} for {}", id, address));
     ok_result(Value::U64(id))
 }
@@ -311,7 +312,7 @@ fn backfill_raw() -> Value {
         }
     });
     if n > 0 {
-        save_state(&MAILBOX.with(|s| s.clone()));
+        MAILBOX.with(|s| save_state(s));
     }
     log(format!("[inbox-mailbox] backfill-raw: {} reconstructed for {}", n, address));
     ok_result(Value::U64(n))
