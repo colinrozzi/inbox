@@ -11,18 +11,15 @@
     crane.url = "github:ipetkov/crane";
 
     theater = {
-      # Runtime host reference (packages.theater + devShell only). As of the
-      # packr 0.11.0 plain-build migration the composite build no longer uses
-      # theaterBin at all (no `theater compose` step), so this input does NOT
-      # gate `nix build .#default` — nix's lazy eval never forces theaterBin for
-      # the default package. Still pinned at the 0.10.6 host (516c4b7e, #148) so
-      # packages.theater/devShell resolve; the bump to the 0.11.0 host
-      # (theater PR #149, 73a4540b) is a FOLLOW-UP gated on theater-dev cutting +
-      # verifying the 0.11.0 host binary (a 0.10.6 host cannot load 0.11.0
-      # plain-build actors, so local `theater spawn` in the devShell is stale
-      # until that bump). Manager bumps flake.lock's narHash on the dev box
-      # (container agents can't nix-flake-update).
-      url = "github:colinrozzi/theater/516c4b7eec38998b18158e1ea9720cbf0716685a";
+      # Fleet 0.24 host (00b0bf93: self.pact + view-scoped control + engine-axis
+      # #194 + packr 0.24). Feeds packages.theater + the devShell (theaterBin =
+      # the theater CLI, used by the spawn-verify path). The `nix build .#default`
+      # wasm build does NOT use theaterBin — it pulls theater-guest as a Cargo git
+      # dep (pinned to this same rev in the actor Cargo.tomls) + packr-guest 0.24;
+      # nix's lazy eval never forces theaterBin for the default package. Manager
+      # runs `nix flake update theater` on the dev box to sync flake.lock's
+      # narHash to this rev (container agents can't nix-flake-update).
+      url = "github:colinrozzi/theater/00b0bf93fe69a231463d3ba918fa435c5f2a517d";
       inputs.nixpkgs.follows = "nixpkgs";
       inputs.rust-overlay.follows = "rust-overlay";
       inputs.crane.follows = "crane";
