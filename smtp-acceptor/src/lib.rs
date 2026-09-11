@@ -2,8 +2,8 @@
 //! spawns an smtp-handler per connection and hands off (non-blocking).
 //!
 //! in-module-state model (packr 0.24): SmtpAcceptorState in a #[derive(State)]
-//! cell; exports drop state; runtime->self; supervisor.spawn returns
-//! result<string, supervisor-error> (raw-Value decode); stop-child -> stop-actor.
+//! cell; exports drop state; runtime->self; runtime.spawn returns
+//! result<string, runtime-error> (raw-Value decode); spawn/stop via runtime (post-#204).
 //!
 //! Init state (Value::String): JSON {router_id, smtp_handler_manifest} or a
 //! legacy plain "<router_id>" (falls back to DEFAULT_SMTP_HANDLER_MANIFEST).
@@ -30,15 +30,17 @@ pub struct SmtpAcceptorState {
 }
 
 pack_types! {
-    // supervisor error typedefs — VERBATIM from theater's supervisor.pact.
+    // runtime error typedefs — VERBATIM from theater's runtime pact (post-#204,
+    // c3937bdc: supervisor handler dissolved into runtime). Byte-identical or
+    // spawn fails. (actor-info omitted — list-actors isn't imported.)
     variant spawn-failure {
         bad-manifest(string), wasm-fetch(string), handler-registry(string), wasm-invalid(string),
         interface-mismatch(string), missing-interface(string), missing-metadata(string), init-failed(string),
         child-failed(string), child-stopped(string), timeout(string), internal(string),
     }
-    variant supervisor-error {
-        actor-not-found(string), out-of-view(string), permission-denied(string), invalid-argument(string),
-        spawn-failed(spawn-failure), runtime-unavailable, internal(string),
+    variant runtime-error {
+        permission-denied(string), runtime-unavailable, actor-not-found(string), invalid-argument(string),
+        spawn-failed(spawn-failure), internal(string),
     }
     imports {
         theater:simple/self {
@@ -49,9 +51,9 @@ pack_types! {
             transfer: func(connection-id: string, target-actor: string) -> result<_, string>,
             transfer-async: func(connection-id: string, target-actor: string) -> result<_, string>,
         }
-        theater:simple/supervisor {
-            spawn: func(manifest: string, init-state: option<value>, wasm-bytes: option<list<u8>>) -> result<string, supervisor-error>,
-            stop-actor: func(id: string) -> result<_, supervisor-error>,
+        theater:simple/runtime {
+            spawn: func(manifest: string, init-state: option<value>, wasm-bytes: option<list<u8>>) -> result<string, runtime-error>,
+            stop-actor: func(id: string) -> result<_, runtime-error>,
         }
     }
     exports {
@@ -70,10 +72,10 @@ fn tcp_listen(address: String) -> Result<String, String>;
 #[import(module = "theater:simple/tcp", name = "transfer-async")]
 fn tcp_transfer_async(connection_id: String, target_actor: String) -> Result<(), String>;
 
-#[import(module = "theater:simple/supervisor", name = "spawn")]
+#[import(module = "theater:simple/runtime", name = "spawn")]
 fn supervisor_spawn_raw(manifest: String, init_state: Option<Value>, wasm_bytes: Option<Vec<u8>>) -> Value;
 
-#[import(module = "theater:simple/supervisor", name = "stop-actor")]
+#[import(module = "theater:simple/runtime", name = "stop-actor")]
 fn supervisor_stop_actor_raw(id: String) -> Value;
 
 fn supervisor_spawn(manifest: String, init_state: Option<Value>) -> Result<String, String> {
@@ -87,7 +89,7 @@ fn supervisor_spawn(manifest: String, init_state: Option<Value>) -> Result<Strin
                 Value::Variant { case_name, .. } => case_name,
                 _ => String::from("unknown"),
             };
-            Err(format!("supervisor-error: {}", case))
+            Err(format!("runtime-error: {}", case))
         }
         _ => Err(String::from("spawn: unexpected result format")),
     }

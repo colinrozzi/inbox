@@ -10,10 +10,10 @@ type = "self"
 type = "tcp"
 
 [[handler]]
-type = "supervisor"
+type = "runtime"
 
 [[handler]]
 type = "rpc"
 
-[permission_policy.supervisor]
+[permission_policy.runtime]
 type = "inherit"

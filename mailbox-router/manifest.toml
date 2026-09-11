@@ -7,7 +7,7 @@ static_package = true
 type = "self"
 
 [[handler]]
-type = "supervisor"
+type = "runtime"
 
 [[handler]]
 type = "rpc"
@@ -17,5 +17,5 @@ type = "store"
 base_path = "/mnt/main-volume/inbox/store"
 store_id = "inbox"
 
-[permission_policy.supervisor]
+[permission_policy.runtime]
 type = "inherit"

@@ -11,15 +11,16 @@
     crane.url = "github:ipetkov/crane";
 
     theater = {
-      # Fleet 0.24 host (00b0bf93: self.pact + view-scoped control + engine-axis
-      # #194 + packr 0.24). Feeds packages.theater + the devShell (theaterBin =
+      # Fleet 0.24 host, post-#204 rev c3937bdc (self.pact + view-scoped control
+      # + engine-axis #194 + packr 0.24 + supervisor handler dissolved into
+      # runtime spawn/stop). Feeds packages.theater + the devShell (theaterBin =
       # the theater CLI, used by the spawn-verify path). The `nix build .#default`
       # wasm build does NOT use theaterBin — it pulls theater-guest as a Cargo git
       # dep (pinned to this same rev in the actor Cargo.tomls) + packr-guest 0.24;
       # nix's lazy eval never forces theaterBin for the default package. Manager
       # runs `nix flake update theater` on the dev box to sync flake.lock's
       # narHash to this rev (container agents can't nix-flake-update).
-      url = "github:colinrozzi/theater/00b0bf93fe69a231463d3ba918fa435c5f2a517d";
+      url = "github:colinrozzi/theater/c3937bdc9d6d81771c2874a5e64adfdc29682b46";
       inputs.nixpkgs.follows = "nixpkgs";
       inputs.rust-overlay.follows = "rust-overlay";
       inputs.crane.follows = "crane";
@@ -123,9 +124,8 @@
           '';
         });
 
-        # nix build .#theater — exposes the pinned theater binary. NOTE: still the
-        # 0.10.6 host (see the `theater` input comment); the 0.11.0 host bump is a
-        # follow-up. Not used by packages.default.
+        # nix build .#theater — the pinned theater CLI (post-#204 c3937bdc); used
+        # by the spawn-verify job's `theater setup`. Not used by packages.default.
         packages.theater = theaterBin;
 
         packages.clippy = craneLib.cargoClippy (commonArgs // {
@@ -140,15 +140,14 @@
         };
 
         devShells.default = craneLib.devShell {
-          # packr 0.11.0 plain build: only wasm-tools is needed to build + verify
-          # (no binaryen/wasm-merge — the compose step is gone). theaterBin is
-          # kept for local `theater spawn`, but note it is still the 0.10.6 host
-          # until the 0.11.0 host bump lands, so it cannot spawn a 0.11.0 actor.
+          # packr 0.24 plain build: wasm-tools to build + verify (no compose), and
+          # theaterBin = the post-#204 (c3937bdc) theater CLI for the spawn-verify
+          # `theater setup` gate.
           packages = [ rustToolchain theaterBin pkgs.wasm-tools ];
           shellHook = ''
-            echo "inbox dev environment (packr 0.11.0 plain build)"
+            echo "inbox dev environment (packr 0.24 plain build, theater c3937bdc)"
             echo "  cargo build --release --target wasm32-unknown-unknown   # directly-loadable <actor>.wasm, no compose"
-            echo "  wasm-tools print <actor>.wasm | grep '(import'          # verify: host theater:simple/* only"
+            echo "  nix develop --command bash ops/spawn-verify.sh          # theater setup each composite"
           '';
         };
       });
