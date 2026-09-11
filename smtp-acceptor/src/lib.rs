@@ -1,31 +1,28 @@
-//! SMTP acceptor: listens on TCP for inbound mail. Same actor-per-connection
-//! pattern as the HTTP acceptor — spawns an smtp-handler for each connection,
-//! passes it the mailbox ID, transfers.
+//! SMTP acceptor: listens on :25 for inbound mail. Actor-per-connection —
+//! spawns an smtp-handler per connection and hands off (non-blocking).
 //!
-//! Init state shape (Value::String): either
-//!   {"router_id": "<id>", "smtp_handler_manifest": "<reference>"}  — JSON
-//! or
-//!   "<router_id>"                                                  — legacy
+//! in-module-state model (packr 0.24): SmtpAcceptorState in a #[derive(State)]
+//! cell; exports drop state; runtime->self; supervisor.spawn returns
+//! result<string, supervisor-error> (raw-Value decode); stop-child -> stop-actor.
 //!
-//! Legacy shape is what the pre-refactor inbox-acceptor sends (plain
-//! router id, no manifest reference); on that path we fall back to the
-//! built-in DEFAULT_SMTP_HANDLER_MANIFEST file path which is what the
-//! systemd VPS deploy lays out via the nix store. New inbox-acceptor
-//! sends the JSON shape with a deploy-agnostic manifest reference.
+//! Init state (Value::String): JSON {router_id, smtp_handler_manifest} or a
+//! legacy plain "<router_id>" (falls back to DEFAULT_SMTP_HANDLER_MANIFEST).
 
 #![no_std]
 extern crate alloc;
 
+use alloc::boxed::Box;
 use alloc::format;
 use alloc::string::{String, ToString};
+use alloc::vec;
 use alloc::vec::Vec;
 use packr_guest::{export, import, pack_types, GraphValue, Value, ValueType};
 use serde::Deserialize;
+use theater_guest::State;
 
 packr_guest::setup_guest!();
 
-#[derive(Clone, GraphValue)]
-#[graph(crate = "packr_guest::composite_abi")]
+#[derive(Clone, GraphValue, State)]
 pub struct SmtpAcceptorState {
     pub listener_id: String,
     pub router_id: String,
@@ -33,8 +30,18 @@ pub struct SmtpAcceptorState {
 }
 
 pack_types! {
+    // supervisor error typedefs — VERBATIM from theater's supervisor.pact.
+    variant spawn-failure {
+        bad-manifest(string), wasm-fetch(string), handler-registry(string), wasm-invalid(string),
+        interface-mismatch(string), missing-interface(string), missing-metadata(string), init-failed(string),
+        child-failed(string), child-stopped(string), timeout(string), internal(string),
+    }
+    variant supervisor-error {
+        actor-not-found(string), out-of-view(string), permission-denied(string), invalid-argument(string),
+        spawn-failed(spawn-failure), runtime-unavailable, internal(string),
+    }
     imports {
-        theater:simple/runtime {
+        theater:simple/self {
             log: func(msg: string),
         }
         theater:simple/tcp {
@@ -43,46 +50,51 @@ pack_types! {
             transfer-async: func(connection-id: string, target-actor: string) -> result<_, string>,
         }
         theater:simple/supervisor {
-            spawn: func(manifest: string, init-state: option<value>, wasm-bytes: option<list<u8>>) -> result<string, string>,
-            stop-child: func(child-id: string) -> result<_, string>,
+            spawn: func(manifest: string, init-state: option<value>, wasm-bytes: option<list<u8>>) -> result<string, supervisor-error>,
+            stop-actor: func(id: string) -> result<_, supervisor-error>,
         }
     }
     exports {
-        theater:simple/actor.init: func(state: value) -> result<smtp-acceptor-state, string>,
-        theater:simple/tcp-client.handle-connection: func(state: smtp-acceptor-state, connection-id: string) -> result<smtp-acceptor-state, string>,
+        theater:simple/actor.init: func(config: value) -> result<_, string>,
+        theater:simple/actor.get-state: func() -> value,
+        theater:simple/tcp-client.handle-connection: func(connection-id: string) -> result<_, string>,
     }
 }
 
-#[import(module = "theater:simple/runtime", name = "log")]
+#[import(module = "theater:simple/self", name = "log")]
 fn log(msg: String);
 
 #[import(module = "theater:simple/tcp", name = "listen")]
 fn tcp_listen(address: String) -> Result<String, String>;
 
-#[import(module = "theater:simple/tcp", name = "transfer")]
-fn tcp_transfer(connection_id: String, target_actor: String) -> Result<(), String>;
-
 #[import(module = "theater:simple/tcp", name = "transfer-async")]
 fn tcp_transfer_async(connection_id: String, target_actor: String) -> Result<(), String>;
 
 #[import(module = "theater:simple/supervisor", name = "spawn")]
-fn supervisor_spawn(
-    manifest: String,
-    init_state: Option<Value>,
-    wasm_bytes: Option<Vec<u8>>,
-) -> Result<String, String>;
+fn supervisor_spawn_raw(manifest: String, init_state: Option<Value>, wasm_bytes: Option<Vec<u8>>) -> Value;
 
-#[import(module = "theater:simple/supervisor", name = "stop-child")]
-fn supervisor_stop_child(child_id: String) -> Result<(), String>;
+#[import(module = "theater:simple/supervisor", name = "stop-actor")]
+fn supervisor_stop_actor_raw(id: String) -> Value;
+
+fn supervisor_spawn(manifest: String, init_state: Option<Value>) -> Result<String, String> {
+    match supervisor_spawn_raw(manifest, init_state, None) {
+        Value::Result { value: Ok(ok), .. } => match *ok {
+            Value::String(id) => Ok(id),
+            _ => Err(String::from("spawn: bad ok payload")),
+        },
+        Value::Result { value: Err(err), .. } => {
+            let case = match *err {
+                Value::Variant { case_name, .. } => case_name,
+                _ => String::from("unknown"),
+            };
+            Err(format!("supervisor-error: {}", case))
+        }
+        _ => Err(String::from("spawn: unexpected result format")),
+    }
+}
 
 const LISTEN_ADDR: &str = "0.0.0.0:25";
-
-// Default smtp-handler manifest reference — used only on the legacy
-// init path (plain Value::String router id, no JSON). Once cutover
-// happens and every spawn is JSON with smtp_handler_manifest supplied
-// by inbox-acceptor's config, this becomes unused.
-const DEFAULT_SMTP_HANDLER_MANIFEST: &str =
-    "/home/colin/work/actors/inbox/smtp-handler/manifest.toml";
+const DEFAULT_SMTP_HANDLER_MANIFEST: &str = "/home/colin/work/actors/inbox/smtp-handler/manifest.toml";
 
 #[derive(Deserialize)]
 struct Config {
@@ -90,84 +102,69 @@ struct Config {
     smtp_handler_manifest: String,
 }
 
+// ---- result-Value helpers (identical across all inbox actors) ----
+fn ok_unit() -> Value {
+    let u = Value::Tuple(vec![]);
+    Value::Result { ok_type: u.infer_type(), err_type: ValueType::String, value: Ok(Box::new(u)) }
+}
+fn err_str(msg: &str) -> Value {
+    let e = Value::String(String::from(msg));
+    Value::Result { ok_type: Value::Tuple(vec![]).infer_type(), err_type: ValueType::String, value: Err(Box::new(e)) }
+}
+
 #[export(name = "theater:simple/actor.init")]
-fn init(state: Value) -> Result<(SmtpAcceptorState, ()), String> {
-    let raw = match state {
+fn init(config: Value) -> Value {
+    let raw = match config {
         Value::String(s) if !s.is_empty() => s,
-        _ => {
-            return Err(String::from(
-                "smtp-acceptor init: expected init_state as a non-empty string \
-                 (JSON {router_id, smtp_handler_manifest} or legacy plain router id)",
-            ))
-        }
+        _ => return err_str(
+            "smtp-acceptor init: expected init_state as a non-empty string (JSON {router_id, smtp_handler_manifest} or legacy plain router id)",
+        ),
     };
 
-    let (router_id, smtp_handler_manifest) =
-        if let Ok(cfg) = serde_json::from_str::<Config>(&raw) {
-            if cfg.router_id.is_empty() {
-                return Err(String::from("router_id must be non-empty"));
-            }
-            if cfg.smtp_handler_manifest.is_empty() {
-                return Err(String::from("smtp_handler_manifest must be non-empty"));
-            }
-            (cfg.router_id, cfg.smtp_handler_manifest)
-        } else {
-            // Legacy: bare router id string. Default the manifest reference
-            // to the systemd-deploy file path.
-            (raw, String::from(DEFAULT_SMTP_HANDLER_MANIFEST))
-        };
+    let (router_id, smtp_handler_manifest) = if let Ok(cfg) = serde_json::from_str::<Config>(&raw) {
+        if cfg.router_id.is_empty() {
+            return err_str("router_id must be non-empty");
+        }
+        if cfg.smtp_handler_manifest.is_empty() {
+            return err_str("smtp_handler_manifest must be non-empty");
+        }
+        (cfg.router_id, cfg.smtp_handler_manifest)
+    } else {
+        (raw, String::from(DEFAULT_SMTP_HANDLER_MANIFEST))
+    };
 
     log(format!("[inbox-smtp-acceptor] init (router={})", router_id));
 
-    let listener_id = tcp_listen(String::from(LISTEN_ADDR))
-        .map_err(|e| format!("listen failed: {}", e))?;
-    log(format!(
-        "[inbox-smtp-acceptor] SMTP listening on {} (id={})",
-        LISTEN_ADDR, listener_id
-    ));
+    let listener_id = match tcp_listen(String::from(LISTEN_ADDR)) {
+        Ok(id) => id,
+        Err(e) => return err_str(&format!("listen failed: {}", e)),
+    };
+    log(format!("[inbox-smtp-acceptor] SMTP listening on {} (id={})", LISTEN_ADDR, listener_id));
 
-    Ok((
-        SmtpAcceptorState {
-            listener_id,
-            router_id,
-            smtp_handler_manifest,
-        },
-        (),
-    ))
+    SmtpAcceptorState::set(SmtpAcceptorState { listener_id, router_id, smtp_handler_manifest });
+    ok_unit()
 }
 
 #[export(name = "theater:simple/tcp-client.handle-connection")]
-fn handle_connection(
-    state: SmtpAcceptorState,
-    connection_id: String,
-) -> Result<(SmtpAcceptorState, ()), String> {
-    // Always-Ok: see the acceptor for context. A connection error must
-    // not kill the smtp listener.
-    if let Err(e) = try_handle_connection(&state, &connection_id) {
-        log(format!(
-            "[inbox-smtp-acceptor] handle-connection failed (conn={}): {}",
-            connection_id, e
-        ));
+fn handle_connection(connection_id: String) -> Value {
+    // Always-Ok: a connection error must not kill the :25 listener.
+    if let Err(e) = try_handle_connection(&connection_id) {
+        log(format!("[inbox-smtp-acceptor] handle-connection failed (conn={}): {}", connection_id, e));
     }
-    let _ = ValueType::Bool; // suppress unused
-    Ok((state, ()))
+    ok_unit()
 }
 
-fn try_handle_connection(state: &SmtpAcceptorState, connection_id: &str) -> Result<(), String> {
-    // supervisor.spawn now does setup+auto-init: the router id we pass as
-    // init_state is delivered to smtp-handler's init synchronously inside
-    // the spawn call; the returned handler_id is post-init.
-    let init_state = Some(Value::String(state.router_id.clone()));
-    let handler_id = supervisor_spawn(state.smtp_handler_manifest.clone(), init_state, None)
+fn try_handle_connection(connection_id: &str) -> Result<(), String> {
+    let (router_id, manifest) =
+        SmtpAcceptorState::with(|s| (s.router_id.clone(), s.smtp_handler_manifest.clone()));
+
+    let handler_id = supervisor_spawn(manifest, Some(Value::String(router_id)))
         .map_err(|e| format!("spawn smtp-handler failed: {}", e))?;
 
-    // Non-blocking hand-off: transfer-async flips connection ownership to the
-    // smtp-handler without the accept loop awaiting the whole SMTP session, so a
-    // slow/stalled/malicious client can no longer serialize + wedge the accept
-    // loop and take :25 down (the accept-loop wedge root cause). Mirrors the HTTP
-    // acceptor (acceptor/src/lib.rs).
+    // Non-blocking hand-off — a slow/stalled/malicious client can't serialize +
+    // wedge the accept loop and take :25 down (the accept-loop wedge root cause).
     if let Err(e) = tcp_transfer_async(connection_id.to_string(), handler_id.clone()) {
-        let _ = supervisor_stop_child(handler_id);
+        let _ = supervisor_stop_actor_raw(handler_id);
         return Err(format!("transfer-async failed: {}", e));
     }
     Ok(())
