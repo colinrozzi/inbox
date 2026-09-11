@@ -13,11 +13,13 @@
 #![no_std]
 extern crate alloc;
 
+use alloc::boxed::Box;
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
-use packr_guest::{export, import, pack_types, GraphValue, Value};
+use packr_guest::{export, import, pack_types, GraphValue, Value, ValueType};
 use serde::{Deserialize, Serialize};
+use theater_guest::State;
 
 packr_guest::setup_guest!();
 
@@ -32,8 +34,7 @@ fn unsupported_getrandom(_dest: &mut [u8]) -> Result<(), getrandom::Error> {
 mod dkim;
 mod rfc2822;
 
-#[derive(Clone, GraphValue)]
-#[graph(crate = "packr_guest::composite_abi")]
+#[derive(Clone, GraphValue, State)]
 pub struct HandlerState {
     pub router_id: String,
     pub dkim_private_key_pem: String,
@@ -42,7 +43,7 @@ pub struct HandlerState {
 
 pack_types! {
     imports {
-        theater:simple/runtime {
+        theater:simple/self {
             log: func(msg: string),
             shutdown: func(data: option<list<u8>>) -> result<_, string>,
         }
@@ -65,15 +66,16 @@ pack_types! {
         }
     }
     exports {
-        theater:simple/actor.init: func(state: value) -> result<handler-state, string>,
-        theater:simple/tcp-client.handle-connection-transfer: func(state: handler-state, connection-id: string) -> result<handler-state, string>,
+        theater:simple/actor.init: func(config: value) -> result<_, string>,
+        theater:simple/actor.get-state: func() -> value,
+        theater:simple/tcp-client.handle-connection-transfer: func(connection-id: string) -> result<_, string>,
     }
 }
 
-#[import(module = "theater:simple/runtime", name = "log")]
+#[import(module = "theater:simple/self", name = "log")]
 fn log(msg: String);
 
-#[import(module = "theater:simple/runtime", name = "shutdown")]
+#[import(module = "theater:simple/self", name = "shutdown")]
 fn shutdown(data: Option<Vec<u8>>) -> Result<(), String>;
 
 #[import(module = "theater:simple/tcp", name = "connect")]
@@ -210,6 +212,11 @@ struct InboxPageJson {
 }
 
 #[derive(Serialize)]
+struct BackfillResponse {
+    backfilled: u64,
+}
+
+#[derive(Serialize)]
 struct ErrorBody<'a> {
     error: &'a str,
 }
@@ -251,39 +258,41 @@ fn load_label_as_string(label: &str) -> Result<String, String> {
     String::from_utf8(bytes).map_err(|_| format!("{} is not valid UTF-8", label))
 }
 
+// ---- result-Value helpers (identical across all inbox actors) ----
+fn ok_unit() -> Value {
+    let u = Value::Tuple(alloc::vec![]);
+    Value::Result { ok_type: u.infer_type(), err_type: ValueType::String, value: Ok(Box::new(u)) }
+}
+fn err_str(msg: &str) -> Value {
+    let e = Value::String(String::from(msg));
+    Value::Result { ok_type: Value::Tuple(alloc::vec![]).infer_type(), err_type: ValueType::String, value: Err(Box::new(e)) }
+}
+
 #[export(name = "theater:simple/actor.init")]
-fn init(state: Value) -> Result<(HandlerState, ()), String> {
-    let router_id = match state {
+fn init(config: Value) -> Value {
+    let router_id = match config {
         Value::String(s) => s,
-        _ => return Err(String::from(
-            "api-handler init: expected init_state = string (router actor id)",
-        )),
+        _ => return err_str("api-handler init: expected init_state = string (router actor id)"),
     };
-    let dkim_private_key_pem = load_label_as_string(DKIM_KEY_LABEL)?;
-    let bearer_token = load_label_as_string(BEARER_TOKEN_LABEL)?;
-    Ok((
-        HandlerState {
-            router_id,
-            dkim_private_key_pem,
-            bearer_token,
-        },
-        (),
-    ))
+    let dkim_private_key_pem = match load_label_as_string(DKIM_KEY_LABEL) {
+        Ok(s) => s,
+        Err(e) => return err_str(&e),
+    };
+    let bearer_token = match load_label_as_string(BEARER_TOKEN_LABEL) {
+        Ok(s) => s,
+        Err(e) => return err_str(&e),
+    };
+    HandlerState::set(HandlerState { router_id, dkim_private_key_pem, bearer_token });
+    ok_unit()
 }
 
 #[export(name = "theater:simple/tcp-client.handle-connection-transfer")]
-fn handle_connection_transfer(
-    state: HandlerState,
-    connection_id: String,
-) -> Result<(HandlerState, ()), String> {
+fn handle_connection_transfer(connection_id: String) -> Value {
     let request = tcp_receive(connection_id.clone(), 65536).unwrap_or_default();
 
-    let response = route(
-        &request,
-        &state.router_id,
-        &state.dkim_private_key_pem,
-        &state.bearer_token,
-    );
+    let response = HandlerState::with(|s| {
+        route(&request, &s.router_id, &s.dkim_private_key_pem, &s.bearer_token)
+    });
 
     if let Err(e) = tcp_send(connection_id.clone(), response) {
         log(format!("[inbox-api] send failed: {}", e));
@@ -291,7 +300,7 @@ fn handle_connection_transfer(
     let _ = tcp_close(connection_id);
     let _ = shutdown(None);
 
-    Ok((state, ()))
+    ok_unit()
 }
 
 // ============================================================================
@@ -364,6 +373,7 @@ fn route(
             ),
             ("GET", "inbox") => handle_inbox(query, &mailbox_id),
             ("POST", "send") => handle_send(request_str, &address, dkim_private_key_pem),
+            ("POST", "backfill-raw") => handle_backfill(&mailbox_id),
             _ => error_response(404, "not found"),
         };
     }
@@ -470,6 +480,23 @@ fn handle_inbox(query: &str, mailbox_id: &str) -> Vec<u8> {
         None => return error_response(500, "mailbox rpc failed"),
     };
     json_response(200, &page_value_to_json(&page))
+}
+
+/// `POST /v1/mailboxes/<addr>/backfill-raw` — one-shot, idempotent maintenance:
+/// give every already-stored message a raw_ref by reconstructing one from its
+/// parsed fields (see the mailbox's `backfill-raw`). Safe to re-run; returns how
+/// many were filled this call.
+fn handle_backfill(mailbox_id: &str) -> Vec<u8> {
+    let result = rpc_call(
+        mailbox_id.to_string(),
+        String::from("theater:inbox/mailbox.backfill-raw"),
+        Value::Tuple(alloc::vec![]),
+        Value::Tuple(alloc::vec![]),
+    );
+    match unwrap_rpc_result(result) {
+        Some(Value::U64(n)) => json_response(200, &BackfillResponse { backfilled: n }),
+        _ => error_response(500, "mailbox rpc failed"),
+    }
 }
 
 /// `POST /v1/mailboxes/<addr>/send` — deliver a message via SMTP. The
@@ -850,13 +877,12 @@ fn parse_smtp_code(line: &[u8]) -> Option<u16> {
 /// strips the state half of the actor's `(state, response)` return, so
 /// the variant payload is just the response value.
 fn unwrap_rpc_result(value: Value) -> Option<Value> {
+    // packr-abi 0.24: rpc.call returns the callee's return Value as-is. Post
+    // in-module-state, exports return result<PAYLOAD, string> directly (no more
+    // tuple<state, response> wrapper), so the Ok box IS the bare payload — strip
+    // the outer Result and hand it back. Err (or malformed) -> None.
     match value {
-        Value::Result { value: Ok(inner), .. } => match *inner {
-            Value::Variant {
-                case_name, payload, ..
-            } if case_name == "ok" => payload.into_iter().next(),
-            _ => None,
-        },
+        Value::Result { value: Ok(inner), .. } => Some(*inner),
         _ => None,
     }
 }
