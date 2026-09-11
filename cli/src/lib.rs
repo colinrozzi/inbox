@@ -12,17 +12,18 @@
 #![no_std]
 extern crate alloc;
 
+use alloc::boxed::Box;
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
-use packr_guest::{export, import, pack_types, Value};
+use packr_guest::{export, import, pack_types, Value, ValueType};
 use serde::{Deserialize, Serialize};
 
 packr_guest::setup_guest!();
 
 pack_types! {
     imports {
-        theater:simple/runtime {
+        theater:simple/self {
             log: func(msg: string),
             shutdown: func(data: option<list<u8>>) -> result<_, string>,
         }
@@ -38,14 +39,14 @@ pack_types! {
         }
     }
     exports {
-        theater:simple/actor.init: func(state: value) -> result<tuple<bool, _>, string>,
+        theater:simple/actor.init: func(config: value) -> result<_, string>,
     }
 }
 
-#[import(module = "theater:simple/runtime", name = "log")]
+#[import(module = "theater:simple/self", name = "log")]
 fn log(msg: String);
 
-#[import(module = "theater:simple/runtime", name = "shutdown")]
+#[import(module = "theater:simple/self", name = "shutdown")]
 fn shutdown(data: Option<Vec<u8>>) -> Result<(), String>;
 
 #[import(module = "theater:simple/tcp", name = "connect")]
@@ -66,14 +67,22 @@ fn write_stdout(data: Vec<u8>) -> Result<u64, String>;
 #[import(module = "theater:simple/terminal", name = "write-stderr")]
 fn write_stderr(data: Vec<u8>) -> Result<u64, String>;
 
+// ---- result-Value helper (in-module-state: init returns a Value::Result) ----
+fn ok_unit() -> Value {
+    let u = Value::Tuple(alloc::vec![]);
+    Value::Result { ok_type: u.infer_type(), err_type: ValueType::String, value: Ok(Box::new(u)) }
+}
+
 #[export(name = "theater:simple/actor.init")]
-fn init(state: Value) -> Result<(bool, ()), String> {
-    let raw = match state {
+fn init(config: Value) -> Value {
+    // One-shot: do the command in init, print to the terminal, shut down. No
+    // persistent state (stateless actor — no cell, no get-state export).
+    let raw = match config {
         Value::String(s) => s,
         _ => {
             err("cli: expected initial_state = JSON string with {cmd, ...}\n");
             shutdown_now();
-            return Ok((false, ()));
+            return ok_unit();
         }
     };
 
@@ -82,27 +91,26 @@ fn init(state: Value) -> Result<(bool, ()), String> {
         Err(e) => {
             err(&format!("cli: parse error: {}\n", e));
             shutdown_now();
-            return Ok((false, ()));
+            return ok_unit();
         }
     };
 
     if req.cmd.is_empty() {
         err("cli: missing 'cmd' field\n");
         shutdown_now();
-        return Ok((false, ()));
+        return ok_unit();
     }
     if req.token.is_empty() {
         err("cli: missing 'token' field (set INBOX_TOKEN)\n");
         shutdown_now();
-        return Ok((false, ()));
+        return ok_unit();
     }
 
-    let ok = run(&req).map(|_| true).unwrap_or_else(|e| {
+    if let Err(e) = run(&req) {
         err(&format!("cli: {}\n", e));
-        false
-    });
+    }
     shutdown_now();
-    Ok((ok, ()))
+    ok_unit()
 }
 
 fn shutdown_now() {

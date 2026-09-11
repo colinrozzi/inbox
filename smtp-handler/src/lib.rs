@@ -7,22 +7,23 @@
 #![no_std]
 extern crate alloc;
 
+use alloc::boxed::Box;
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
-use packr_guest::{export, import, pack_types, GraphValue, Value};
+use packr_guest::{export, import, pack_types, GraphValue, Value, ValueType};
+use theater_guest::State;
 
 packr_guest::setup_guest!();
 
-#[derive(Clone, GraphValue)]
-#[graph(crate = "packr_guest::composite_abi")]
+#[derive(Clone, GraphValue, State)]
 pub struct SmtpHandlerState {
     pub router_id: String,
 }
 
 pack_types! {
     imports {
-        theater:simple/runtime {
+        theater:simple/self {
             log: func(msg: string),
             shutdown: func(data: option<list<u8>>) -> result<_, string>,
         }
@@ -36,15 +37,16 @@ pack_types! {
         }
     }
     exports {
-        theater:simple/actor.init: func(state: value) -> result<smtp-handler-state, string>,
-        theater:simple/tcp-client.handle-connection-transfer: func(state: smtp-handler-state, connection-id: string) -> result<smtp-handler-state, string>,
+        theater:simple/actor.init: func(config: value) -> result<_, string>,
+        theater:simple/actor.get-state: func() -> value,
+        theater:simple/tcp-client.handle-connection-transfer: func(connection-id: string) -> result<_, string>,
     }
 }
 
-#[import(module = "theater:simple/runtime", name = "log")]
+#[import(module = "theater:simple/self", name = "log")]
 fn log(msg: String);
 
-#[import(module = "theater:simple/runtime", name = "shutdown")]
+#[import(module = "theater:simple/self", name = "shutdown")]
 fn shutdown(data: Option<Vec<u8>>) -> Result<(), String>;
 
 #[import(module = "theater:simple/tcp", name = "receive")]
@@ -61,28 +63,35 @@ fn rpc_call(actor_id: String, function: String, params: Value, options: Value) -
 
 const HOSTNAME: &str = "inbox.local";
 
+// ---- result-Value helpers (identical across all inbox actors) ----
+fn ok_unit() -> Value {
+    let u = Value::Tuple(alloc::vec![]);
+    Value::Result { ok_type: u.infer_type(), err_type: ValueType::String, value: Ok(Box::new(u)) }
+}
+fn err_str(msg: &str) -> Value {
+    let e = Value::String(String::from(msg));
+    Value::Result { ok_type: Value::Tuple(alloc::vec![]).infer_type(), err_type: ValueType::String, value: Err(Box::new(e)) }
+}
+
 #[export(name = "theater:simple/actor.init")]
-fn init(state: Value) -> Result<(SmtpHandlerState, ()), String> {
-    let router_id = match state {
+fn init(config: Value) -> Value {
+    let router_id = match config {
         Value::String(s) => s,
-        _ => return Err(String::from(
-            "smtp-handler init: expected init_state = string (router actor id)",
-        )),
+        _ => return err_str("smtp-handler init: expected init_state = string (router actor id)"),
     };
-    Ok((SmtpHandlerState { router_id }, ()))
+    SmtpHandlerState::set(SmtpHandlerState { router_id });
+    ok_unit()
 }
 
 #[export(name = "theater:simple/tcp-client.handle-connection-transfer")]
-fn handle_connection_transfer(
-    state: SmtpHandlerState,
-    connection_id: String,
-) -> Result<(SmtpHandlerState, ()), String> {
-    if let Err(e) = run_session(&connection_id, &state.router_id) {
+fn handle_connection_transfer(connection_id: String) -> Value {
+    let router_id = SmtpHandlerState::with(|s| s.router_id.clone());
+    if let Err(e) = run_session(&connection_id, &router_id) {
         log(format!("[inbox-smtp] session error: {}", e));
     }
     let _ = tcp_close(connection_id);
     let _ = shutdown(None);
-    Ok((state, ()))
+    ok_unit()
 }
 
 // ============================================================================
@@ -183,6 +192,9 @@ fn run_session(conn: &str, router_id: &str) -> Result<(), String> {
                             Value::String(parsed.in_reply_to.clone()),
                             Value::String(parsed.references.clone()),
                             Value::String(parsed.cc.clone()),
+                            // #70: full raw RFC822 (un-dot-stuffed by read_data_block)
+                            // — the mailbox persists it as a content-addressed blob.
+                            Value::String(raw.clone()),
                         ]),
                         Value::Tuple(alloc::vec![]),
                     );
@@ -224,14 +236,10 @@ fn router_lookup(router_id: &str, address: &str) -> Result<Option<String>, Strin
         Value::Tuple(alloc::vec![Value::String(address.to_string())]),
         Value::Tuple(alloc::vec![]),
     );
-    // Result<Variant<"ok", [Option<String>]>, _>
+    // packr-abi 0.24: strip the outer Value::Result{Ok(box)}; the box IS the
+    // bare option<string> payload now (no tuple<state,_> wrapper).
     let ok_payload = match result {
-        Value::Result { value: Ok(inner), .. } => match *inner {
-            Value::Variant { case_name, payload, .. } if case_name == "ok" => {
-                payload.into_iter().next()
-            }
-            _ => None,
-        },
+        Value::Result { value: Ok(inner), .. } => Some(*inner),
         _ => None,
     };
     match ok_payload {
