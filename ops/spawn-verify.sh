@@ -37,7 +37,7 @@ verify() {
       -e "s|^base_path = .*|base_path = \"$store\"|" \
       "$src" > "$man"
   local out
-  out=$(timeout 40 theater setup "$man" 2>&1 || true)
+  out=$(timeout 8 theater setup "$man" 2>&1 || true)
   if printf '%s' "$out" | grep -qiE "$SIG"; then
     echo "SPAWN-VERIFY FAIL: $actor"; printf '%s\n' "$out"; return 1
   fi
