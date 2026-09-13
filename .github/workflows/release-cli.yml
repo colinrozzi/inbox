@@ -1,0 +1,55 @@
+name: release-cli
+
+# Tag inbox-cli-v* (e.g. `git tag inbox-cli-v0.1.0 && git push --tags`) to build
+# a portable, static-musl `inbox` CLI binary (a plain HTTPS client to the inbox
+# API -- no theater, no wasm) and attach it to the GitHub Release.
+# Modeled on colinrozzi/supervisor's release.yml, minus the wasm build/asset.
+
+on:
+  push:
+    tags:
+      - "inbox-cli-v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (musl target)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - name: Install musl toolchain
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Build the inbox CLI (static musl)
+        working-directory: cli
+        env:
+          # ring (rustls' crypto backend) needs the musl cross-cc for this target.
+          CC_x86_64_unknown_linux_musl: musl-gcc
+        run: cargo build --release --target x86_64-unknown-linux-musl
+
+      - name: Stage assets
+        run: |
+          mkdir -p dist
+          cp cli/target/x86_64-unknown-linux-musl/release/inbox dist/inbox
+          ( cd dist && sha256sum inbox > SHA256SUMS )
+
+      - name: Assert the binary is truly static (portability guarantee)
+        run: |
+          file dist/inbox
+          file dist/inbox | grep -q "static" \
+            || { echo "::error::inbox is not static -- would not exec in other containers"; exit 1; }
+
+      - name: Attach to the GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/inbox
+            dist/SHA256SUMS
+          fail_on_unmatched_files: true

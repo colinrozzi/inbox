@@ -31,7 +31,31 @@ jobs:
       - uses: DeterminateSystems/magic-nix-cache-action@main
 
       # Same build the release job uses as its gate. Produces result/ with the
-      # seven wasm actors; fails (and blocks the PR) if the workspace does not
+      # six wasm actors; fails (and blocks the PR) if the workspace does not
       # compile.
       - name: Build workspace
         run: nix build
+
+  build-cli:
+    name: Build inbox CLI (static musl)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The `inbox` CLI is a standalone native crate (a plain HTTPS client to
+      # the inbox API — no theater, no wasm), outside the wasm workspace, so
+      # `nix build` above never compiles it. Build it here on the same
+      # static-musl target release-cli.yml ships, so a broken CLI blocks the PR.
+      - name: Install Rust (musl target)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - name: Install musl toolchain
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Build the CLI
+        working-directory: cli
+        env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
+        run: cargo build --release --target x86_64-unknown-linux-musl
