@@ -11,7 +11,7 @@
     crane.url = "github:ipetkov/crane";
 
     theater = {
-      # Fleet 0.24 host, post-#204 rev c3937bdc (self.pact + view-scoped control
+      # Fleet 0.24 host, final tree rev cfcd7376 (PR #211) (self.pact + view-scoped control
       # + engine-axis #194 + packr 0.24 + supervisor handler dissolved into
       # runtime spawn/stop). Feeds packages.theater + the devShell (theaterBin =
       # the theater CLI, used by the spawn-verify path). The `nix build .#default`
@@ -20,7 +20,7 @@
       # nix's lazy eval never forces theaterBin for the default package. Manager
       # runs `nix flake update theater` on the dev box to sync flake.lock's
       # narHash to this rev (container agents can't nix-flake-update).
-      url = "github:colinrozzi/theater/c3937bdc9d6d81771c2874a5e64adfdc29682b46";
+      url = "github:colinrozzi/theater/cfcd7376606758d388ab9d7042932d13e8da23a76";
       inputs.nixpkgs.follows = "nixpkgs";
       inputs.rust-overlay.follows = "rust-overlay";
       inputs.crane.follows = "crane";
@@ -145,7 +145,7 @@
           # `theater setup` gate.
           packages = [ rustToolchain theaterBin pkgs.wasm-tools ];
           shellHook = ''
-            echo "inbox dev environment (packr 0.24 plain build, theater c3937bdc)"
+            echo "inbox dev environment (packr 0.24 plain build, theater cfcd7376)"
             echo "  cargo build --release --target wasm32-unknown-unknown   # directly-loadable <actor>.wasm, no compose"
             echo "  nix develop --command bash ops/spawn-verify.sh          # theater setup each composite"
           '';
