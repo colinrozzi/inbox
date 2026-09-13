@@ -37,17 +37,25 @@ instead of `keep_chain`.
    acceptor get its config — a roster entry field, baked into the manifest, or a
    separate mechanism? Resolve with supervisor-dev before the cutover.
 
-3. **CRASH-CATCH ONLY — the stall is NOT covered by this roster.** v0.1.1 does
-   respawn-on-Failed + crash-loop breaker. Crash-catch of the acceptor root
-   **cannot** see inbox's headline failure — the `:25` accepts-but-hangs STALL
-   (acceptor alive, not delivering; or a lone grandchild death the acceptor
-   doesn't monitor). That is the incident inbox-under-supervisor exists to fix,
-   and it needs the supervisor's **external delivery-probe** (the #69 check:
-   read-200 + a loopback `/send` that DELIVERS 2xx to `watchdog-probe@`, on a
-   timer, restart-the-tree on N consecutive fails) — the gating **v0.2** feature
-   supervisor-dev is building. Per the manager's bar: the prod cutover is only
-   "wedge protection" once the probe is in the cutover version; a crash-catch-only
-   cutover ships **labeled** crash-catch-only and does NOT count the wedge fixed.
-   Also note: `keep_chain`/`record` on this root captures only the acceptor's own
+3. **CRASH-CATCH ONLY — the `:25` stall is NOT covered by the supervisor (Colin's
+   ruling).** The supervisor stays generic crash-catch: respawn-on-Failed +
+   crash-loop breaker + the flight-recorder chain. Crash-catch of the acceptor
+   root **cannot** see inbox's headline failure — the `:25` accepts-but-hangs
+   STALL (acceptor alive, not delivering; or a lone grandchild death the acceptor
+   doesn't monitor). Colin ruled the delivery-check (`healthy` = read-200 + a
+   loopback `/send` that DELIVERS 2xx) is **application-level logic, deferred** —
+   not the generic supervisor's job. So this cutover ships **labeled** "crash-catch
+   + flight-recorder," NOT wedge-fixed.
+
+   **THEREFORE the standalone systemd watchdog (`ops/inbox-watchdog.sh`, the #69
+   delivery-check) STAYS — it is the only stall-catch.** The earlier plan to
+   retire it once a supervisor probe proved out is VOID (the probe is deferred).
+   The cutover MUST keep the watchdog functioning after inbox is re-parented under
+   the supervisor (verify its restart path still applies once `supervisor spawn`
+   is inbox's host) so wedge protection is not silently dropped. Future delivery-
+   probe = application-level (an inbox-side health actor, or a supervisor-driven
+   probe config down the line; the #69 watchdog logic seeds it) — not scoped now.
+
+   Also: `keep_chain`/`record` on this root captures only the acceptor's own
    chain, not the whole spine (the runtime is flat/no-lineage; whole-tree
    recording is a later supervisor feature).
