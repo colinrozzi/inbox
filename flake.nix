@@ -124,7 +124,7 @@
           '';
         });
 
-        # nix build .#theater — the pinned theater CLI (post-#204 c3937bdc); used
+        # nix build .#theater — the pinned theater CLI (final-rev cfcd7376); used
         # by the spawn-verify job's `theater setup`. Not used by packages.default.
         packages.theater = theaterBin;
 
@@ -141,7 +141,7 @@
 
         devShells.default = craneLib.devShell {
           # packr 0.24 plain build: wasm-tools to build + verify (no compose), and
-          # theaterBin = the post-#204 (c3937bdc) theater CLI for the spawn-verify
+          # theaterBin = the final-rev (cfcd7376) theater CLI for the spawn-verify
           # `theater setup` gate.
           packages = [ rustToolchain theaterBin pkgs.wasm-tools ];
           shellHook = ''
