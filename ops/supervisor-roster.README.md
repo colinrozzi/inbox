@@ -25,17 +25,24 @@ instead of `keep_chain`.
 
 ## Open items for the cutover (supervisor-dev / manager — do NOT treat final)
 
-1. **`manifest` ref** — repo-relative here for review; the manager sets the prod
-   deploy ref at cutover (own-theater-gc-root at the final tree rev, decoupled
-   like website).
+1. **`manifest` ref** — repo-relative (config-less) here for review; at cutover
+   the manager points it at the **deploy-generated acceptor manifest that carries
+   `initial_state`** (see 2), own-theater-gc-root at the final tree rev, decoupled
+   like website.
 
-2. **Acceptor `initial_state` / config passing (REAL open question).** The
-   acceptor's `init` needs its JSON config (`bearer_token`, `dkim_private_key`,
-   `listen_addr`, + the 4 sub-manifest refs). The v0.1.1 roster entry has no
-   `init_state` field, and `acceptor/manifest.toml` does not currently carry
-   `initial_state` (the deploy provides it). So under supervision, how does the
-   acceptor get its config — a roster entry field, baked into the manifest, or a
-   separate mechanism? Resolve with supervisor-dev before the cutover.
+2. **Acceptor `initial_state` / config passing — RESOLVED: manifest-carries-config,
+   no supervisor change.** The supervisor spawns each entry via
+   `runtime.spawn(manifest, init_state=None)`; `None` → the host falls back to the
+   child manifest's `initial_state` (identical to how `theater spawn` passes config
+   today — README: the acceptor reads bearer/DKIM + sub-manifest refs from manifest
+   `initial_state`). So the supervised acceptor gets its config from the acceptor
+   manifest's `initial_state`, exactly as in the current deploy. SECRETS: the prod
+   `acceptor.toml` is **deploy-generated on the box** (template + injected
+   bearer/DKIM, gitignored) — the committed manifest here is the config-less
+   structural reference. (We DECLINED supervisor-dev's optional roster `init_state`
+   override: inbox doesn't need it, it'd force secrets/placeholders into the
+   committed roster, and manifest-carries-config keeps the supervisor generic +
+   matches today's model at lowest cutover risk.)
 
 3. **CRASH-CATCH ONLY — the `:25` stall is NOT covered by the supervisor (Colin's
    ruling).** The supervisor stays generic crash-catch: respawn-on-Failed +
