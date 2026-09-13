@@ -29,7 +29,8 @@ jobs:
       - uses: DeterminateSystems/magic-nix-cache-action@main
 
       # Workspace build sanity check. Blocks the release if main does not
-      # compile. Produces result/ with the seven wasm actors.
+      # compile. Produces result/ with the six wasm actors (the CLI is now a
+      # native binary released separately via release-cli.yml).
       - name: Build workspace
         run: nix build
 
@@ -62,8 +63,7 @@ jobs:
             inbox_mailbox \
             inbox_mailbox_router \
             inbox_smtp_acceptor \
-            inbox_smtp_handler \
-            inbox_cli
+            inbox_smtp_handler
           do
             # nix build emits plain self-contained actor modules (packr 0.11.0); the
             # deployable artifact is <actor>.wasm, not a bare member.
@@ -204,7 +204,7 @@ jobs:
           TOML
           ASSETS+=("${SMTP_HANDLER_MANIFEST_FILE}")
 
-          # 3) Bundle of all seven actor modules (humans / local use) + sha256.
+          # 3) Bundle of all six actor modules (humans / local use) + sha256.
           STAGE="inbox-${STAGE_TAG}-wasm32"
           mkdir -p "$STAGE"
           for actor in \
@@ -213,8 +213,7 @@ jobs:
             inbox_mailbox \
             inbox_mailbox_router \
             inbox_smtp_acceptor \
-            inbox_smtp_handler \
-            inbox_cli
+            inbox_smtp_handler
           do
             cp "$(realpath result)/${actor}.wasm" "$STAGE/"
           done
