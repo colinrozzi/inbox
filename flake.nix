@@ -20,7 +20,7 @@
       # nix's lazy eval never forces theaterBin for the default package. Manager
       # runs `nix flake update theater` on the dev box to sync flake.lock's
       # narHash to this rev (container agents can't nix-flake-update).
-      url = "github:colinrozzi/theater/cfcd7376606758d388ab9d7042932d13e8da23a76";
+      url = "github:colinrozzi/theater/cfcd737606758d388ab9d7042932d13e8da23a76";
       inputs.nixpkgs.follows = "nixpkgs";
       inputs.rust-overlay.follows = "rust-overlay";
       inputs.crane.follows = "crane";

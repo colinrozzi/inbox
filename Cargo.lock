@@ -304,9 +304,9 @@ checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 
 [[package]]
 name = "packr-abi"
-version = "0.24.0"
+version = "0.24.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "491978dde2b52bcbefed839e4bd54bd85ef9b9154dfc51e534d4a99e47848257"
+checksum = "37a3e818f64611d4141c33c5fa53cb1b2258e422fec6dd33579478d5370b971f"
 dependencies = [
  "hashbrown",
  "sha2",
@@ -314,9 +314,9 @@ dependencies = [
 
 [[package]]
 name = "packr-derive"
-version = "0.24.0"
+version = "0.24.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "15dbc463646981ca2d65828b89e92b200c90b3c7523908943aaad4733291a6dd"
+checksum = "66479c98d5f25bf4666e4bd25cc4f6c456d23603aa3cab8beb03290542165fbb"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -325,9 +325,9 @@ dependencies = [
 
 [[package]]
 name = "packr-guest"
-version = "0.24.0"
+version = "0.24.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3df02961941b03820f34e9de534330053411950d2e8394102070da15d3466ee3"
+checksum = "66a0492b1a064b55abbaeade861e36afc59696cc7e3052f4e4c106ecc26b5bde"
 dependencies = [
  "dlmalloc",
  "packr-abi",
@@ -337,9 +337,9 @@ dependencies = [
 
 [[package]]
 name = "packr-guest-macros"
-version = "0.24.0"
+version = "0.24.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "05192b88d8ad3621744e6604e6a4276f47617f13816f84d48dd2bc0d9e99b340"
+checksum = "589bb1dd2eb3c91063307d36b98d37a1fc715e84c7a2563c606d051fd26b1ddb"
 dependencies = [
  "packr-abi",
  "proc-macro2",
@@ -568,7 +568,7 @@ dependencies = [
 [[package]]
 name = "theater-guest"
 version = "0.1.0"
-source = "git+https://github.com/colinrozzi/theater?rev=00b0bf93fe69a231463d3ba918fa435c5f2a517d#00b0bf93fe69a231463d3ba918fa435c5f2a517d"
+source = "git+https://github.com/colinrozzi/theater?rev=cfcd737606758d388ab9d7042932d13e8da23a76#cfcd737606758d388ab9d7042932d13e8da23a76"
 dependencies = [
  "packr-guest",
  "theater-guest-macros",
@@ -577,7 +577,7 @@ dependencies = [
 [[package]]
 name = "theater-guest-macros"
 version = "0.1.0"
-source = "git+https://github.com/colinrozzi/theater?rev=00b0bf93fe69a231463d3ba918fa435c5f2a517d#00b0bf93fe69a231463d3ba918fa435c5f2a517d"
+source = "git+https://github.com/colinrozzi/theater?rev=cfcd737606758d388ab9d7042932d13e8da23a76#cfcd737606758d388ab9d7042932d13e8da23a76"
 dependencies = [
  "proc-macro2",
  "quote",
