@@ -10,6 +10,7 @@
 //!   INBOX_API    host[:port] of the API   (default: mail.colinrozzi.com:443)
 //!   INBOX_TOKEN  bearer token; required    (alt: ~/.config/inbox/token, one line)
 
+use std::io::{Read, Write};
 use std::process::ExitCode;
 
 use clap::{Args, Parser, Subcommand};
@@ -136,6 +137,9 @@ struct Ctx {
 }
 
 fn main() -> ExitCode {
+    // rustls 0.23 needs an explicit process-level crypto provider when built with
+    // the ring backend and default features off.
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let cli = Cli::parse();
 
     let token = match resolve_token() {
@@ -353,27 +357,91 @@ fn run_forward(ctx: &Ctx, from: &str, id: u64, to: &[String], cc: &[String], not
 }
 
 // ---- HTTP (ureq 2.x, blocking, rustls) ----
+// Talk HTTP/1.1 to the inbox API over TLS (rustls) and return the response body.
+//
+// The ENTIRE request (request line + headers + Content-Length + body) is built
+// into one buffer and written with a single write_all, so a small request goes
+// out as a single TLS record. This is REQUIRED: the api-handler reads the whole
+// request with a single tcp_receive, so headers + body must arrive together.
+// (ureq wrote the POST body as a separate write -> a separate TLS record, which
+// the server's single read missed -> empty body -> 400. This mirrors the framing
+// the old wasm CLI used.) Response is read to EOF (Connection: close).
 fn http(ctx: &Ctx, method: &str, path: &str, body: Option<&str>) -> Result<String, String> {
-    let url = format!("https://{}{}", ctx.api, path);
-    let auth = format!("Bearer {}", ctx.token);
-    let req = match method {
-        "GET" => ureq::get(&url).set("Authorization", &auth),
-        "POST" => ureq::post(&url).set("Authorization", &auth).set("Content-Type", "application/json"),
-        m => return Err(format!("unsupported method {m}")),
+    let (host, port) = match ctx.api.rsplit_once(':') {
+        Some((h, p)) => (
+            h.to_string(),
+            p.parse::<u16>()
+                .map_err(|_| format!("invalid port in INBOX_API: {}", ctx.api))?,
+        ),
+        None => (ctx.api.clone(), 443),
     };
-    let result = match body {
-        Some(b) => req.send_string(b),
-        None => req.call(),
-    };
-    match result {
-        Ok(resp) => resp.into_string().map_err(|e| format!("read response: {e}")),
-        // ureq returns Err(Status) for non-2xx; surface the server's JSON error body.
-        Err(ureq::Error::Status(code, resp)) => {
-            let b = resp.into_string().unwrap_or_default();
-            Err(format!("HTTP {code}: {b}"))
-        }
-        Err(e) => Err(format!("request to {url}: {e}")),
+
+    let mut req = format!(
+        "{method} {path} HTTP/1.1\r\nHost: {host}\r\nAuthorization: Bearer {}\r\nConnection: close\r\n",
+        ctx.token
+    );
+    match body {
+        Some(b) => req.push_str(&format!(
+            "Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            b.len(),
+            b
+        )),
+        None => req.push_str("\r\n"),
     }
+
+    let root_store = rustls::RootCertStore {
+        roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+    };
+    let config = rustls::ClientConfig::builder()
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+    let server_name = rustls::pki_types::ServerName::try_from(host.clone())
+        .map_err(|_| format!("invalid host: {host}"))?;
+    let mut conn = rustls::ClientConnection::new(std::sync::Arc::new(config), server_name)
+        .map_err(|e| format!("tls setup: {e}"))?;
+    let mut sock = std::net::TcpStream::connect((host.as_str(), port))
+        .map_err(|e| format!("connect {host}:{port}: {e}"))?;
+    let mut tls = rustls::Stream::new(&mut conn, &mut sock);
+
+    tls.write_all(req.as_bytes())
+        .map_err(|e| format!("write request: {e}"))?;
+    let _ = tls.flush();
+
+    // Connection: close -> read to EOF. Tolerate an unclean TLS close (peer drops
+    // without close_notify) once we already have the response bytes.
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        match tls.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            Err(ref e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(e) => {
+                if buf.is_empty() {
+                    return Err(format!("read response: {e}"));
+                }
+                break;
+            }
+        }
+    }
+
+    let text = String::from_utf8_lossy(&buf).into_owned();
+    let (head, resp_body) = text.split_once("\r\n\r\n").ok_or_else(|| {
+        format!(
+            "malformed response: {}",
+            text.chars().take(200).collect::<String>()
+        )
+    })?;
+    let code: u16 = head
+        .lines()
+        .next()
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|c| c.parse().ok())
+        .unwrap_or(0);
+    if !(200..300).contains(&code) {
+        return Err(format!("HTTP {code}: {}", resp_body.trim()));
+    }
+    Ok(resp_body.to_string())
 }
 
 fn to_json<T: Serialize>(v: &T) -> Result<String, String> {
