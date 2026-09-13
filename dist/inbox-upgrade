@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+# inbox-upgrade — install/update the `inbox` CLI from the latest GitHub Release
+# of colinrozzi/inbox. Mirrors the fleet's supervisor-upgrade wrapper: drop a
+# static binary on PATH, no container rebuild, no theater/wasm, no result-symlink.
+#
+#   inbox-upgrade                    # install/update to the latest inbox-cli release
+#   inbox-upgrade inbox-cli-v0.1.0   # pin a specific tag
+#
+# NOTE: the inbox repo publishes TWO release series — the wasm actors
+# (`release-*`) and this CLI (`inbox-cli-v*`). So "latest" here means the latest
+# `inbox-cli-v*` release specifically, NOT the repo's newest release overall
+# (which is usually a wasm-actor `release-*` with no `inbox` asset).
+set -euo pipefail
+
+REPO="colinrozzi/inbox"
+TAG_PREFIX="inbox-cli-v"
+TAG="${1:-latest}"
+BIN_DIR="${INBOX_BIN_DIR:-$HOME/.local/bin}"
+SHARE_DIR="${INBOX_SHARE_DIR:-$HOME/.local/share/inbox}"
+mkdir -p "$BIN_DIR" "$SHARE_DIR"
+
+# Prefer gh (agents are gh-authed); fall back to curl against the release API.
+if command -v gh >/dev/null 2>&1; then
+  if [ "$TAG" = "latest" ]; then
+    # Newest-first; pick the first tag in the CLI series.
+    TAG=$(gh release list --repo "$REPO" --limit 100 \
+            --json tagName --jq "[.[].tagName | select(startswith(\"$TAG_PREFIX\"))] | .[0]")
+    [ -n "$TAG" ] && [ "$TAG" != "null" ] \
+      || { echo "inbox-upgrade: no $TAG_PREFIX* release found on $REPO"; exit 1; }
+  fi
+  echo "inbox-upgrade: fetching $REPO@$TAG …"
+  gh release download "$TAG" --repo "$REPO" --clobber --dir "$SHARE_DIR" \
+     --pattern 'inbox' --pattern 'SHA256SUMS'
+else
+  if [ "$TAG" = "latest" ]; then
+    # Resolve the latest CLI-series tag from the releases API (no auth needed for public repos).
+    TAG=$(curl -fSL "https://api.github.com/repos/$REPO/releases" \
+            | jq -r "[.[].tag_name | select(startswith(\"$TAG_PREFIX\"))] | .[0]")
+    [ -n "$TAG" ] && [ "$TAG" != "null" ] \
+      || { echo "inbox-upgrade: no $TAG_PREFIX* release found on $REPO"; exit 1; }
+  fi
+  echo "inbox-upgrade: fetching $REPO@$TAG …"
+  base="https://github.com/$REPO/releases/download/$TAG"
+  curl -fSL "$base/inbox"        -o "$SHARE_DIR/inbox"
+  curl -fSL "$base/SHA256SUMS"   -o "$SHARE_DIR/SHA256SUMS" || true
+fi
+
+# Integrity: verify the binary against the published checksums before installing.
+if [ -f "$SHARE_DIR/SHA256SUMS" ]; then
+  ( cd "$SHARE_DIR" && sha256sum -c --ignore-missing SHA256SUMS ) \
+    || { echo "inbox-upgrade: checksum verification FAILED — refusing to install"; exit 1; }
+else
+  echo "inbox-upgrade: WARNING no SHA256SUMS found — skipping integrity check"
+fi
+
+install -m 0755 "$SHARE_DIR/inbox" "$BIN_DIR/inbox"
+echo "inbox-upgrade: installed $TAG -> $BIN_DIR/inbox"
+"$BIN_DIR/inbox" --help >/dev/null 2>&1 \
+  && echo "inbox-upgrade: ok (a static HTTPS client — set INBOX_TOKEN or ~/.config/inbox/token, INBOX_API defaults to mail.colinrozzi.com:443)"
