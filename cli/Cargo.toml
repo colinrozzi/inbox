@@ -16,10 +16,11 @@ path = "src/main.rs"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
-# ureq 2.x: blocking HTTP + rustls (default "tls" feature) with bundled Mozilla
-# roots — no system CA / OpenSSL dep, so it packages static-musl cleanly (ring
-# needs the musl cross-cc, set in release.yml). No async runtime for a one-shot CLI.
-ureq = "2"
+# Hand-rolled HTTP/1.1 over rustls (ring backend, bundled Mozilla roots) — the
+# request MUST go out as one write (see http() in main.rs). ring + musl needs the
+# cross-cc set in release-cli.yml. No async runtime for a one-shot CLI.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+webpki-roots = "0.26"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
