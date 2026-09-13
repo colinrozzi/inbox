@@ -114,35 +114,38 @@ Each connection-handling actor is single-shot — handles one connection then sh
 
 ## CLI
 
-The `cli/` workspace member is a one-shot theater actor wrapped by a bash script. It builds in the same `nix build` as the server actors:
+`cli/` is a standalone native binary (`inbox`) — a plain HTTPS client to the
+API (bearer token, rustls). It is **not** a theater actor: its whole surface is
+HTTP calls to `/v1/mailboxes/*`, so there's no wasm or runtime to carry. Build it
+with cargo (static-musl in CI, released as a downloadable binary):
 
 ```sh
-nix build .#default     # produces result/inbox_cli.wasm alongside the rest
+cd cli && cargo build --release      # -> cli/target/release/inbox
 ```
 
 Configure once:
 
 ```sh
-export INBOX_API=mail.yourdomain.com:8080      # or whatever your deploy uses
+export INBOX_API=mail.yourdomain.com:443       # or whatever your deploy uses
 mkdir -p ~/.config/inbox && cp /path/to/token ~/.config/inbox/token
 ```
 
-Then:
+Then (assuming `inbox` is on your PATH):
 
 ```sh
-./cli/inbox list
-./cli/inbox new alice@yourdomain.com
-./cli/inbox lookup alice@yourdomain.com
-./cli/inbox read alice@yourdomain.com [--since N]
-./cli/inbox send alice@yourdomain.com --to bob@example.com \
+inbox list
+inbox new alice@yourdomain.com
+inbox lookup alice@yourdomain.com
+inbox read alice@yourdomain.com [--since N] [--full]
+inbox send alice@yourdomain.com --to bob@example.com \
                   [--to carol@example.com]... [--cc dan@example.com]... \
                   [--bcc eve@example.com]... \
                   --subject "hi" --body "hello" \
                   [--in-reply-to "<mid>"] [--references "<m1> <m2>"]
-./cli/inbox reply alice@yourdomain.com <id> --to bob@example.com \
+inbox reply alice@yourdomain.com <id> --to bob@example.com \
                   [--cc carol@example.com]... [--bcc eve@example.com]... \
                   [--subject "..."] --body "hello"
-./cli/inbox forward alice@yourdomain.com <id> --to bob@example.com \
+inbox forward alice@yourdomain.com <id> --to bob@example.com \
                   [--cc carol@example.com]... [--note "fwd note"]
 ```
 
@@ -210,7 +213,7 @@ For a real deployment (real domain, real internet mail, systemd, GC roots), see 
 - [x] Cascade-resistant acceptors (a single failed connection doesn't kill the process)
 - [x] systemd unit + nix GC roots (survives reboot, won't be garbage-collected)
 - [x] Bearer-token auth on every HTTP route (single deployment-wide token for now)
-- [x] Theater-actor-based CLI (`cli/inbox`) — local theater talks to the API over real-internet HTTPS with the token
+- [x] CLI (`inbox`) — native static-musl HTTPS client to the API (bearer token, rustls); no theater/wasm
 - [x] TLS on the HTTPS API via theater's `server_tls` (Let's Encrypt cert for `mail.<domain>`)
 - [ ] Date + Message-ID headers on outbound (blocked on `theater:simple/timer.now()` from pack actors)
 - [ ] api-handler pool (or single long-lived api-handler) — connections currently fail under burst load

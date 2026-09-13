@@ -88,8 +88,10 @@
         theaterBin = theater.packages.${system}.default;
 
       in {
-        # nix build — produces all seven plain self-contained actor modules in
-        # $out as inbox_<actor>.wasm (the deployable 0.11.0 artifacts).
+        # nix build — produces all six plain self-contained actor modules in
+        # $out as inbox_<actor>.wasm (the deployable 0.11.0 artifacts). The CLI
+        # is no longer here: it's a standalone native HTTPS-client binary (cli/,
+        # released static-musl), not a wasm actor.
         #
         # packr 0.11.0 links each cdylib into a directly-loadable module: NO
         # `theater compose` step, NO binaryen/wasm-merge. crane builds the plain
@@ -106,7 +108,6 @@
             for name in \
               inbox_acceptor \
               inbox_api_handler \
-              inbox_cli \
               inbox_mailbox \
               inbox_mailbox_router \
               inbox_smtp_acceptor \
