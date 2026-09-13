@@ -1,0 +1,11 @@
+{
+  "services": [
+    {
+      "handle": "inbox",
+      "manifest": "acceptor/manifest.toml",
+      "max": 5,
+      "window_ms": 60000,
+      "keep_chain": true
+    }
+  ]
+}
