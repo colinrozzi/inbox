@@ -146,11 +146,26 @@ fn raw_label(address: &str, id: u64) -> String {
 /// Hydrate a MailboxState from the store. None if unset/undecodable. Relies on
 /// `forward_compatible` for field-add tolerance (old blobs decode with missing
 /// trailing fields defaulted) — no hand-written field migration needed.
-fn load_state(address: &str) -> Option<MailboxState> {
-    let content_ref = store_get_by_label(STORE_ID.into(), label_for(address)).ok()??;
-    let bytes = store_get(STORE_ID.into(), content_ref).ok()?;
-    let value = decode(&bytes).ok()?;
-    MailboxState::try_from(value).ok()
+// Ok(None)      = no stored state (fresh mailbox; empty is correct).
+// Ok(Some(_))   = state present + decoded.
+// Err(_)        = state PRESENT but unreadable (old-format / corruption). The
+//                 caller MUST hard-fail loudly, NOT fall back to empty — a silent
+//                 empty here would drop persisted mail (the v2->v3 store-format
+//                 trap: 0.24 decode cleanly Errs on v2 data). Fail-loud so a
+//                 missed/pending store migration is visible, never a silent wipe.
+fn load_state(address: &str) -> Result<Option<MailboxState>, String> {
+    let content_ref = match store_get_by_label(STORE_ID.into(), label_for(address)) {
+        Ok(Some(r)) => r,
+        Ok(None) => return Ok(None),
+        Err(e) => return Err(format!("store get-by-label failed: {}", e)),
+    };
+    let bytes = store_get(STORE_ID.into(), content_ref)
+        .map_err(|e| format!("store get failed: {}", e))?;
+    let value = decode(&bytes)
+        .map_err(|e| format!("decode failed (old-format store data? needs v2->v3 migration): {:?}", e))?;
+    let state = MailboxState::try_from(value)
+        .map_err(|_| String::from("MailboxState try_from failed (schema mismatch or old-format)"))?;
+    Ok(Some(state))
 }
 
 fn save_state(state: &MailboxState) {
@@ -211,10 +226,24 @@ fn init(config: Value) -> Value {
         Value::String(s) => s,
         _ => return err_str("mailbox init: expected init_state = string (email address)"),
     };
-    let state = load_state(&address).unwrap_or_else(|| MailboxState {
-        address: address.clone(),
-        messages: Vec::new(),
-    });
+    let state = match load_state(&address) {
+        Ok(Some(s)) => s,
+        // Genuinely no stored state yet -> a fresh empty mailbox is correct.
+        Ok(None) => MailboxState { address: address.clone(), messages: Vec::new() },
+        // Stored data PRESENT but unreadable -> refuse to start empty (that would
+        // silently drop persisted mail). Fail loudly; it's visible + fixable (run
+        // the v2->v3 store migration), not a silent wipe.
+        Err(e) => {
+            log(format!(
+                "[inbox-mailbox] init ABORT for {}: {} — refusing to start empty over present-but-unreadable store data (data-loss guard)",
+                address, e
+            ));
+            return err_str(&format!(
+                "mailbox init: present store data for {} is unreadable ({}); refusing silent-empty — migrate v2->v3",
+                address, e
+            ));
+        }
+    };
     log(format!("[inbox-mailbox] init {} ({} messages)", address, state.messages.len()));
     MAILBOX.set(state);
     ok_unit()
