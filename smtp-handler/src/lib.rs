@@ -236,11 +236,33 @@ fn router_lookup(router_id: &str, address: &str) -> Result<Option<String>, Strin
         Value::Tuple(alloc::vec![Value::String(address.to_string())]),
         Value::Tuple(alloc::vec![]),
     );
-    // packr-abi 0.24: strip the outer Value::Result{Ok(box)}; the box IS the
-    // bare option<string> payload now (no tuple<state,_> wrapper).
-    let ok_payload = match result {
-        Value::Result { value: Ok(inner), .. } => Some(*inner),
-        _ => None,
+    // theater's rpc.call transport-wraps the callee return in a LEGACY result-as-Variant
+    // (Value::Variant{type_name:"result", case_name:"ok"/"err", tag:0/1, payload:[x]})
+    // around the router's OWN Value::Result. A single native-Result strip hit the outer
+    // Variant -> None -> "451 Temporary lookup failure" on every RCPT TO. Peel result-
+    // layers ITERATIVELY, accepting BOTH first-class Value::Result AND the legacy Variant
+    // form, stopping at the callee's payload (the option<string>); result-Err at any
+    // layer -> None. Same fix as the api-handler's unwrap_rpc_result (#76); this is the
+    // smtp-handler's own copy of that decode (inbound RCPT TO recipient resolution).
+    let ok_payload = {
+        let mut v = result;
+        loop {
+            v = match v {
+                Value::Result { value: Ok(inner), .. } => *inner,
+                Value::Result { value: Err(_), .. } => break None,
+                Value::Variant { type_name, case_name, tag, mut payload, .. }
+                    if type_name == "result" && (case_name == "ok" || tag == 0) && payload.len() == 1 =>
+                {
+                    payload.remove(0)
+                }
+                Value::Variant { type_name, case_name, tag, .. }
+                    if type_name == "result" && (case_name == "err" || tag == 1) =>
+                {
+                    break None
+                }
+                other => break Some(other),
+            };
+        }
     };
     match ok_payload {
         Some(Value::Option { value: Some(inner), .. }) => match *inner {
