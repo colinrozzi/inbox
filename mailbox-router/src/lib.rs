@@ -134,20 +134,25 @@ fn opt_string(o: Option<String>) -> Value {
     o.into()
 }
 
-fn load_bindings() -> Vec<Binding> {
+// Ok(None)    = no bindings stored yet (fresh router; empty index is correct).
+// Ok(Some(_)) = bindings present + decoded.
+// Err(_)      = bindings PRESENT but unreadable (old-format / corruption). The
+//               caller MUST hard-fail — silently loading an EMPTY index would
+//               orphan every registered mailbox (lose the whole address->mailbox
+//               map). Same v2->v3 data-loss guard as the mailbox.
+fn load_bindings() -> Result<Option<Vec<Binding>>, String> {
     let content_ref = match store_get_by_label(STORE_ID.into(), String::from(BINDINGS_LABEL)) {
         Ok(Some(r)) => r,
-        _ => return Vec::new(),
+        Ok(None) => return Ok(None),
+        Err(e) => return Err(format!("store get-by-label failed: {}", e)),
     };
-    let bytes = match store_get(STORE_ID.into(), content_ref) {
-        Ok(b) => b,
-        Err(_) => return Vec::new(),
-    };
-    let value = match decode(&bytes) {
-        Ok(v) => v,
-        Err(_) => return Vec::new(),
-    };
-    Vec::<Binding>::try_from(value).unwrap_or_else(|_| Vec::new())
+    let bytes = store_get(STORE_ID.into(), content_ref)
+        .map_err(|e| format!("store get failed: {}", e))?;
+    let value = decode(&bytes)
+        .map_err(|e| format!("decode failed (old-format bindings? needs v2->v3 migration): {:?}", e))?;
+    let bindings = Vec::<Binding>::try_from(value)
+        .map_err(|_| String::from("bindings try_from failed (schema mismatch or old-format)"))?;
+    Ok(Some(bindings))
 }
 
 fn save_bindings(bindings: &[Binding]) {
@@ -174,8 +179,26 @@ fn init(config: Value) -> Value {
         _ => return err_str("mailbox-router init: expected init_state = string (mailbox manifest path)"),
     };
     log(format!("[mailbox-router] init (manifest={}) — lazy mailbox spawn", mailbox_manifest));
+    let saved = match load_bindings() {
+        Ok(Some(b)) => b,
+        // No bindings stored yet -> fresh empty index is correct.
+        Ok(None) => Vec::new(),
+        // Bindings PRESENT but unreadable -> refuse to start with an empty index
+        // (that silently orphans every registered mailbox). Fail loudly; fix via
+        // the v2->v3 store migration.
+        Err(e) => {
+            log(format!(
+                "[mailbox-router] init ABORT: {} — refusing to start with an empty binding index over present-but-unreadable data (would orphan all mailboxes)",
+                e
+            ));
+            return err_str(&format!(
+                "mailbox-router init: present bindings unreadable ({}); refusing silent-empty — migrate v2->v3",
+                e
+            ));
+        }
+    };
     // Keep the known addresses, but clear mailbox_id (not-spawned-this-process).
-    let bindings: Vec<Binding> = load_bindings()
+    let bindings: Vec<Binding> = saved
         .into_iter()
         .map(|b| Binding { address: b.address, mailbox_id: String::new() })
         .collect();
