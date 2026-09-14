@@ -877,13 +877,41 @@ fn parse_smtp_code(line: &[u8]) -> Option<u16> {
 /// strips the state half of the actor's `(state, response)` return, so
 /// the variant payload is just the response value.
 fn unwrap_rpc_result(value: Value) -> Option<Value> {
-    // packr-abi 0.24: rpc.call returns the callee's return Value as-is. Post
-    // in-module-state, exports return result<PAYLOAD, string> directly (no more
-    // tuple<state, response> wrapper), so the Ok box IS the bare payload — strip
-    // the outer Result and hand it back. Err (or malformed) -> None.
-    match value {
-        Value::Result { value: Ok(inner), .. } => Some(*inner),
-        _ => None,
+    // theater's rpc.call (theater-handler-rpc) transport-wraps the callee's return in a
+    // LEGACY result-as-Variant: Value::Variant{type_name:"result", case_name:"ok"/"err",
+    // tag:0/1, payload:[x]} — NOT a first-class Value::Result. The callee's OWN return is
+    // nested inside payload[0] and is ITSELF a result (first-class Value::Result here). So
+    // the api-handler receives TWO result layers and the OUTER is a Variant. The old code
+    // matched only a single native Value::Result -> the outer Variant fell to `_ => None`
+    // -> "router rpc failed" for EVERY call (fresh + existing), regardless of the payload.
+    //
+    // Fix: peel result-layers ITERATIVELY, accepting BOTH the first-class Value::Result AND
+    // the legacy Variant{type_name:"result"} forms (packr's result-encoding duality — this
+    // stays encoding-agnostic, so a future theater cleanup that emits first-class results
+    // won't reintroduce the bug). Stop at the first value that is not a result wrapper (=
+    // the callee's actual payload: Value::Option / String / list). A result-Err at any
+    // layer -> None (caller maps to "router rpc failed"). Covers every rpc.call site.
+    let mut v = value;
+    loop {
+        v = match v {
+            Value::Result { value: Ok(inner), .. } => *inner,
+            Value::Result { value: Err(_), .. } => {
+                log(String::from("[inbox-api] rpc result: native/callee Err"));
+                return None;
+            }
+            Value::Variant { type_name, case_name, tag, mut payload, .. }
+                if type_name == "result" && (case_name == "ok" || tag == 0) && payload.len() == 1 =>
+            {
+                payload.remove(0)
+            }
+            Value::Variant { type_name, case_name, tag, .. }
+                if type_name == "result" && (case_name == "err" || tag == 1) =>
+            {
+                log(String::from("[inbox-api] rpc result: transport/variant Err"));
+                return None;
+            }
+            other => return Some(other),
+        };
     }
 }
 
