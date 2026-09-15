@@ -50,7 +50,7 @@ verify inbox_mailbox        mailbox/manifest.toml        || fail=1
 verify inbox_mailbox_router mailbox-router/manifest.toml || fail=1
 verify inbox_smtp_acceptor  smtp-acceptor/manifest.toml  || fail=1
 verify inbox_smtp_handler   smtp-handler/manifest.toml   || fail=1
-verify inbox_cli            cli/manifest.toml            || fail=1
+# inbox_cli is a standalone NATIVE binary (#72), not a wasm actor — nothing to spawn-verify.
 
 echo "----"
 if [ "$fail" = 0 ]; then echo "spawn-verify: all composites set up clean"; else echo "spawn-verify: FAILURES above"; fi
