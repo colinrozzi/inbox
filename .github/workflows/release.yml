@@ -74,135 +74,35 @@ jobs:
             ASSETS+=("${actor}-${STAGE_TAG}.wasm")
           done
 
-          # 2) Sub-manifest TOMLs for the five sub-actors that
-          #    inbox-acceptor / smtp-acceptor reference via initial_state.
-          #    Each manifest's package field is a self-referential
-          #    https:// URL pointing at this release's matching wasm.
-          #    The handler stanzas mirror the in-repo manifests.
-
-          API_HANDLER_MANIFEST_FILE="inbox-api-handler-${STAGE_TAG}.toml"
-          API_HANDLER_WASM_URL="https://github.com/${REPO}/releases/download/${TAG}/inbox_api_handler-${STAGE_TAG}.wasm"
-          cat > "${API_HANDLER_MANIFEST_FILE}" <<TOML
-          name = "inbox-api-handler"
-          version = "0.1.0"
-          package = "${API_HANDLER_WASM_URL}"
-          static_package = true
-
-          [[handler]]
-          type = "runtime"
-
-          [[handler]]
-          type = "tcp"
-
-          # client_tls lets api-handler take over the TLS handshake on the
-          # connection inbox-acceptor transfers to it. auto_handshake=false
-          # so api-handler controls the timing (it runs the HTTP/1.1 path
-          # after TLS negotiation, including bearer-token auth + DKIM-sign).
-          [handler.client_tls]
-          enabled = true
-          auto_handshake = false
-
-          [[handler]]
-          type = "rpc"
-
-          [[handler]]
-          type = "store"
-          base_path = "/mnt/main-volume/inbox/store"
-          store_id = "inbox"
-          TOML
-          ASSETS+=("${API_HANDLER_MANIFEST_FILE}")
-
-          MAILBOX_MANIFEST_FILE="inbox-mailbox-${STAGE_TAG}.toml"
-          MAILBOX_WASM_URL="https://github.com/${REPO}/releases/download/${TAG}/inbox_mailbox-${STAGE_TAG}.wasm"
-          cat > "${MAILBOX_MANIFEST_FILE}" <<TOML
-          name = "inbox-mailbox"
-          version = "0.1.0"
-          package = "${MAILBOX_WASM_URL}"
-          static_package = true
-
-          [[handler]]
-          type = "runtime"
-
-          [[handler]]
-          type = "store"
-          base_path = "/mnt/main-volume/inbox/store"
-          store_id = "inbox"
-          TOML
-          ASSETS+=("${MAILBOX_MANIFEST_FILE}")
-
-          ROUTER_MANIFEST_FILE="inbox-mailbox-router-${STAGE_TAG}.toml"
-          ROUTER_WASM_URL="https://github.com/${REPO}/releases/download/${TAG}/inbox_mailbox_router-${STAGE_TAG}.wasm"
-          cat > "${ROUTER_MANIFEST_FILE}" <<TOML
-          name = "inbox-mailbox-router"
-          version = "0.1.0"
-          package = "${ROUTER_WASM_URL}"
-          static_package = true
-
-          [[handler]]
-          type = "runtime"
-
-          [[handler]]
-          type = "supervisor"
-
-          [[handler]]
-          type = "rpc"
-
-          [[handler]]
-          type = "store"
-          base_path = "/mnt/main-volume/inbox/store"
-          store_id = "inbox"
-          TOML
-          ASSETS+=("${ROUTER_MANIFEST_FILE}")
-
-          SMTP_ACCEPTOR_MANIFEST_FILE="inbox-smtp-acceptor-${STAGE_TAG}.toml"
-          SMTP_ACCEPTOR_WASM_URL="https://github.com/${REPO}/releases/download/${TAG}/inbox_smtp_acceptor-${STAGE_TAG}.wasm"
-          cat > "${SMTP_ACCEPTOR_MANIFEST_FILE}" <<TOML
-          name = "inbox-smtp-acceptor"
-          version = "0.1.0"
-          package = "${SMTP_ACCEPTOR_WASM_URL}"
-          static_package = true
-
-          [[handler]]
-          type = "runtime"
-
-          [[handler]]
-          type = "tcp"
-
-          [[handler]]
-          type = "supervisor"
-
-          [[handler]]
-          type = "rpc"
-          TOML
-          ASSETS+=("${SMTP_ACCEPTOR_MANIFEST_FILE}")
-
-          SMTP_HANDLER_MANIFEST_FILE="inbox-smtp-handler-${STAGE_TAG}.toml"
-          SMTP_HANDLER_WASM_URL="https://github.com/${REPO}/releases/download/${TAG}/inbox_smtp_handler-${STAGE_TAG}.wasm"
-          cat > "${SMTP_HANDLER_MANIFEST_FILE}" <<TOML
-          name = "inbox-smtp-handler"
-          version = "0.1.0"
-          package = "${SMTP_HANDLER_WASM_URL}"
-          static_package = true
-
-          [[handler]]
-          type = "runtime"
-
-          [[handler]]
-          type = "tcp"
-
-          # server_tls is used for STARTTLS upgrade after inbox-smtp-acceptor
-          # transfers the plain-TCP :25 connection here. Same cert/key as
-          # inbox-acceptor's :443 listener — single fullchain covers both
-          # ports on mail.colinrozzi.com.
-          [handler.server_tls]
-          enabled = true
-          cert = "/etc/letsencrypt/live/mail.colinrozzi.com/fullchain.pem"
-          key = "/etc/letsencrypt/live/mail.colinrozzi.com/privkey.pem"
-
-          [[handler]]
-          type = "rpc"
-          TOML
-          ASSETS+=("${SMTP_HANDLER_MANIFEST_FILE}")
+          # 2) Sub-manifest TOMLs for the five sub-actors, DERIVED from the
+          #    in-repo <actor>/manifest.toml (the tested post-cutover truth) so
+          #    they can never drift: copy the manifest, repoint `package` at
+          #    this release's matching wasm asset (static_package=true), and
+          #    inject the deploy-only TLS stanzas the in-repo skeletons omit
+          #    (client_tls on api-handler for outbound STARTTLS; server_tls on
+          #    smtp-handler for :25 STARTTLS). Handler sets + permission_policy
+          #    come straight from the in-repo manifests -- no hand-maintained
+          #    copies to rot. (The old heredocs had fallen ~3 revs behind: a
+          #    dead `supervisor` handler, a missing `self`, a wrong `runtime`.)
+          derive_manifest() {
+            local actor_dir="$1" wasm_name="$2" tls="$3" out="$4"
+            local url="https://github.com/${REPO}/releases/download/${TAG}/${wasm_name}-${STAGE_TAG}.wasm"
+            awk -v url="$url" -v tls="$tls" '
+              /^package = /        { print "package = \"" url "\""; print "static_package = true"; next }
+              /^static_package = / { next }
+              { print }
+              /^type = "tcp"$/ {
+                if (tls == "client") { print ""; print "[handler.client_tls]"; print "enabled = true"; print "auto_handshake = false" }
+                else if (tls == "server") { print ""; print "[handler.server_tls]"; print "enabled = true"; print "cert = \"/etc/letsencrypt/live/mail.colinrozzi.com/fullchain.pem\""; print "key = \"/etc/letsencrypt/live/mail.colinrozzi.com/privkey.pem\"" }
+              }
+            ' "${actor_dir}/manifest.toml" > "$out"
+            ASSETS+=("$out")
+          }
+          derive_manifest api-handler    inbox_api_handler    client "inbox-api-handler-${STAGE_TAG}.toml"
+          derive_manifest mailbox        inbox_mailbox        ""     "inbox-mailbox-${STAGE_TAG}.toml"
+          derive_manifest mailbox-router inbox_mailbox_router ""     "inbox-mailbox-router-${STAGE_TAG}.toml"
+          derive_manifest smtp-acceptor  inbox_smtp_acceptor  ""     "inbox-smtp-acceptor-${STAGE_TAG}.toml"
+          derive_manifest smtp-handler   inbox_smtp_handler   server "inbox-smtp-handler-${STAGE_TAG}.toml"
 
           # 3) Bundle of all six actor modules (humans / local use) + sha256.
           STAGE="inbox-${STAGE_TAG}-wasm32"
