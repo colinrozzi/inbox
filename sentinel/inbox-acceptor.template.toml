@@ -1,122 +1,76 @@
-# Sentinel-managed deploy template for inbox-acceptor.
+# Deploy template for inbox-acceptor (http-pull / supervisor-managed).
 #
-# Sentinel renders this template by literal substring substitution of
-# the placeholders below (each wrapped in doubled underscores) from
-# its per-child config at every spawn:
+# Rendered by literal substring substitution of the __PLACEHOLDER__ tokens
+# below from per-deploy config at render/apply time:
 #
-# (Comment intentionally avoids writing an example placeholder name in
-# the doubled-underscore form — Phase 3.3's secret-validation regex
-# scans the whole template for that pattern and would treat an example
-# in a doc comment as a required secret. Manager patched this locally
-# on the 2026-05-31 cutover attempt; fixed in source here.)
+#   __PACKAGE__                 canonical inbox_acceptor-<tag>.wasm URL (release asset)
+#   __LISTEN_ADDR__             host:port the HTTPS API binds (see note)
+#   __API_HANDLER_MANIFEST__    https URL of the api-handler release-asset manifest
+#   __MAILBOX_MANIFEST__        https URL of the mailbox release-asset manifest
+#   __ROUTER_MANIFEST__         https URL of the mailbox-router release-asset manifest
+#   __SMTP_ACCEPTOR_MANIFEST__  https URL of the smtp-acceptor release-asset manifest
+#   __SMTP_HANDLER_MANIFEST__   https URL of the smtp-handler release-asset manifest
 #
-#   children: {
-#     "inbox-acceptor": {
-#       manifest_template: <contents of this file>,
-#       default_package:   "<canonical inbox_acceptor-<tag>.composite.wasm URL>",
-#       secrets: {
-#         "BEARER_TOKEN":            "...",
-#         "DKIM_PRIVATE_KEY":        "...",
-#         "LISTEN_ADDR":             "...",
-#         "API_HANDLER_MANIFEST":    "...",
-#         "MAILBOX_MANIFEST":        "...",
-#         "ROUTER_MANIFEST":         "...",
-#         "SMTP_ACCEPTOR_MANIFEST":  "...",
-#         "SMTP_HANDLER_MANIFEST":   "..."
-#       }
-#     }
-#   }
-#
-# OPERATOR NOTE — DKIM_PRIVATE_KEY MUST BE JSON-ESCAPED:
-#   The PEM is multi-line. Inside the JSON initial_state field, newlines
-#   are illegal as raw bytes — they MUST appear as the two-character
-#   escape sequence \n. Set DKIM_PRIVATE_KEY in sentinel's secrets map
-#   as a single-line string with literal \n escapes, e.g.
-#     "DKIM_PRIVATE_KEY": "-----BEGIN RSA PRIVATE KEY-----\nMIIE...\n-----END RSA PRIVATE KEY-----\n"
-#   Sentinel substitutes the value verbatim into the TOML literal string
-#   below; theater passes the resulting JSON to the acceptor; serde_json
-#   parses \n back to newlines; the PEM reaches DKIM signing intact.
-#
-# OPERATOR NOTE — BEARER_TOKEN ROTATION:
-#   The bearer field accepts a single token or a comma-separated rotation
-#   list ("<new>,<old>"). api-handler accepts any token in the list (see
-#   api-handler/src/lib.rs:311). Set BEARER_TOKEN as a single-line string;
-#   no escape needed.
+# SECRETS ARE NOT IN THIS TEMPLATE (PR #78, secrets-reader flip). The acceptor
+# no longer carries bearer/dkim in initial_state — it READS them from the store
+# labels `api-bearer-token` + `dkim-key` at init as a gatekeeper (it refuses to
+# start if either is absent/empty). Secrets are seeded into the on-box store
+# ONCE, out-of-band (operator/manager-owned), never through this template or any
+# published manifest. That is exactly what makes this manifest safe to publish
+# over http for pull-based deploys.
 #
 # OPERATOR NOTE — LISTEN_ADDR:
-#   host:port string the HTTPS API binds on this host. Pre-frontdoor:
-#   "0.0.0.0:443" (public bind). Post-frontdoor cutover: "127.0.0.1:8443"
-#   (loopback; frontdoor takes the public :443 and SNI-routes the raw
-#   encrypted stream to this backend). The backend still terminates TLS
-#   using the cert/key paths in [handler.server_tls] below, regardless of
-#   bind address.
+#   host:port the HTTPS API binds on this host. With the frontdoor in front,
+#   "127.0.0.1:8443" (loopback; frontdoor owns the public :443 and SNI-routes
+#   the raw encrypted stream to this backend). The backend still terminates TLS
+#   using the cert/key in [handler.server_tls] below, regardless of bind address.
 #
 # OPERATOR NOTE — MANIFEST REFERENCES:
-#   *_MANIFEST values are opaque references that theater's
-#   resolve_reference dispatches. Three accepted forms:
-#     - file paths (/path/to/manifest.toml)        — dev/legacy
-#     - https://... URLs                            — release artifacts
-#     - store://... references                       — sentinel pre-staged
-#   For production sentinel-managed deploy, all four should be https://
-#   URLs pointing at the matching release-asset manifest TOMLs on
-#   github.com/colinrozzi/inbox/releases.
-#
-# COEXISTENCE CONSTRAINT:
-#   Pre-cutover, this template and the systemd-deployed
-#   acceptor/manifest.toml share store_id ("inbox") + base_path. They
-#   cannot coexist on the same host — port :443 / :25 contention AND
-#   concurrent writers to the same store. Cutover order is "stop systemd;
-#   nc sentinel start inbox-acceptor" with a ~5-10s downtime window
-#   (CLI/HTTP clients retry; SMTP peers retry per RFC 5321 §4.5.4.1).
-#   See the cutover PR description for the full procedure.
+#   *_MANIFEST values are references theater's resolve_reference dispatches:
+#     - https://... URLs        — release artifacts (production http-pull)
+#     - file paths              — dev/legacy
+#     - store://... references  — pre-staged
+#   For http-pull deploys, all five are https:// URLs pointing at the matching
+#   release-asset manifest TOMLs (generated by .github/workflows/release.yml).
 #
 # WHY initial_state IS A SINGLE-LINE TOML LITERAL (not multi-line):
-#   Sentinel embeds this entire template as a STRING value in its own
-#   outer manifest, which itself uses TOML triple-quote literal syntax.
-#   TOML literal strings have NO escape mechanism for nested triple
-#   quotes — if this template uses triple-quote for its inner
-#   initial_state, the outer parse closes the wrapping string early
-#   ("expected newline" error at the inner triple-quote position).
-#   Cutover attempt on 2026-05-31 hit this exact bug and rolled back.
-#   Keep initial_state as a single-line single-quote literal. Don't
-#   "improve readability" by re-introducing multi-line.
+#   When this template is embedded as a STRING value inside an outer manifest
+#   that uses TOML triple-quote literal syntax, a nested triple-quote here would
+#   close the wrapping string early ("expected newline" at the inner quote). A
+#   2026-05-31 cutover attempt hit exactly this and rolled back. Keep
+#   initial_state a single-line single-quote literal; don't re-introduce
+#   multi-line for "readability".
 
 name = "inbox-acceptor"
 version = "0.1.0"
 package = "__PACKAGE__"
-# JSON shape (one-line for nesting-safety; see operator note above):
+# initial_state JSON (one-line for nesting-safety; see note above) — NON-SECRET:
 #   {
-#     "bearer_token":           "<token or comma-separated rotation list>",
-#     "dkim_private_key":       "<PEM, newlines as \n escapes>",
 #     "listen_addr":            "<host:port for HTTPS bind>",
-#     "api_handler_manifest":   "<reference>",
-#     "mailbox_manifest":       "<reference>",
-#     "router_manifest":        "<reference>",
-#     "smtp_acceptor_manifest": "<reference>",
-#     "smtp_handler_manifest":  "<reference>"
+#     "api_handler_manifest":   "<https reference>",
+#     "mailbox_manifest":       "<https reference>",
+#     "router_manifest":        "<https reference>",
+#     "smtp_acceptor_manifest": "<https reference>",
+#     "smtp_handler_manifest":  "<https reference>"
 #   }
-initial_state = '{"bearer_token":"__BEARER_TOKEN__","dkim_private_key":"__DKIM_PRIVATE_KEY__","listen_addr":"__LISTEN_ADDR__","api_handler_manifest":"__API_HANDLER_MANIFEST__","mailbox_manifest":"__MAILBOX_MANIFEST__","router_manifest":"__ROUTER_MANIFEST__","smtp_acceptor_manifest":"__SMTP_ACCEPTOR_MANIFEST__","smtp_handler_manifest":"__SMTP_HANDLER_MANIFEST__"}'
+initial_state = '{"listen_addr":"__LISTEN_ADDR__","api_handler_manifest":"__API_HANDLER_MANIFEST__","mailbox_manifest":"__MAILBOX_MANIFEST__","router_manifest":"__ROUTER_MANIFEST__","smtp_acceptor_manifest":"__SMTP_ACCEPTOR_MANIFEST__","smtp_handler_manifest":"__SMTP_HANDLER_MANIFEST__"}'
 
 [[handler]]
-type = "runtime"
+type = "self"
 
 [[handler]]
 type = "tcp"
 
-# server_tls binds the :443 HTTPS listener. Cert + key paths point at
-# the let'sencrypt fullchain/privkey on the VPS — the sentinel-host
-# operator owns those files at fixed paths (renewed by certbot). Same
-# cert pair is used by smtp-handler for STARTTLS on :25 (see the
-# release-asset smtp-handler manifest generated by .github/workflows/
-# release.yml). If the deploy target ever moves off this host, the
-# cert/key paths become per-host config — for now they're hardcoded.
+# server_tls terminates TLS for the HTTPS API. cert+key are the certbot
+# fullchain/privkey on the VPS (the same pair smtp-handler uses for STARTTLS on
+# :25). If the deploy target moves off this host these become per-host config.
 [handler.server_tls]
 enabled = true
 cert = "/etc/letsencrypt/live/mail.colinrozzi.com/fullchain.pem"
 key = "/etc/letsencrypt/live/mail.colinrozzi.com/privkey.pem"
 
 [[handler]]
-type = "supervisor"
+type = "runtime"
 
 [[handler]]
 type = "rpc"
@@ -125,3 +79,8 @@ type = "rpc"
 type = "store"
 base_path = "/mnt/main-volume/inbox/store"
 store_id = "inbox"
+
+# Children (router, api-handler, smtp-acceptor) are spawned via the runtime
+# handler; inherit grants them the acceptor's capability set.
+[permission_policy.runtime]
+type = "inherit"
