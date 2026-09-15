@@ -4,13 +4,16 @@ package = "/home/colin/work/actors/inbox/target/wasm32-unknown-unknown/release/i
 static_package = true
 
 [[handler]]
-type = "runtime"
+type = "self"
 
 [[handler]]
 type = "tcp"
 
 [[handler]]
-type = "supervisor"
+type = "runtime"
 
 [[handler]]
 type = "rpc"
+
+[permission_policy.runtime]
+type = "inherit"

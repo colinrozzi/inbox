@@ -75,7 +75,7 @@ openssl rand -hex 32 > /etc/inbox/api-token
 chmod 600 /etc/inbox/api-token
 ```
 
-This token gets embedded in the acceptor manifest's `initial_state` (next step) and copied to each client machine that wants to talk to the API. On a client:
+This token gets seeded into the store under the `api-bearer-token` label (see §6.1 — it is no longer carried in any manifest) and copied to each client machine that wants to talk to the API. On a client:
 
 ```sh
 mkdir -p ~/.config/inbox
@@ -85,7 +85,7 @@ chmod 600 ~/.config/inbox/token
 
 The CLI looks at `$INBOX_TOKEN` first, then `~/.config/inbox/token`. Curl from anywhere is `-H "Authorization: Bearer $(cat ~/.config/inbox/token)"`.
 
-To rotate the bearer without a 401-flicker window: write `<new>,<old>` to the acceptor manifest's bearer line in `initial_state` (comma-separated), redeploy, distribute the new bearer to all consumers, then redeploy again with just `<new>`. The acceptor stores whatever line you give it; the api-handler accepts any comma-separated entry.
+To rotate the bearer without a 401-flicker window: re-seed the `api-bearer-token` store label with `<new>,<old>` (comma-separated — the api-handler accepts any comma-separated entry), distribute the new bearer to all consumers, then re-seed the label with just `<new>`. Rotation is a store re-seed now, not a manifest edit.
 
 ## 5. Build
 
@@ -105,7 +105,9 @@ If you don't use nix: `cargo build --release --target wasm32-unknown-unknown`, s
 
 ## 6. Deployment manifests
 
-The actor sources hardcode manifest paths under `/home/colin/work/actors/inbox/...`. On the deployment host, lay out the same directory structure and give each manifest the right `package = <nix-store-path>/inbox_<name>.wasm` line. The acceptor manifest also needs an `initial_state` field with the bearer token on the first line and the DKIM private key after it.
+The actor sources default their sub-manifest paths under `/home/colin/work/actors/inbox/...`. On the deployment host, lay out the same directory structure and give each manifest the right `package = <nix-store-path-or-https-url>/inbox_<name>.wasm` line.
+
+**Secrets are NOT in the manifest.** As of the secrets-reader flip, the acceptor no longer carries the bearer token or DKIM key in `initial_state`. Its `initial_state` is now a secret-free JSON config of manifest references, which keeps every manifest safe to publish (e.g. over http for pull-based deploys). The acceptor READS the secrets from the store at init and refuses to start if they are absent — so they must be seeded into the store once, out-of-band, before first start (see §6.1).
 
 A working acceptor manifest looks like:
 
@@ -114,33 +116,48 @@ name = "inbox-acceptor"
 version = "0.1.0"
 package = "/nix/store/XXXX-inbox-0.1.0/inbox_acceptor.wasm"
 
-initial_state = """\
-<bearer-token>
------BEGIN PRIVATE KEY-----
-MIIEvQIB...
-...
------END PRIVATE KEY-----
+# NON-SECRET config only — no bearer, no DKIM.
+initial_state = """
+{
+  "listen_addr": "0.0.0.0:443",
+  "api_handler_manifest": "/home/colin/work/actors/inbox/api-handler/manifest.toml",
+  "mailbox_manifest": "/home/colin/work/actors/inbox/mailbox/manifest.toml",
+  "router_manifest": "/home/colin/work/actors/inbox/mailbox-router/manifest.toml",
+  "smtp_acceptor_manifest": "/home/colin/work/actors/inbox/smtp-acceptor/manifest.toml",
+  "smtp_handler_manifest": "/home/colin/work/actors/inbox/smtp-handler/manifest.toml"
+}
 """
 
 [[handler]]
-type = "runtime"
+type = "self"
 
 [[handler]]
 type = "tcp"
 
 [[handler]]
-type = "supervisor"
+type = "runtime"
 
 [[handler]]
 type = "rpc"
 
 [[handler]]
 type = "store"
-base_path = "/var/lib/inbox/store"
+base_path = "/mnt/main-volume/inbox/store"
 store_id = "inbox"
+
+[permission_policy.runtime]
+type = "inherit"
 ```
 
-The mailbox, mailbox-router, and api-handler manifests also need the `store` handler entry (same `base_path` and `store_id`). The other manifests just need `package = ...` updated to the same nix-store path. See the canonical manifests in each actor's directory.
+(A production acceptor manifest additionally carries `[handler.server_tls]` on the tcp handler to terminate TLS on :443 — see the on-box manifest.)
+
+The mailbox, mailbox-router, and api-handler manifests also need the `store` handler entry (same `base_path` and `store_id`). The other manifests just need `package = ...` updated. See the canonical manifests in each actor's directory.
+
+### 6.1 Seed the secrets into the store (once, before first start)
+
+The bearer token and DKIM private key live in the store under labels `api-bearer-token` and `dkim-key` (raw bytes, content-addressed). On an EXISTING deployment they are already there (earlier acceptors populated them), so an in-place upgrade to the reader-acceptor needs no seed step — it finds them and comes up. On a FRESH or disaster-recovery box the store is empty and the reader-acceptor will hard-fail loudly at init until the two labels are seeded.
+
+Seeding is an operator step performed on-box from the secret sources (`/etc/inbox/api-token`, `/etc/inbox/dkim/private.pem`) — the values never travel through a published manifest. It writes each secret's raw bytes into the store's content-addressed layout (`data/<sha1(bytes)>`) and points the label at that hash, the same shape any store write produces. Keep the DKIM PEM's real newlines intact (unlike the old JSON `initial_state`, a raw store label needs no `\n`-escaping).
 
 A small script that updates package paths to the new build:
 

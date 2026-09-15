@@ -1,0 +1,34 @@
+name: spawn-verify
+
+# Setup-verify each actor composite on the pinned theater host (00b0bf93): runs
+# the SPAWN-TIME path (module_compile + interface-hash + handler wiring) via
+# `theater setup` (no init, no listeners), failing on the build-green/spawn-fail
+# class `nix build` can't catch — MissingInterfaceMetadata / InterfaceHashMismatch
+# / Failed-to-instantiate-Pack / unknown-import. NON-BLOCKING for the 0.24 cutover
+# (the manager's manual dev-box spawn-gate covers the first deploy); this becomes
+# the self-serve spawn gate for inbox spine work after. Co-designed with
+# theater-dev. Cannot go green until flake.lock resolves theater @00b0bf93
+# (dev-box regen) — expect the first run to also tune the manifest paths + grep.
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  spawn-verify:
+    name: theater setup each composite (00b0bf93)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+
+      - name: Build actor modules
+        run: nix build .#default
+
+      - name: Spawn-verify (theater setup, no-init)
+        run: nix develop --command bash ops/spawn-verify.sh result
