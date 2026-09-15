@@ -3,13 +3,13 @@ version = "0.1.0"
 package = "/home/colin/work/actors/inbox/target/wasm32-unknown-unknown/release/inbox_acceptor.wasm"
 
 [[handler]]
-type = "runtime"
+type = "self"
 
 [[handler]]
 type = "tcp"
 
 [[handler]]
-type = "supervisor"
+type = "runtime"
 
 [[handler]]
 type = "rpc"
@@ -18,3 +18,6 @@ type = "rpc"
 type = "store"
 base_path = "/mnt/main-volume/inbox/store"
 store_id = "inbox"
+
+[permission_policy.runtime]
+type = "inherit"

@@ -4,7 +4,7 @@ package = "/home/colin/work/actors/inbox/target/wasm32-unknown-unknown/release/i
 static_package = true
 
 [[handler]]
-type = "runtime"
+type = "self"
 
 [[handler]]
 type = "store"
