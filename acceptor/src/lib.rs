@@ -1,18 +1,25 @@
 //! Inbox acceptor.
 //!
-//! On startup: parses initial_state (JSON config with bearer + DKIM + 4
-//! sub-manifest references), persists secrets into the shared store, spawns the
-//! singleton mailbox-router and smtp-acceptor, binds the HTTP listener. On each
-//! TCP connection: spawns an api-handler and hands off the connection.
+//! On startup: parses initial_state (JSON config of NON-SECRET manifest refs),
+//! VERIFIES the bearer + DKIM secrets are already present in the shared store
+//! (gatekeeper — see below), spawns the singleton mailbox-router and
+//! smtp-acceptor, binds the HTTP listener. On each TCP connection: spawns an
+//! api-handler and hands off the connection.
 //!
 //! in-module-state model (packr 0.24): AcceptorState lives in a #[derive(State)]
 //! cell; exports no longer thread state. runtime->self; runtime.spawn returns
 //! result<string, runtime-error> (raw-Value decode); spawn/stop via runtime (post-#204).
 //!
-//! Expected initial_state (JSON string): { bearer_token, dkim_private_key,
-//! listen_addr, api_handler_manifest, mailbox_manifest, router_manifest,
-//! smtp_acceptor_manifest, smtp_handler_manifest }. Backward-compat: a
-//! "<bearer>\n<DKIM PEM>" string uses built-in default manifest refs + :443.
+//! SECRETS ARE STORE-SEEDED, NOT MANIFEST-CARRIED. The acceptor no longer OWNS
+//! bearer/dkim: they are seeded into the on-box store out-of-band (manager-owned,
+//! never over an http-published manifest). At init the acceptor is a READER +
+//! GATEKEEPER — it verifies both secret labels resolve to non-empty content and
+//! refuses to bring up the listener otherwise, so a missing/unseeded secret fails
+//! LOUD here at the singleton entry point rather than later inside a per-connection
+//! api-handler. This keeps EVERY manifest secret-free and http-publishable.
+//!
+//! Expected initial_state (JSON string): { listen_addr, api_handler_manifest,
+//! mailbox_manifest, router_manifest, smtp_acceptor_manifest, smtp_handler_manifest }.
 
 #![no_std]
 extern crate alloc;
@@ -62,7 +69,8 @@ pack_types! {
             stop-actor: func(id: string) -> result<_, runtime-error>,
         }
         theater:simple/store {
-            store-at-label: func(store-id: string, label: string, content: list<u8>) -> result<string, string>,
+            get-by-label: func(store-id: string, label: string) -> result<option<string>, string>,
+            get: func(store-id: string, content-ref: string) -> result<list<u8>, string>,
         }
     }
     exports {
@@ -106,23 +114,22 @@ fn supervisor_spawn(manifest: String, init_state: Option<Value>) -> Result<Strin
     }
 }
 
-#[import(module = "theater:simple/store", name = "store-at-label")]
-fn store_store_at_label(store_id: String, label: String, content: Vec<u8>) -> Result<String, String>;
+// Read-side store bindings. The acceptor no longer WRITES secrets (store-at-label
+// dropped) — the manager seeds them out-of-band; the acceptor only verifies them.
+#[import(module = "theater:simple/store", name = "get-by-label")]
+fn store_get_by_label(store_id: String, label: String) -> Result<Option<String>, String>;
 
-const DEFAULT_LISTEN_ADDR: &str = "0.0.0.0:443";
-const DEFAULT_API_HANDLER_MANIFEST: &str = "/home/colin/work/actors/inbox/api-handler/manifest.toml";
-const DEFAULT_MAILBOX_MANIFEST: &str = "/home/colin/work/actors/inbox/mailbox/manifest.toml";
-const DEFAULT_ROUTER_MANIFEST: &str = "/home/colin/work/actors/inbox/mailbox-router/manifest.toml";
-const DEFAULT_SMTP_ACCEPTOR_MANIFEST: &str = "/home/colin/work/actors/inbox/smtp-acceptor/manifest.toml";
+#[import(module = "theater:simple/store", name = "get")]
+fn store_get(store_id: String, content_ref: String) -> Result<Vec<u8>, String>;
 
 const STORE_ID: &str = "inbox";
 const DKIM_KEY_LABEL: &str = "dkim-key";
 const BEARER_TOKEN_LABEL: &str = "api-bearer-token";
 
+// initial_state config — NON-SECRET only (bearer/dkim live in the store, seeded
+// out-of-band by the manager). This makes the acceptor manifest http-publishable.
 #[derive(Deserialize)]
 struct Config {
-    bearer_token: String,
-    dkim_private_key: String,
     listen_addr: String,
     api_handler_manifest: String,
     mailbox_manifest: String,
@@ -147,78 +154,77 @@ fn err_str(msg: &str) -> Value {
     Value::Result { ok_type: Value::Tuple(vec![]).infer_type(), err_type: ValueType::String, value: Err(Box::new(e)) }
 }
 
+// GATEKEEPER: a secret must resolve to non-empty content in the store, or the
+// acceptor refuses to start. Mirrors the #75 store guard, but for a SECRET both
+// "absent" and "present-but-unreadable" are fatal — unlike the mailbox, absent is
+// NOT a valid "fresh" state (you cannot serve mail without bearer/dkim). Secrets
+// are stored as plain bytes (into_bytes, no CGRF), so presence + non-empty is the
+// whole check; the acceptor itself never uses the values (downstream actors read
+// them from the store), so we verify and discard.
+fn require_secret(label: &str) -> Result<(), String> {
+    match store_get_by_label(STORE_ID.into(), label.into()) {
+        Err(e) => Err(format!("store get-by-label('{}') failed: {}", label, e)),
+        Ok(None) => Err(format!(
+            "secret label '{}' is ABSENT from the store — refusing to start; the manager \
+             must seed bearer/dkim into the on-box store before first acceptor start",
+            label
+        )),
+        Ok(Some(content_ref)) => match store_get(STORE_ID.into(), content_ref) {
+            Err(e) => Err(format!("store get for secret '{}' failed: {}", label, e)),
+            Ok(bytes) if bytes.is_empty() => Err(format!(
+                "secret label '{}' is present but EMPTY — refusing to start",
+                label
+            )),
+            Ok(_) => Ok(()),
+        },
+    }
+}
+
 #[export(name = "theater:simple/actor.init")]
 fn init(config: Value) -> Value {
     log(String::from("[inbox-acceptor] init"));
 
     let raw = match config {
         Value::String(s) if !s.is_empty() => s,
-        _ => return err_str(
-            "acceptor needs initial_state as a non-empty string (JSON config or legacy '<bearer>\\n<DKIM PEM>')",
-        ),
+        _ => return err_str("acceptor needs initial_state as a non-empty JSON config string"),
     };
 
-    let (
-        bearer_token,
-        dkim_private_key,
+    let cfg: Config = match serde_json::from_str::<Config>(&raw) {
+        Ok(cfg) => cfg,
+        Err(e) => return err_str(&format!("initial_state is not valid JSON config: {}", e)),
+    };
+    if cfg.listen_addr.is_empty() {
+        return err_str("listen_addr must be non-empty");
+    }
+    if cfg.api_handler_manifest.is_empty()
+        || cfg.mailbox_manifest.is_empty()
+        || cfg.router_manifest.is_empty()
+        || cfg.smtp_acceptor_manifest.is_empty()
+        || cfg.smtp_handler_manifest.is_empty()
+    {
+        return err_str("all five *_manifest references must be non-empty");
+    }
+    let Config {
         listen_addr,
         api_handler_manifest,
         mailbox_manifest,
         router_manifest,
         smtp_acceptor_manifest,
-        smtp_handler_manifest_opt,
-    ) = if let Ok(cfg) = serde_json::from_str::<Config>(&raw) {
-        if cfg.bearer_token.is_empty() {
-            return err_str("bearer_token must be non-empty");
-        }
-        if cfg.dkim_private_key.is_empty() {
-            return err_str("dkim_private_key must be non-empty");
-        }
-        if cfg.listen_addr.is_empty() {
-            return err_str("listen_addr must be non-empty");
-        }
-        if cfg.api_handler_manifest.is_empty()
-            || cfg.mailbox_manifest.is_empty()
-            || cfg.router_manifest.is_empty()
-            || cfg.smtp_acceptor_manifest.is_empty()
-            || cfg.smtp_handler_manifest.is_empty()
-        {
-            return err_str("all five *_manifest references must be non-empty");
-        }
-        (
-            cfg.bearer_token,
-            cfg.dkim_private_key,
-            cfg.listen_addr,
-            cfg.api_handler_manifest,
-            cfg.mailbox_manifest,
-            cfg.router_manifest,
-            cfg.smtp_acceptor_manifest,
-            Some(cfg.smtp_handler_manifest),
-        )
-    } else {
-        match raw.split_once('\n') {
-            Some((t, rest)) if !t.is_empty() => (
-                t.to_string(),
-                rest.to_string(),
-                String::from(DEFAULT_LISTEN_ADDR),
-                String::from(DEFAULT_API_HANDLER_MANIFEST),
-                String::from(DEFAULT_MAILBOX_MANIFEST),
-                String::from(DEFAULT_ROUTER_MANIFEST),
-                String::from(DEFAULT_SMTP_ACCEPTOR_MANIFEST),
-                None,
-            ),
-            _ => return err_str(
-                "initial_state is neither valid JSON config nor legacy '<bearer-token>\\n<DKIM PEM>' shape",
-            ),
-        }
-    };
+        smtp_handler_manifest,
+    } = cfg;
 
-    if let Err(e) = store_store_at_label(STORE_ID.into(), BEARER_TOKEN_LABEL.into(), bearer_token.into_bytes()) {
-        return err_str(&format!("persist bearer token failed: {}", e));
+    // GATEKEEPER: secrets must already be seeded in the store (manager-owned, never
+    // in this http-publishable manifest). Fail LOUD if absent/empty/unreadable —
+    // never bring up the listener over missing bearer/dkim.
+    if let Err(e) = require_secret(BEARER_TOKEN_LABEL) {
+        return err_str(&e);
     }
-    if let Err(e) = store_store_at_label(STORE_ID.into(), DKIM_KEY_LABEL.into(), dkim_private_key.into_bytes()) {
-        return err_str(&format!("persist dkim key failed: {}", e));
+    if let Err(e) = require_secret(DKIM_KEY_LABEL) {
+        return err_str(&e);
     }
+    log(String::from(
+        "[inbox-acceptor] secrets verified present in store (bearer + dkim) — gatekeeper ok",
+    ));
 
     // Spawn the mailbox-router (owns address -> mailbox mapping; lazy-spawns).
     let router_id = match supervisor_spawn(router_manifest, Some(Value::String(mailbox_manifest))) {
@@ -233,17 +239,13 @@ fn init(config: Value) -> Value {
     };
     log(format!("[inbox-acceptor] HTTP listening on {} (id={})", listen_addr, listener_id));
 
-    // Spawn the SMTP acceptor. JSON config -> pass {router_id, smtp_handler_manifest};
-    // legacy -> pass the plain router id (smtp-acceptor uses its own default).
-    let smtp_init_state = match &smtp_handler_manifest_opt {
-        Some(handler_ref) => match serde_json::to_string(&SmtpInit {
-            router_id: &router_id,
-            smtp_handler_manifest: handler_ref,
-        }) {
-            Ok(s) => Value::String(s),
-            Err(e) => return err_str(&format!("serialize smtp-acceptor init failed: {}", e)),
-        },
-        None => Value::String(router_id.clone()),
+    // Spawn the SMTP acceptor with {router_id, smtp_handler_manifest}.
+    let smtp_init_state = match serde_json::to_string(&SmtpInit {
+        router_id: &router_id,
+        smtp_handler_manifest: &smtp_handler_manifest,
+    }) {
+        Ok(s) => Value::String(s),
+        Err(e) => return err_str(&format!("serialize smtp-acceptor init failed: {}", e)),
     };
     let smtp_acceptor_id = match supervisor_spawn(smtp_acceptor_manifest, Some(smtp_init_state)) {
         Ok(id) => id,
