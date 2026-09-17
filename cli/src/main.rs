@@ -273,7 +273,7 @@ fn run_reply(
     smtp: Option<&str>,
 ) -> Result<(), String> {
     let page: InboxPage = parse(
-        &http(ctx, "GET", &format!("/v1/mailboxes/{}/inbox?since=0", url_encode(from)), None)?,
+        &http(ctx, "GET", &format!("/v1/mailboxes/{}/inbox?since={}", url_encode(from), id.saturating_sub(1)), None)?,
         "/inbox",
     )?;
     let original = page
@@ -314,7 +314,7 @@ fn run_reply(
 
 fn run_forward(ctx: &Ctx, from: &str, id: u64, to: &[String], cc: &[String], note: Option<&str>) -> Result<(), String> {
     let page: InboxPage = parse(
-        &http(ctx, "GET", &format!("/v1/mailboxes/{}/inbox?since=0", url_encode(from)), None)?,
+        &http(ctx, "GET", &format!("/v1/mailboxes/{}/inbox?since={}", url_encode(from), id.saturating_sub(1)), None)?,
         "/inbox",
     )?;
     let original = page
@@ -399,8 +399,27 @@ fn http(ctx: &Ctx, method: &str, path: &str, body: Option<&str>) -> Result<Strin
         .map_err(|_| format!("invalid host: {host}"))?;
     let mut conn = rustls::ClientConnection::new(std::sync::Arc::new(config), server_name)
         .map_err(|e| format!("tls setup: {e}"))?;
-    let mut sock = std::net::TcpStream::connect((host.as_str(), port))
-        .map_err(|e| format!("connect {host}:{port}: {e}"))?;
+
+    // Resolve + connect with a timeout, retrying the connect ONCE. A connect-phase
+    // failure means no request bytes were sent, so a retry is safe for any method
+    // (no risk of double-sending a POST). Read/write timeouts stop a hung server
+    // from wedging the CLI forever -- important in a Monitor poll-loop, where a
+    // hang reads as a silently-dark agent.
+    let connect_timeout = std::time::Duration::from_secs(10);
+    let io_timeout = std::time::Duration::from_secs(30);
+    let addr = std::net::ToSocketAddrs::to_socket_addrs(&(host.as_str(), port))
+        .map_err(|e| format!("resolve {host}:{port}: {e}"))?
+        .next()
+        .ok_or_else(|| format!("no address for {host}:{port}"))?;
+    let mut sock = match std::net::TcpStream::connect_timeout(&addr, connect_timeout) {
+        Ok(s) => s,
+        Err(_) => std::net::TcpStream::connect_timeout(&addr, connect_timeout)
+            .map_err(|e| format!("connect {host}:{port} (after 1 retry): {e}"))?,
+    };
+    sock.set_read_timeout(Some(io_timeout))
+        .map_err(|e| format!("set read timeout: {e}"))?;
+    sock.set_write_timeout(Some(io_timeout))
+        .map_err(|e| format!("set write timeout: {e}"))?;
     let mut tls = rustls::Stream::new(&mut conn, &mut sock);
 
     tls.write_all(req.as_bytes())
@@ -416,6 +435,14 @@ fn http(ctx: &Ctx, method: &str, path: &str, body: Option<&str>) -> Result<Strin
             Ok(0) => break,
             Ok(n) => buf.extend_from_slice(&chunk[..n]),
             Err(ref e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(ref e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                // A read timeout mid-response = incomplete; error rather than
+                // return a truncated body (do NOT tolerate like an unclean close).
+                return Err(format!("read timed out after {}s", io_timeout.as_secs()));
+            }
             Err(e) => {
                 if buf.is_empty() {
                     return Err(format!("read response: {e}"));
