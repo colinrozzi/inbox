@@ -1,0 +1,7 @@
+[
+  { "actor": "api-handler",    "dir": "api-handler",    "wasm": "inbox_api_handler",    "tls": "client" },
+  { "actor": "mailbox",        "dir": "mailbox",        "wasm": "inbox_mailbox",        "tls": ""       },
+  { "actor": "mailbox-router", "dir": "mailbox-router", "wasm": "inbox_mailbox_router", "tls": ""       },
+  { "actor": "smtp-acceptor",  "dir": "smtp-acceptor",  "wasm": "inbox_smtp_acceptor",  "tls": ""       },
+  { "actor": "smtp-handler",   "dir": "smtp-handler",   "wasm": "inbox_smtp_handler",   "tls": "server" }
+]

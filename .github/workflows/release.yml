@@ -75,34 +75,28 @@ jobs:
           done
 
           # 2) Sub-manifest TOMLs for the five sub-actors, DERIVED from the
-          #    in-repo <actor>/manifest.toml (the tested post-cutover truth) so
-          #    they can never drift: copy the manifest, repoint `package` at
-          #    this release's matching wasm asset (static_package=true), and
-          #    inject the deploy-only TLS stanzas the in-repo skeletons omit
-          #    (client_tls on api-handler for outbound STARTTLS; server_tls on
-          #    smtp-handler for :25 STARTTLS). Handler sets + permission_policy
-          #    come straight from the in-repo manifests -- no hand-maintained
-          #    copies to rot. (The old heredocs had fallen ~3 revs behind: a
-          #    dead `supervisor` handler, a missing `self`, a wrong `runtime`.)
-          derive_manifest() {
-            local actor_dir="$1" wasm_name="$2" tls="$3" out="$4"
-            local url="https://github.com/${REPO}/releases/download/${TAG}/${wasm_name}-${STAGE_TAG}.wasm"
-            awk -v url="$url" -v tls="$tls" '
-              /^package = /        { print "package = \"" url "\""; print "static_package = true"; next }
-              /^static_package = / { next }
-              { print }
-              /^type = "tcp"$/ {
-                if (tls == "client") { print ""; print "[handler.client_tls]"; print "enabled = true"; print "auto_handshake = false" }
-                else if (tls == "server") { print ""; print "[handler.server_tls]"; print "enabled = true"; print "cert = \"/etc/letsencrypt/live/mail.colinrozzi.com/fullchain.pem\""; print "key = \"/etc/letsencrypt/live/mail.colinrozzi.com/privkey.pem\"" }
-              }
-            ' "${actor_dir}/manifest.toml" > "$out"
+          #    in-repo <actor>/manifest.toml (the tested source of truth) via the
+          #    shared ops/derive-manifest.sh: repoint `package` at this release's
+          #    wasm asset (static_package=true) + inject the deploy-only TLS
+          #    stanzas the skeletons omit. Handler sets + permission_policy come
+          #    straight from the in-repo manifests, so they can't drift. The SAME
+          #    script + ops/inbox-actors.json (the canonical actor set) are reused
+          #    by the fleet store's `store publish` with a store package_ref --
+          #    one transform, no forks.
+          while read -r actor dir wasm tls; do
+            url="https://github.com/${REPO}/releases/download/${TAG}/${wasm}-${STAGE_TAG}.wasm"
+            out="inbox-${actor}-${STAGE_TAG}.toml"
+            sh ops/derive-manifest.sh "$dir" "$tls" "$url" > "$out"
             ASSETS+=("$out")
-          }
-          derive_manifest api-handler    inbox_api_handler    client "inbox-api-handler-${STAGE_TAG}.toml"
-          derive_manifest mailbox        inbox_mailbox        ""     "inbox-mailbox-${STAGE_TAG}.toml"
-          derive_manifest mailbox-router inbox_mailbox_router ""     "inbox-mailbox-router-${STAGE_TAG}.toml"
-          derive_manifest smtp-acceptor  inbox_smtp_acceptor  ""     "inbox-smtp-acceptor-${STAGE_TAG}.toml"
-          derive_manifest smtp-handler   inbox_smtp_handler   server "inbox-smtp-handler-${STAGE_TAG}.toml"
+          done < <(jq -r '.[] | "\(.actor) \(.dir) \(.wasm) \(.tls)"' ops/inbox-actors.json)
+
+          # Index so consumers (store publish, etc.) can iterate the published set
+          # without hardcoding names.
+          INDEX="inbox-manifest-index-${STAGE_TAG}.json"
+          jq --arg st "${STAGE_TAG}" \
+            '[.[] | {actor, wasm: "\(.wasm)-\($st).wasm", manifest: "inbox-\(.actor)-\($st).toml", tls}]' \
+            ops/inbox-actors.json > "$INDEX"
+          ASSETS+=("$INDEX")
 
           # 3) Bundle of all six actor modules (humans / local use) + sha256.
           STAGE="inbox-${STAGE_TAG}-wasm32"
