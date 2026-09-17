@@ -286,9 +286,84 @@ fn init(config: Value) -> Value {
     ok_unit()
 }
 
+/// Max total request size we'll buffer — a DoS guard on the read loop below.
+/// (The old single 65536-byte read implicitly capped there by TRUNCATING; this
+/// reads the whole request but bounds it explicitly instead.) Generous for mail;
+/// bump if large attachments ever need it.
+const MAX_REQUEST_BYTES: usize = 10 * 1024 * 1024;
+
+/// Index just past the "\r\n\r\n" header/body separator, or None if not seen yet.
+fn find_headers_end(buf: &[u8]) -> Option<usize> {
+    buf.windows(4).position(|w| w == b"\r\n\r\n").map(|i| i + 4)
+}
+
+/// Content-Length header value (case-insensitive) from the header bytes.
+/// Absent or unparseable => 0 (e.g. a GET carries no body).
+fn parse_content_length(headers: &[u8]) -> usize {
+    let text = match core::str::from_utf8(headers) {
+        Ok(t) => t,
+        Err(_) => return 0,
+    };
+    for line in text.lines() {
+        if let Some((name, value)) = line.split_once(':') {
+            if name.trim().eq_ignore_ascii_case("content-length") {
+                return value.trim().parse::<usize>().unwrap_or(0);
+            }
+        }
+    }
+    0
+}
+
+/// Read a COMPLETE HTTP/1.1 request off the connection. A single tcp_receive
+/// returns only the first chunk (one TLS record), so a body spanning multiple
+/// records was being silently truncated (the fleet-wide long-body data loss).
+/// Loop until the headers are fully in AND the Content-Length body has arrived.
+/// On a receive error, EOF before completion, or oversize, return Err — the
+/// caller replies 400 rather than acting on a partial/empty request (the old
+/// `.unwrap_or_default()` silently treated both as an empty request).
+fn read_full_request(connection_id: &str) -> Result<Vec<u8>, String> {
+    let mut buf = Vec::new();
+    let mut header_info: Option<(usize, usize)> = None; // (headers_end, content_length)
+    loop {
+        let chunk = tcp_receive(connection_id.to_string(), 65536)
+            .map_err(|e| format!("receive failed: {}", e))?;
+        if chunk.is_empty() {
+            return Err(if buf.is_empty() {
+                String::from("connection closed before any request bytes")
+            } else {
+                String::from("connection closed before request complete")
+            });
+        }
+        buf.extend_from_slice(&chunk);
+        if buf.len() > MAX_REQUEST_BYTES {
+            return Err(format!("request exceeds max size ({} bytes)", MAX_REQUEST_BYTES));
+        }
+        if header_info.is_none() {
+            if let Some(headers_end) = find_headers_end(&buf) {
+                header_info = Some((headers_end, parse_content_length(&buf[..headers_end])));
+            }
+        }
+        if let Some((headers_end, content_length)) = header_info {
+            if buf.len() - headers_end >= content_length {
+                return Ok(buf);
+            }
+        }
+    }
+}
+
 #[export(name = "theater:simple/tcp-client.handle-connection-transfer")]
 fn handle_connection_transfer(connection_id: String) -> Value {
-    let request = tcp_receive(connection_id.clone(), 65536).unwrap_or_default();
+    let request = match read_full_request(&connection_id) {
+        Ok(req) => req,
+        Err(e) => {
+            log(format!("[inbox-api] request read failed: {}", e));
+            let resp = error_response(400, "incomplete or unreadable request");
+            let _ = tcp_send(connection_id.clone(), resp);
+            let _ = tcp_close(connection_id);
+            let _ = shutdown(None);
+            return ok_unit();
+        }
+    };
 
     let response = HandlerState::with(|s| {
         route(&request, &s.router_id, &s.dkim_private_key_pem, &s.bearer_token)
