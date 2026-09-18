@@ -100,6 +100,11 @@
         # needed on PATH.
         packages.default = craneLib.buildPackage (commonArgs // {
           inherit cargoArtifacts;
+          # Baked into the api-handler by build.rs -> GET /version (deploy-freshness
+          # check). self.rev = the git commit of a clean (CI/tag) build; "dirty"
+          # for a local working-tree build. Scoped here (not commonArgs) so it only
+          # touches the wasm build, not clippy/fmt.
+          INBOX_BUILD_ID = self.rev or "dirty";
           nativeBuildInputs = [ pkgs.wasm-tools ];
           installPhaseCommand = ''
             mkdir -p $out
