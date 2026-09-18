@@ -222,6 +222,11 @@ struct ErrorBody<'a> {
 }
 
 /// 400/4xx/5xx response with `{"error": ...}`.
+/// Build id baked at compile time by build.rs (from $INBOX_BUILD_ID, else
+/// "unspecified"). Exposed via GET /version so a deploy can verify the running
+/// build. build.rs always sets the env, so env! resolves.
+const BUILD_ID: &str = env!("INBOX_BUILD_ID");
+
 fn error_response(status: u16, error: &str) -> Vec<u8> {
     let body = serde_json::to_vec(&ErrorBody { error })
         .unwrap_or_else(|_| br#"{"error":"serialization failed"}"#.to_vec());
@@ -411,6 +416,23 @@ fn route(
         Some(i) => (&path_and_query[..i], &path_and_query[i + 1..]),
         None => (path_and_query, ""),
     };
+
+    // GET /version — the running build id, for deploy-freshness verification: the
+    // deploy script queries it post-restart and FAILS LOUD if it isn't the
+    // just-published build (the running code attesting itself — robust to any
+    // cache/resolve path). Authed like every route; build id baked at compile time
+    // via build.rs (-> INBOX_BUILD_ID).
+    if method == "GET" && path == "/version" {
+        #[derive(Serialize)]
+        struct Version {
+            build_id: &'static str,
+            actor: &'static str,
+        }
+        return json_response(
+            200,
+            &Version { build_id: BUILD_ID, actor: "inbox-api-handler" },
+        );
+    }
 
     // POST /v1/mailboxes — register a new address.
     if method == "POST" && path == "/v1/mailboxes" {
