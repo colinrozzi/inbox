@@ -300,7 +300,9 @@ fn extract_address(line: &str, marker: &str) -> Option<String> {
 fn read_data_block(conn: &str) -> Result<String, String> {
     let mut out = String::new();
     loop {
-        let line = read_line(conn)?;
+        // DATA body lines can be long (base64 blob / minified paste); cap at the
+        // advertised message SIZE, not the tight command cap.
+        let line = read_line_capped(conn, MAX_DATA_LINE)?;
         // Trim only the trailing CRLF, keep internal whitespace.
         let line = line.trim_end_matches('\n').trim_end_matches('\r');
         if line == "." {
@@ -587,7 +589,22 @@ fn send_line(conn: &str, line: &str) -> Result<(), String> {
         .map_err(|e| format!("send failed: {}", e))
 }
 
+// SMTP command lines are short (RFC 5321 caps them near 512), so a huge command
+// line is abuse -> keep a tight cap. DATA body lines, however, are legitimately
+// long: an unwrapped base64 blob, a long URL, or a minified paste is a single
+// line that can run up to the advertised message SIZE. The old flat 4096 cap
+// applied to BOTH, so any single body line >=~4KB was rejected "line too long"
+// -> the handler closed the connection -> the sender saw a 502
+// ("connection closed before reply complete") on a single-long-line body while
+// multi-line bodies of any size were fine (each line < 4096).
+const MAX_COMMAND_LINE: usize = 4096;
+const MAX_DATA_LINE: usize = 10 * 1024 * 1024; // matches the advertised 250-SIZE 10485760
+
 fn read_line(conn: &str) -> Result<String, String> {
+    read_line_capped(conn, MAX_COMMAND_LINE)
+}
+
+fn read_line_capped(conn: &str, max_len: usize) -> Result<String, String> {
     let mut buf = Vec::new();
     loop {
         let chunk = tcp_receive(conn.to_string(), 1)
@@ -599,7 +616,7 @@ fn read_line(conn: &str) -> Result<String, String> {
         if buf.ends_with(b"\n") {
             break;
         }
-        if buf.len() > 4096 {
+        if buf.len() > max_len {
             return Err(String::from("line too long"));
         }
     }
