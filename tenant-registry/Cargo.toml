@@ -1,0 +1,17 @@
+[package]
+name = "inbox-tenant-registry"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+packr-guest = { version = "0.24", features = ["derive"] }
+packr-abi = { version = "0.24", default-features = false }
+theater-guest = { git = "https://github.com/colinrozzi/theater", rev = "cfcd737606758d388ab9d7042932d13e8da23a76" }
+# Token hashing (D8: store sha256(token), never plaintext) + hand-rolled HMAC-SHA256
+# for deterministic, replay-safe token generation from a store-seeded secret. sha2
+# is already in the workspace lock (api-handler DKIM) and is pure-Rust no_std → the
+# wasm stays self-contained (host imports only).
+sha2 = { version = "0.10", default-features = false }

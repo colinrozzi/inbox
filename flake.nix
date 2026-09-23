@@ -114,7 +114,8 @@
               inbox_mailbox \
               inbox_mailbox_router \
               inbox_smtp_acceptor \
-              inbox_smtp_handler
+              inbox_smtp_handler \
+              inbox_tenant_registry
             do
               wasm="target/wasm32-unknown-unknown/release/$name.wasm"
               wasm-tools validate "$wasm"
