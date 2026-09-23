@@ -99,6 +99,16 @@ echo "== register: can't claim another tenant's address, nor a reserved one =="
 status "A re-claims B addr -> 409"        409 "$TOKEN_A" POST "/v1/mailboxes" "{\"address\":\"$ADDR_B\"}"
 status "A claims reserved  -> 409"        409 "$TOKEN_A" POST "/v1/mailboxes" "{\"address\":\"$RESERVED\"}"
 
+echo "== FIX 1 regression: a case-variant of another tenant's address must COLLIDE, not twin =="
+# Pre-FIX-1 this returned 201 (a second Binding{tenant:B} + mailbox — the exact
+# cross-tenant hole the review found). After FIX 1 the router canonicalizes, so B
+# claiming a mis-cased variant of A's address collides on the one-tenant invariant.
+ADDR_A_CV="${ADDR_A_CV:-$(printf '%s' "$ADDR_A" | tr '[:lower:]' '[:upper:]')}"
+status "B claims A addr mis-cased -> 409" 409 "$TOKEN_B" POST "/v1/mailboxes" "{\"address\":\"$ADDR_A_CV\"}"
+# NOT curl-testable here (SMTP): after FIX 1, inbound RCPT to a mis-cased variant of
+# A's address must resolve to A's single canonical mailbox, never a B twin. Verify
+# with an SMTP send to the mis-cased address on the dev box.
+
 echo "== auth: unknown token is rejected =="
 status "bad token -> 401"                 401 "$BAD"     GET  "/v1/mailboxes/$ADDR_A/inbox?since=0"
 status "no-address list w/ bad token 401" 401 "$BAD"     GET  "/v1/mailboxes"
