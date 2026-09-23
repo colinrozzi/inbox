@@ -37,8 +37,14 @@ mod rfc2822;
 #[derive(Clone, GraphValue, State)]
 pub struct HandlerState {
     pub router_id: String,
+    /// tenant-registry actor id, "" if not wired (legacy single-tenant). Empty =>
+    /// enforcement can never engage, whatever the flag says.
+    pub registry_id: String,
     pub dkim_private_key_pem: String,
     pub bearer_token: String,
+    /// Multi-tenant enforcement engaged (registry wired AND the store flag set).
+    /// When false, the legacy shared-bearer path runs unchanged.
+    pub enforce: bool,
 }
 
 pack_types! {
@@ -108,6 +114,10 @@ fn timer_now() -> u64;
 const STORE_ID: &str = "inbox";
 const DKIM_KEY_LABEL: &str = "dkim-key";
 const BEARER_TOKEN_LABEL: &str = "api-bearer-token";
+// Multi-tenant enforcement flag. Read at init (per-connection actor), so flipping
+// the store label takes effect on the next connection — no redeploy. "1" = on;
+// absent/anything-else = off (legacy shared-bearer behavior).
+const TENANCY_ENFORCE_LABEL: &str = "tenancy-enforce";
 
 // ============================================================================
 // API request/response types — all JSON shapes the handler reads or writes.
@@ -273,11 +283,32 @@ fn err_str(msg: &str) -> Value {
     Value::Result { ok_type: Value::Tuple(alloc::vec![]).infer_type(), err_type: ValueType::String, value: Err(Box::new(e)) }
 }
 
+/// api-handler init_state (multi-tenant). `registry_id` defaults empty for a bare
+/// legacy router_id string / a pre-tenancy acceptor.
+#[derive(serde::Deserialize)]
+struct HandlerInit {
+    router_id: String,
+    #[serde(default)]
+    registry_id: String,
+}
+
+/// True iff the store label holds exactly "1". Absent/unreadable => false.
+fn flag_enabled(label: &str) -> bool {
+    matches!(load_label_as_string(label), Ok(v) if v.trim() == "1")
+}
+
 #[export(name = "theater:simple/actor.init")]
 fn init(config: Value) -> Value {
-    let router_id = match config {
+    let raw = match config {
         Value::String(s) => s,
-        _ => return err_str("api-handler init: expected init_state = string (router actor id)"),
+        _ => return err_str("api-handler init: expected init_state string"),
+    };
+    // Accept {"router_id":..,"registry_id":..} (multi-tenant) OR a bare router_id
+    // string (legacy, from a pre-tenancy acceptor). A missing/empty registry_id
+    // keeps enforcement permanently off, so a partial deploy can't half-enable it.
+    let (router_id, registry_id) = match serde_json::from_str::<HandlerInit>(&raw) {
+        Ok(h) => (h.router_id, h.registry_id),
+        Err(_) => (raw, String::new()),
     };
     let dkim_private_key_pem = match load_label_as_string(DKIM_KEY_LABEL) {
         Ok(s) => s,
@@ -287,7 +318,9 @@ fn init(config: Value) -> Value {
         Ok(s) => s,
         Err(e) => return err_str(&e),
     };
-    HandlerState::set(HandlerState { router_id, dkim_private_key_pem, bearer_token });
+    // Enforce only when a registry is wired AND the store flag is "1".
+    let enforce = !registry_id.is_empty() && flag_enabled(TENANCY_ENFORCE_LABEL);
+    HandlerState::set(HandlerState { router_id, registry_id, dkim_private_key_pem, bearer_token, enforce });
     ok_unit()
 }
 
@@ -371,7 +404,7 @@ fn handle_connection_transfer(connection_id: String) -> Value {
     };
 
     let response = HandlerState::with(|s| {
-        route(&request, &s.router_id, &s.dkim_private_key_pem, &s.bearer_token)
+        route(&request, &s.router_id, &s.registry_id, &s.dkim_private_key_pem, &s.bearer_token, s.enforce)
     });
 
     if let Err(e) = tcp_send(connection_id.clone(), response) {
@@ -390,23 +423,22 @@ fn handle_connection_transfer(connection_id: String) -> Value {
 fn route(
     request: &[u8],
     router_id: &str,
+    registry_id: &str,
     dkim_private_key_pem: &str,
     bearer_token: &str,
+    enforce: bool,
 ) -> Vec<u8> {
     let request_str = match core::str::from_utf8(request) {
         Ok(s) => s,
         Err(_) => return error_response(400, "non-utf8 request"),
     };
 
-    let presented = extract_bearer(request_str);
-    if !bearer_token
-        .split(',')
-        .map(str::trim)
-        .filter(|t| !t.is_empty())
-        .any(|t| presented == Some(t))
-    {
-        return error_response(401, "unauthorized");
-    }
+    // Authenticate: legacy shared-token, or (when enforcing) resolve the bearer to
+    // a tenant + capabilities via the registry.
+    let caller = match authenticate(request_str, bearer_token, registry_id, enforce) {
+        Ok(c) => c,
+        Err(resp) => return resp,
+    };
 
     let first_line = request_str.lines().next().unwrap_or("");
     let mut parts = first_line.split(' ');
@@ -436,12 +468,12 @@ fn route(
 
     // POST /v1/mailboxes — register a new address.
     if method == "POST" && path == "/v1/mailboxes" {
-        return handle_register_mailbox(request_str, router_id);
+        return handle_register_mailbox(request_str, router_id, &caller);
     }
 
     // GET /v1/mailboxes — list registered addresses.
     if method == "GET" && path == "/v1/mailboxes" {
-        return handle_list_mailboxes(router_id);
+        return handle_list_mailboxes(router_id, &caller);
     }
 
     // /v1/mailboxes/<address>/...
@@ -454,10 +486,9 @@ fn route(
         let address = url_decode(address_enc);
 
         // Resolve the address → mailbox id via the router.
-        let mailbox_id = match resolve_mailbox(router_id, &address) {
-            Ok(Some(id)) => id,
-            Ok(None) => return error_response(404, &format!("unknown address: {}", address)),
-            Err(e) => return error_response(500, &format!("router rpc failed: {}", e)),
+        let mailbox_id = match resolve_for_caller(router_id, &address, &caller) {
+            Ok(id) => id,
+            Err(resp) => return resp,
         };
 
         return match (method, sub) {
@@ -478,8 +509,141 @@ fn route(
     error_response(404, "not found")
 }
 
-/// `POST /v1/mailboxes` — register a new address.
-fn handle_register_mailbox(request_str: &str, router_id: &str) -> Vec<u8> {
+/// Who is making this request. `Legacy` = the shared bearer token validated
+/// (single-tenant behavior — unchanged). `Tenant` = the bearer resolved to a
+/// tenant + its capability set via the registry (enforcement on).
+enum Caller {
+    Legacy,
+    Tenant { id: String, caps: Vec<String> },
+}
+
+impl Caller {
+    fn has_cap(&self, cap: &str) -> bool {
+        match self {
+            Caller::Legacy => true,
+            Caller::Tenant { caps, .. } => caps.iter().any(|c| c == cap),
+        }
+    }
+}
+
+/// Authenticate the request. Legacy: match the presented bearer against the shared
+/// token(s). Enforcing: resolve the bearer to a tenant via the registry. Returns a
+/// 401 response on failure. Fails closed.
+fn authenticate(request_str: &str, bearer_token: &str, registry_id: &str, enforce: bool) -> Result<Caller, Vec<u8>> {
+    let presented = extract_bearer(request_str);
+    if enforce {
+        let token = match presented {
+            Some(t) => t,
+            None => return Err(error_response(401, "unauthorized")),
+        };
+        match registry_resolve(registry_id, token) {
+            Some((id, caps)) => Ok(Caller::Tenant { id, caps }),
+            None => Err(error_response(401, "unauthorized")),
+        }
+    } else {
+        let ok = bearer_token
+            .split(',')
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .any(|t| presented == Some(t));
+        if ok {
+            Ok(Caller::Legacy)
+        } else {
+            Err(error_response(401, "unauthorized"))
+        }
+    }
+}
+
+/// Resolve a bearer token -> (tenant_id, caps) via the registry. None = unknown /
+/// revoked / rpc failure (all unauthenticated — fail closed).
+fn registry_resolve(registry_id: &str, token: &str) -> Option<(String, Vec<String>)> {
+    let result = rpc_call(
+        registry_id.to_string(),
+        String::from("theater:inbox/registry.resolve"),
+        Value::Tuple(alloc::vec![Value::String(token.to_string())]),
+        Value::Tuple(alloc::vec![]),
+    );
+    match unwrap_rpc_result(result) {
+        Some(Value::Option { value: Some(inner), .. }) => match *inner {
+            Value::Record { fields, .. } => {
+                let id = record_string(&fields, "tenant_id")?;
+                Some((id, record_string_list(&fields, "caps")))
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Read a string field from a packr Record by name, tolerant of snake_case vs
+/// kebab-case field encoding.
+fn record_string(fields: &[(String, Value)], key: &str) -> Option<String> {
+    let kebab = key.replace('_', "-");
+    fields
+        .iter()
+        .find(|(k, _)| k == key || k == &kebab)
+        .and_then(|(_, v)| if let Value::String(s) = v { Some(s.clone()) } else { None })
+}
+
+/// Read a list-of-string field from a packr Record by name (same key tolerance).
+fn record_string_list(fields: &[(String, Value)], key: &str) -> Vec<String> {
+    let kebab = key.replace('_', "-");
+    fields
+        .iter()
+        .find(|(k, _)| k == key || k == &kebab)
+        .and_then(|(_, v)| {
+            if let Value::List { items, .. } = v {
+                Some(items.iter().filter_map(|i| if let Value::String(s) = i { Some(s.clone()) } else { None }).collect())
+            } else {
+                None
+            }
+        })
+        .unwrap_or_default()
+}
+
+/// Resolve an address -> mailbox id for a request, enforcing ownership when the
+/// caller is a tenant. Legacy resolves any address. A tenant that doesn't control
+/// the address gets 404 (never 403 — never reveal existence).
+fn resolve_for_caller(router_id: &str, address: &str, caller: &Caller) -> Result<String, Vec<u8>> {
+    match caller {
+        Caller::Legacy => match resolve_mailbox(router_id, address) {
+            Ok(Some(id)) => Ok(id),
+            Ok(None) => Err(error_response(404, &format!("unknown address: {}", address))),
+            Err(e) => Err(error_response(500, &format!("router rpc failed: {}", e))),
+        },
+        Caller::Tenant { id: tenant, .. } => match resolve_owned(router_id, address) {
+            Ok(Some((mailbox_id, owner))) if &owner == tenant => Ok(mailbox_id),
+            Ok(Some(_)) | Ok(None) => Err(error_response(404, &format!("unknown address: {}", address))),
+            Err(e) => Err(error_response(500, &format!("router rpc failed: {}", e))),
+        },
+    }
+}
+
+/// Resolve an address -> (mailbox_id, controlling_tenant) via the router's
+/// owner-aware lookup. None for unknown addresses.
+fn resolve_owned(router_id: &str, address: &str) -> Result<Option<(String, String)>, String> {
+    let result = rpc_call(
+        router_id.to_string(),
+        String::from("theater:inbox/router.lookup-owned"),
+        Value::Tuple(alloc::vec![Value::String(address.to_string())]),
+        Value::Tuple(alloc::vec![]),
+    );
+    match unwrap_rpc_result(result) {
+        Some(Value::Option { value: Some(inner), .. }) => match *inner {
+            Value::Record { fields, .. } => {
+                let mailbox_id = record_string(&fields, "mailbox_id").ok_or_else(|| String::from("lookup-owned: missing mailbox_id"))?;
+                let tenant = record_string(&fields, "tenant").unwrap_or_default();
+                Ok(Some((mailbox_id, tenant)))
+            }
+            _ => Err(String::from("unexpected lookup-owned response shape")),
+        },
+        Some(Value::Option { value: None, .. }) => Ok(None),
+        _ => Err(String::from("router rpc failed")),
+    }
+}
+
+/// `POST /v1/mailboxes` — register/claim an address.
+fn handle_register_mailbox(request_str: &str, router_id: &str, caller: &Caller) -> Vec<u8> {
     let req: NewMailboxRequest = match parse_body(request_str) {
         Ok(r) => r,
         Err(resp) => return resp,
@@ -488,34 +652,53 @@ fn handle_register_mailbox(request_str: &str, router_id: &str) -> Vec<u8> {
         return error_response(400, "address is required");
     }
 
-    let result = rpc_call(
-        router_id.to_string(),
-        String::from("theater:inbox/router.register"),
-        Value::Tuple(alloc::vec![Value::String(req.address.clone())]),
-        Value::Tuple(alloc::vec![]),
-    );
-    let mailbox_id = match unwrap_rpc_result(result) {
-        Some(Value::String(id)) => id,
-        _ => return error_response(500, "router rpc failed"),
-    };
-
-    json_response(
-        201,
-        &MailboxInfo {
-            address: req.address,
-            mailbox_id,
-        },
-    )
+    match caller {
+        // Legacy single-tenant register (owner-less), unchanged.
+        Caller::Legacy => {
+            let result = rpc_call(
+                router_id.to_string(),
+                String::from("theater:inbox/router.register"),
+                Value::Tuple(alloc::vec![Value::String(req.address.clone())]),
+                Value::Tuple(alloc::vec![]),
+            );
+            match unwrap_rpc_result(result) {
+                Some(Value::String(mailbox_id)) => json_response(201, &MailboxInfo { address: req.address, mailbox_id }),
+                _ => error_response(500, "router rpc failed"),
+            }
+        }
+        // Tenant: creating a mailbox is a control-plane act — needs `admin`. The
+        // router stamps ownership + enforces reserved-list & one-tenant-per-mailbox.
+        Caller::Tenant { id, .. } => {
+            if !caller.has_cap("admin") {
+                return error_response(403, "admin capability required to register an address");
+            }
+            let result = rpc_call(
+                router_id.to_string(),
+                String::from("theater:inbox/router.register-owned"),
+                Value::Tuple(alloc::vec![Value::String(req.address.clone()), Value::String(id.clone())]),
+                Value::Tuple(alloc::vec![]),
+            );
+            match unwrap_rpc_result(result) {
+                Some(Value::String(mailbox_id)) => json_response(201, &MailboxInfo { address: req.address, mailbox_id }),
+                // register-owned's Err (reserved / already controlled) collapses to
+                // None here -> 409. (A spawn failure also lands here; rare.)
+                _ => error_response(409, "address unavailable (reserved or already claimed)"),
+            }
+        }
+    }
 }
 
-/// `GET /v1/mailboxes` — list all registered addresses.
-fn handle_list_mailboxes(router_id: &str) -> Vec<u8> {
-    let result = rpc_call(
-        router_id.to_string(),
-        String::from("theater:inbox/router.list"),
-        Value::Tuple(alloc::vec![]),
-        Value::Tuple(alloc::vec![]),
-    );
+/// `GET /v1/mailboxes` — list addresses (all for legacy; the caller tenant's when
+/// enforcing).
+fn handle_list_mailboxes(router_id: &str, caller: &Caller) -> Vec<u8> {
+    let (function, params) = match caller {
+        Caller::Legacy => (String::from("theater:inbox/router.list"), Value::Tuple(alloc::vec![])),
+        Caller::Tenant { id, .. } => (
+            String::from("theater:inbox/router.list-by-tenant"),
+            Value::Tuple(alloc::vec![Value::String(id.clone())]),
+        ),
+    };
+    let result = rpc_call(router_id.to_string(), function, params, Value::Tuple(alloc::vec![]));
     let bindings = match unwrap_rpc_result(result) {
         Some(Value::List { items, .. }) => items,
         _ => return error_response(500, "router rpc failed"),
@@ -1040,6 +1223,8 @@ fn http_response(status: u16, content_type: &str, body: Vec<u8>) -> Vec<u8> {
         400 => "Bad Request",
         401 => "Unauthorized",
         404 => "Not Found",
+        403 => "Forbidden",
+        409 => "Conflict",
         500 => "Internal Server Error",
         _ => "OK",
     };
