@@ -112,6 +112,23 @@ fn is_reserved(address: &str) -> bool {
     RESERVED_LOCAL_PARTS.iter().any(|r| local.eq_ignore_ascii_case(r))
 }
 
+/// Canonical address form for ownership + routing: lowercase the whole address.
+/// Applied on every write AND every lookup so two case-variants can never be owned
+/// or routed as distinct identities (isolation review FIX 1 — the byte-exact
+/// compare let tenant B register Bob@ against A's bob@ and harvest mis-cased mail).
+fn canon(address: &str) -> String {
+    address.to_ascii_lowercase()
+}
+
+/// Minimal address sanity for claiming: exactly one '@', non-empty local + domain,
+/// no whitespace. Bounds the otherwise-unbounded claimable space (review FIX 1).
+fn valid_address(a: &str) -> bool {
+    let mut parts = a.split('@');
+    let local = parts.next().unwrap_or("");
+    let domain = parts.next().unwrap_or("");
+    parts.next().is_none() && !local.is_empty() && !domain.is_empty() && !a.contains(char::is_whitespace)
+}
+
 #[import(module = "theater:simple/self", name = "log")]
 fn log(msg: String);
 
@@ -230,7 +247,7 @@ fn init(config: Value) -> Value {
     // Keep the known addresses, but clear mailbox_id (not-spawned-this-process).
     let bindings: Vec<Binding> = saved
         .into_iter()
-        .map(|b| Binding { address: b.address, mailbox_id: String::new(), tenant: b.tenant })
+        .map(|b| Binding { address: canon(&b.address), mailbox_id: String::new(), tenant: b.tenant })
         .collect();
     RouterState::set(RouterState { mailbox_manifest, bindings });
     ok_unit()
@@ -259,6 +276,7 @@ fn ensure_spawned(idx: usize, address: &str) -> Result<String, String> {
 
 #[export(name = "theater:inbox/router.register")]
 fn register(address: String) -> Value {
+    let address = canon(&address);
     match find(&address) {
         Some((_, id)) if !id.is_empty() => ok_result(Value::String(id)),
         Some((idx, _)) => match ensure_spawned(idx, &address) {
@@ -284,6 +302,7 @@ fn register(address: String) -> Value {
 
 #[export(name = "theater:inbox/router.lookup")]
 fn lookup(address: String) -> Value {
+    let address = canon(&address);
     match find(&address) {
         None => ok_result(opt_string(None)),
         Some((_, id)) if !id.is_empty() => ok_result(opt_string(Some(id))),
@@ -309,6 +328,10 @@ fn list() -> Value {
 /// the mailbox id.
 #[export(name = "theater:inbox/router.register-owned")]
 fn register_owned(address: String, tenant: String) -> Value {
+    let address = canon(&address);
+    if !valid_address(&address) {
+        return err_str(&format!("invalid address: {}", address));
+    }
     if is_reserved(&address) {
         return err_str(&format!("address is operator-reserved, not claimable: {}", address));
     }
@@ -357,6 +380,7 @@ fn register_owned(address: String, tenant: String) -> Value {
 /// (lazy-spawns like `lookup`). None for unknown addresses.
 #[export(name = "theater:inbox/router.lookup-owned")]
 fn lookup_owned(address: String) -> Value {
+    let address = canon(&address);
     match find(&address) {
         None => {
             let none: Option<Owned> = None;
