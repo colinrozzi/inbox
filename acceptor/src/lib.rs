@@ -39,6 +39,8 @@ packr_guest::setup_guest!();
 pub struct AcceptorState {
     pub listener_id: String,
     pub router_id: String,
+    /// tenant-registry actor id, "" if not wired. Passed to each api-handler.
+    pub registry_id: String,
     pub api_handler_manifest: String,
 }
 
@@ -136,12 +138,22 @@ struct Config {
     router_manifest: String,
     smtp_acceptor_manifest: String,
     smtp_handler_manifest: String,
+    // Multi-tenancy: the tenant-registry manifest. Optional — absent leaves the
+    // registry unspawned and api-handler enforcement permanently off (inert).
+    #[serde(default)]
+    tenant_registry_manifest: String,
 }
 
 #[derive(Serialize)]
 struct SmtpInit<'a> {
     router_id: &'a str,
     smtp_handler_manifest: &'a str,
+}
+
+#[derive(Serialize)]
+struct ApiHandlerInit<'a> {
+    router_id: &'a str,
+    registry_id: &'a str,
 }
 
 // ---- result-Value helpers (identical across all inbox actors) ----
@@ -211,6 +223,7 @@ fn init(config: Value) -> Value {
         router_manifest,
         smtp_acceptor_manifest,
         smtp_handler_manifest,
+        tenant_registry_manifest,
     } = cfg;
 
     // GATEKEEPER: secrets must already be seeded in the store (manager-owned, never
@@ -233,6 +246,21 @@ fn init(config: Value) -> Value {
     };
     log(format!("[inbox-acceptor] spawned mailbox-router {}", router_id));
 
+    // Spawn the tenant-registry singleton (multi-tenancy). Optional: an empty
+    // manifest leaves registry_id empty, so api-handler enforcement can never
+    // engage — the acceptor stays fully backward-compatible / inert.
+    let registry_id = if tenant_registry_manifest.is_empty() {
+        String::new()
+    } else {
+        match supervisor_spawn(tenant_registry_manifest, Some(Value::String(String::new()))) {
+            Ok(id) => {
+                log(format!("[inbox-acceptor] spawned tenant-registry {}", id));
+                id
+            }
+            Err(e) => return err_str(&format!("spawn tenant-registry failed: {}", e)),
+        }
+    };
+
     let listener_id = match tcp_listen(listen_addr.clone()) {
         Ok(id) => id,
         Err(e) => return err_str(&format!("listen failed: {}", e)),
@@ -253,7 +281,7 @@ fn init(config: Value) -> Value {
     };
     log(format!("[inbox-acceptor] spawned smtp-acceptor {}", smtp_acceptor_id));
 
-    AcceptorState::set(AcceptorState { listener_id, router_id, api_handler_manifest });
+    AcceptorState::set(AcceptorState { listener_id, router_id, registry_id, api_handler_manifest });
     ok_unit()
 }
 
@@ -268,10 +296,14 @@ fn handle_connection(connection_id: String) -> Value {
 }
 
 fn try_handle_connection(connection_id: &str) -> Result<(), String> {
-    let (api_handler_manifest, router_id) =
-        AcceptorState::with(|s| (s.api_handler_manifest.clone(), s.router_id.clone()));
+    let (api_handler_manifest, router_id, registry_id) = AcceptorState::with(|s| {
+        (s.api_handler_manifest.clone(), s.router_id.clone(), s.registry_id.clone())
+    });
 
-    let handler_id = supervisor_spawn(api_handler_manifest, Some(Value::String(router_id)))
+    // Pass both ids as JSON. api-handler tolerates a bare router_id too (legacy).
+    let init = serde_json::to_string(&ApiHandlerInit { router_id: &router_id, registry_id: &registry_id })
+        .map_err(|e| format!("serialize api-handler init failed: {}", e))?;
+    let handler_id = supervisor_spawn(api_handler_manifest, Some(Value::String(init)))
         .map_err(|e| format!("spawn api-handler failed: {}", e))?;
 
     // Non-blocking hand-off (avoids the accept-loop wedge). On sync failure the

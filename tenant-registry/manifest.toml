@@ -1,0 +1,15 @@
+name = "inbox-tenant-registry"
+version = "0.1.0"
+package = "/home/colin/work/actors/inbox/target/wasm32-unknown-unknown/release/inbox_tenant_registry.wasm"
+static_package = true
+
+# Callee only (api-handler calls it) + store-backed, like the mailbox: no `rpc`
+# handler (that is caller-side) and no `runtime` (it spawns nothing). self = log +
+# init/get-state; store = persisted state + the token-gen seed.
+[[handler]]
+type = "self"
+
+[[handler]]
+type = "store"
+base_path = "/mnt/main-volume/inbox/store"
+store_id = "inbox"
