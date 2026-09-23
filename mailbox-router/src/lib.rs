@@ -35,6 +35,19 @@ const BINDINGS_LABEL: &str = "router-bindings";
 pub struct Binding {
     pub address: String,
     pub mailbox_id: String,
+    /// Controlling tenant id (multi-tenancy). Empty = unowned (pre-tenancy
+    /// bindings decode here via forward_compatible). Stamped by `register-owned`;
+    /// the legacy `register` leaves it empty. Read by `lookup-owned` so the API
+    /// path can enforce "caller's tenant controls this address".
+    pub tenant: String,
+}
+
+/// `lookup-owned` payload: the mailbox id + its controlling tenant, resolved in
+/// one call so the api-handler's authorize() needn't make two round-trips.
+#[derive(Clone, GraphValue)]
+pub struct Owned {
+    pub mailbox_id: String,
+    pub tenant: String,
 }
 
 // RouterState in the derive(State) cell: small + serializable. The derive emits
@@ -79,7 +92,24 @@ pack_types! {
         theater:inbox/router.register: func(address: string) -> result<string, string>,
         theater:inbox/router.lookup: func(address: string) -> result<option<string>, string>,
         theater:inbox/router.list: func() -> result<list<binding>, string>,
+        // Owner-aware exports (multi-tenancy, phase 1 — additive + inert until the
+        // api-handler switches to them; legacy register/lookup/list stay as-is so
+        // current callers are unaffected).
+        theater:inbox/router.register-owned: func(address: string, tenant: string) -> result<string, string>,
+        theater:inbox/router.lookup-owned: func(address: string) -> result<option<owned>, string>,
+        theater:inbox/router.list-by-tenant: func(tenant: string) -> result<list<binding>, string>,
     }
+}
+
+// Tier-1 operator-reserved local-parts — the MX operator's own RFC obligations
+// (postmaster/abuse per RFC 5321/2142; the bounce identity). Hardcoded floor,
+// never claimable by a tenant, on any domain we run mail for. Tier-2 domain-admin
+// reservations (noreply/security/…) are per-domain config, not here.
+const RESERVED_LOCAL_PARTS: [&str; 3] = ["postmaster", "abuse", "mailer-daemon"];
+
+fn is_reserved(address: &str) -> bool {
+    let local = address.split('@').next().unwrap_or(address);
+    RESERVED_LOCAL_PARTS.iter().any(|r| local.eq_ignore_ascii_case(r))
 }
 
 #[import(module = "theater:simple/self", name = "log")]
@@ -200,7 +230,7 @@ fn init(config: Value) -> Value {
     // Keep the known addresses, but clear mailbox_id (not-spawned-this-process).
     let bindings: Vec<Binding> = saved
         .into_iter()
-        .map(|b| Binding { address: b.address, mailbox_id: String::new() })
+        .map(|b| Binding { address: b.address, mailbox_id: String::new(), tenant: b.tenant })
         .collect();
     RouterState::set(RouterState { mailbox_manifest, bindings });
     ok_unit()
@@ -241,7 +271,7 @@ fn register(address: String) -> Value {
                 Ok(id) => {
                     log(format!("[mailbox-router] registered {} -> {}", address, id));
                     RouterState::with_mut(|s| {
-                        s.bindings.push(Binding { address: address.clone(), mailbox_id: id.clone() });
+                        s.bindings.push(Binding { address: address.clone(), mailbox_id: id.clone(), tenant: String::new() });
                     });
                     RouterState::with(|s| save_bindings(&s.bindings));
                     ok_result(Value::String(id))
@@ -269,5 +299,93 @@ fn lookup(address: String) -> Value {
 #[export(name = "theater:inbox/router.list")]
 fn list() -> Value {
     let bindings = RouterState::with(|s| s.bindings.clone());
+    ok_result(bindings.into())
+}
+
+/// Register an address OWNED by `tenant`. Rejects operator-reserved local-parts
+/// and enforces one-tenant-per-mailbox (first-come): claiming an address another
+/// tenant already controls fails; re-claiming your own, or claiming a currently
+/// unowned/legacy binding (tenant empty), succeeds and stamps the owner. Returns
+/// the mailbox id.
+#[export(name = "theater:inbox/router.register-owned")]
+fn register_owned(address: String, tenant: String) -> Value {
+    if is_reserved(&address) {
+        return err_str(&format!("address is operator-reserved, not claimable: {}", address));
+    }
+    match find(&address) {
+        // Known address: gate on current owner, then (re)stamp + ensure spawned.
+        Some((idx, id)) => {
+            let existing = RouterState::with(|s| s.bindings[idx].tenant.clone());
+            if !existing.is_empty() && existing != tenant {
+                return err_str(&format!("address already controlled by another tenant: {}", address));
+            }
+            let mbox = if id.is_empty() {
+                match ensure_spawned(idx, &address) {
+                    Ok(i) => i,
+                    Err(e) => return err_str(&e),
+                }
+            } else {
+                id
+            };
+            RouterState::with_mut(|s| s.bindings[idx].tenant = tenant.clone());
+            RouterState::with(|s| save_bindings(&s.bindings));
+            ok_result(Value::String(mbox))
+        }
+        // New address: spawn + create the owned binding.
+        None => {
+            let manifest = RouterState::with(|s| s.mailbox_manifest.clone());
+            match spawn_mailbox(&manifest, &address) {
+                Ok(id) => {
+                    log(format!("[mailbox-router] registered {} -> {} (tenant={})", address, id, tenant));
+                    RouterState::with_mut(|s| {
+                        s.bindings.push(Binding {
+                            address: address.clone(),
+                            mailbox_id: id.clone(),
+                            tenant: tenant.clone(),
+                        });
+                    });
+                    RouterState::with(|s| save_bindings(&s.bindings));
+                    ok_result(Value::String(id))
+                }
+                Err(e) => err_str(&e),
+            }
+        }
+    }
+}
+
+/// Resolve an address to its mailbox id AND controlling tenant in one call
+/// (lazy-spawns like `lookup`). None for unknown addresses.
+#[export(name = "theater:inbox/router.lookup-owned")]
+fn lookup_owned(address: String) -> Value {
+    match find(&address) {
+        None => {
+            let none: Option<Owned> = None;
+            ok_result(none.into())
+        }
+        Some((idx, id)) => {
+            let mbox = if id.is_empty() {
+                match ensure_spawned(idx, &address) {
+                    Ok(i) => i,
+                    // Spawn failure on a known address -> not-found (matches `lookup`).
+                    Err(_) => {
+                        let none: Option<Owned> = None;
+                        return ok_result(none.into());
+                    }
+                }
+            } else {
+                id
+            };
+            let tenant = RouterState::with(|s| s.bindings[idx].tenant.clone());
+            ok_result(Some(Owned { mailbox_id: mbox, tenant }).into())
+        }
+    }
+}
+
+/// All bindings controlled by `tenant` ("list my mailboxes"). Read-only.
+#[export(name = "theater:inbox/router.list-by-tenant")]
+fn list_by_tenant(tenant: String) -> Value {
+    let bindings = RouterState::with(|s| {
+        s.bindings.iter().filter(|b| b.tenant == tenant).cloned().collect::<Vec<_>>()
+    });
     ok_result(bindings.into())
 }
