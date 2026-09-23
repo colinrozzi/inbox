@@ -135,19 +135,27 @@ fn run_session(conn: &str, router_id: &str) -> Result<(), String> {
                     send_line(conn, "503 Need MAIL command first")?;
                 } else {
                     match extract_address(trimmed, "TO:") {
-                        Some(addr) => match router_lookup(router_id, &addr) {
-                            Ok(Some(mbox_id)) => {
-                                rcpts.push((addr, mbox_id));
-                                send_line(conn, "250 OK")?;
+                        // Canonicalize (lowercase) the recipient before routing AND
+                        // before recording the delivery leg, so store-side ownership
+                        // and delivery agree with the router (isolation FIX 1 — a
+                        // mis-cased RCPT must resolve to the one canonical mailbox,
+                        // never a case-variant twin).
+                        Some(addr) => {
+                            let addr = addr.to_ascii_lowercase();
+                            match router_lookup(router_id, &addr) {
+                                Ok(Some(mbox_id)) => {
+                                    rcpts.push((addr, mbox_id));
+                                    send_line(conn, "250 OK")?;
+                                }
+                                Ok(None) => {
+                                    send_line(conn, "550 No such recipient")?;
+                                }
+                                Err(e) => {
+                                    log(format!("[inbox-smtp] router lookup failed: {}", e));
+                                    send_line(conn, "451 Temporary lookup failure")?;
+                                }
                             }
-                            Ok(None) => {
-                                send_line(conn, "550 No such recipient")?;
-                            }
-                            Err(e) => {
-                                log(format!("[inbox-smtp] router lookup failed: {}", e));
-                                send_line(conn, "451 Temporary lookup failure")?;
-                            }
-                        },
+                        }
                         None => send_line(conn, "501 Syntax error in RCPT TO")?,
                     }
                 }
