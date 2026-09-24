@@ -130,6 +130,7 @@ pack_types! {
         theater:inbox/registry.resolve: func(token: string) -> result<option<resolved>, string>,
         theater:inbox/registry.create-tenant: func(label: string) -> result<tenant-created, string>,
         theater:inbox/registry.mint-key: func(tenant-id: string, caps: list<string>, label: string, created-by: string) -> result<minted, string>,
+        theater:inbox/registry.import-key: func(tenant-id: string, token: string, caps: list<string>, label: string) -> result<string, string>,
         theater:inbox/registry.revoke-key: func(key-id: string) -> result<_, string>,
         theater:inbox/registry.list-keys: func(tenant-id: string) -> result<list<key-meta>, string>,
     }
@@ -378,6 +379,52 @@ fn mint_key(tenant_id: String, caps: Vec<String>, label: String, created_by: Str
         Ok((key_id, token)) => {
             RegistryState::with(save_state);
             ok_result(Minted { key_id, token }.into())
+        }
+        Err(e) => err_str(&e),
+    }
+}
+
+/// Register an EXISTING token (its sha256) as a key on a tenant — instead of
+/// generating one. The cutover primitive: grandfather the current shared bearer
+/// token into the `fleet` tenant so it stays valid through the enforce flip.
+/// RPC-only (operator setup), NOT HTTP-reachable. Rejects a token already
+/// registered anywhere — a token must resolve to exactly one tenant, so the same
+/// token can never be imported into two tenants (would be a cross-tenant hole).
+#[export(name = "theater:inbox/registry.import-key")]
+fn import_key(tenant_id: String, token: String, caps: Vec<String>, label: String) -> Value {
+    if let Err(e) = caps_valid(&caps) {
+        return err_str(&e);
+    }
+    if token.is_empty() {
+        return err_str("import-key: empty token");
+    }
+    let token_hash = sha256_hex(token.as_bytes());
+    let result = RegistryState::with_mut(|s| {
+        // Global uniqueness: a token must map to exactly one tenant.
+        if s.tenants.iter().any(|t| t.keys.iter().any(|k| k.token_hash == token_hash)) {
+            return Err(String::from("token already registered"));
+        }
+        let idx = match s.tenants.iter().position(|t| t.id == tenant_id) {
+            Some(i) => i,
+            None => return Err(format!("unknown tenant: {}", tenant_id)),
+        };
+        let kseq = s.next_seq;
+        s.next_seq += 1;
+        let key_id = format!("k{}", kseq);
+        s.tenants[idx].keys.push(Key {
+            id: key_id.clone(),
+            token_hash,
+            caps: caps.clone(),
+            label: label.clone(),
+            created_seq: kseq,
+            created_by: String::from("import"),
+        });
+        Ok(key_id)
+    });
+    match result {
+        Ok(key_id) => {
+            RegistryState::with(save_state);
+            ok_result(Value::String(key_id))
         }
         Err(e) => err_str(&e),
     }
