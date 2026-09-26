@@ -1,0 +1,18 @@
+name = "inbox-opsctl"
+version = "0.1.0"
+package = "/home/colin/work/actors/inbox/target/wasm32-unknown-unknown/release/inbox_opsctl.wasm"
+static_package = true
+
+# Operator setup tool: self = log, store = write labels (seed/flip), rpc = call
+# the registry + router (create-tenant / import-key / register-owned). No runtime
+# (spawns nothing). Privileged — spawning it is the operator action.
+[[handler]]
+type = "self"
+
+[[handler]]
+type = "store"
+base_path = "/mnt/main-volume/inbox/store"
+store_id = "inbox"
+
+[[handler]]
+type = "rpc"

@@ -113,6 +113,7 @@
               inbox_api_handler \
               inbox_mailbox \
               inbox_mailbox_router \
+              inbox_opsctl \
               inbox_smtp_acceptor \
               inbox_smtp_handler \
               inbox_tenant_registry
