@@ -1,5 +1,5 @@
 [workspace]
-members = ["acceptor", "api-handler", "mailbox", "mailbox-router", "smtp-acceptor", "smtp-handler", "tenant-registry"]
+members = ["acceptor", "api-handler", "mailbox", "mailbox-router", "opsctl", "smtp-acceptor", "smtp-handler", "tenant-registry"]
 resolver = "2"
 
 [profile.release]

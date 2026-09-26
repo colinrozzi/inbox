@@ -198,6 +198,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "inbox-opsctl"
+version = "0.1.0"
+dependencies = [
+ "packr-abi",
+ "packr-guest",
+ "serde",
+ "serde_json",
+ "theater-guest",
+]
+
+[[package]]
 name = "inbox-smtp-acceptor"
 version = "0.1.0"
 dependencies = [
