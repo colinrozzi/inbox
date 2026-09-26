@@ -67,9 +67,16 @@ fn ok_unit() -> Value {
     let u = Value::Tuple(vec![]);
     Value::Result { ok_type: u.infer_type(), err_type: ValueType::String, value: Ok(Box::new(u)) }
 }
-fn err_str(msg: &str) -> Value {
-    let e = Value::String(String::from(msg));
-    Value::Result { ok_type: Value::Tuple(vec![]).infer_type(), err_type: ValueType::String, value: Err(Box::new(e)) }
+/// One-shot semantics: opsctl must NOT fail its init, or the supervisor respawns
+/// it (rate-limited 5/60s, then trips the breaker) — supervisor-dev's nuance. So
+/// on any problem we LOG it prominently to the chain and return a CLEAN Ok: the
+/// operator reads the outcome via `supervisor chain <handle>`, and a failed setup
+/// halts here without a respawn loop. (Success + failure both leave a readable
+/// chain; neither respawns.)
+fn abort(msg: &str) -> Value {
+    log(format!("[opsctl] ABORT — halted, NOT respawned; read this chain: {}", msg));
+    OpsState::set(OpsState { done: false });
+    ok_unit()
 }
 
 /// Peel the outer result<_, _> off an RPC return.
@@ -132,25 +139,25 @@ struct Adopt {
 fn init(config: Value) -> Value {
     let raw = match config {
         Value::String(s) => s,
-        _ => return err_str("opsctl: init_state must be a JSON config string"),
+        _ => return abort("opsctl: init_state must be a JSON config string"),
     };
     let cfg: Cfg = match serde_json::from_str(&raw) {
         Ok(c) => c,
-        Err(e) => return err_str(&format!("opsctl: bad config: {}", e)),
+        Err(e) => return abort(&format!("opsctl: bad config: {}", e)),
     };
 
     // 1. Store labels — the missing out-of-band seed/flip mechanism (Gap 1).
     for l in &cfg.labels {
         match store_at_label(STORE_ID.into(), l.name.clone(), l.value.clone().into_bytes()) {
             Ok(_) => log(format!("[opsctl] wrote store label '{}'", l.name)),
-            Err(e) => return err_str(&format!("opsctl: write label '{}' failed: {}", l.name, e)),
+            Err(e) => return abort(&format!("opsctl: write label '{}' failed: {}", l.name, e)),
         }
     }
 
     // 2. create-tenant (Gap 2) — mint tenants + log their root tokens.
     for label in &cfg.create_tenants {
         if cfg.registry_id.is_empty() {
-            return err_str("opsctl: create_tenants requires registry_id");
+            return abort("opsctl: create_tenants requires registry_id");
         }
         let v = rpc_call(
             cfg.registry_id.clone(),
@@ -164,14 +171,14 @@ fn init(config: Value) -> Value {
                 let tok = record_field(&fields, "root_token");
                 log(format!("[opsctl] created tenant '{}' id={} root_token={}", label, tid, tok));
             }
-            _ => return err_str(&format!("opsctl: create-tenant '{}' failed", label)),
+            _ => return abort(&format!("opsctl: create-tenant '{}' failed", label)),
         }
     }
 
     // 3. import-key — grandfather existing tokens (e.g. the shared bearer -> fleet).
     for im in &cfg.imports {
         if cfg.registry_id.is_empty() {
-            return err_str("opsctl: imports requires registry_id");
+            return abort("opsctl: imports requires registry_id");
         }
         let caps: Value = im.caps.clone().into();
         let v = rpc_call(
@@ -187,14 +194,14 @@ fn init(config: Value) -> Value {
         );
         match unwrap_result(v) {
             Some(Value::String(kid)) => log(format!("[opsctl] imported key {} into tenant {}", kid, im.tenant)),
-            _ => return err_str(&format!("opsctl: import-key into '{}' failed", im.tenant)),
+            _ => return abort(&format!("opsctl: import-key into '{}' failed", im.tenant)),
         }
     }
 
     // 4. adopt — stamp existing addresses to a tenant via register-owned.
     for a in &cfg.adopt {
         if cfg.router_id.is_empty() {
-            return err_str("opsctl: adopt requires router_id");
+            return abort("opsctl: adopt requires router_id");
         }
         let v = rpc_call(
             cfg.router_id.clone(),
@@ -204,7 +211,7 @@ fn init(config: Value) -> Value {
         );
         match unwrap_result(v) {
             Some(Value::String(_)) => log(format!("[opsctl] adopted {} -> tenant {}", a.address, a.tenant)),
-            _ => return err_str(&format!("opsctl: register-owned '{}' failed", a.address)),
+            _ => return abort(&format!("opsctl: register-owned '{}' failed", a.address)),
         }
     }
 
