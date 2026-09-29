@@ -102,6 +102,11 @@ const DEFAULT_SMTP_HANDLER_MANIFEST: &str = "/home/colin/work/actors/inbox/smtp-
 struct Config {
     router_id: String,
     smtp_handler_manifest: String,
+    // SMTP bind address. Empty => the LISTEN_ADDR default (0.0.0.0:25). Lets a
+    // non-root dev/proof node bind an unprivileged port (e.g. 0.0.0.0:2525)
+    // from init config, no source patch; prod omits it and gets :25.
+    #[serde(default)]
+    listen_addr: String,
 }
 
 // ---- result-Value helpers (identical across all inbox actors) ----
@@ -123,25 +128,33 @@ fn init(config: Value) -> Value {
         ),
     };
 
-    let (router_id, smtp_handler_manifest) = if let Ok(cfg) = serde_json::from_str::<Config>(&raw) {
+    let (router_id, smtp_handler_manifest, listen_addr) = if let Ok(cfg) = serde_json::from_str::<Config>(&raw) {
         if cfg.router_id.is_empty() {
             return err_str("router_id must be non-empty");
         }
         if cfg.smtp_handler_manifest.is_empty() {
             return err_str("smtp_handler_manifest must be non-empty");
         }
-        (cfg.router_id, cfg.smtp_handler_manifest)
+        (cfg.router_id, cfg.smtp_handler_manifest, cfg.listen_addr)
     } else {
-        (raw, String::from(DEFAULT_SMTP_HANDLER_MANIFEST))
+        (raw, String::from(DEFAULT_SMTP_HANDLER_MANIFEST), String::new())
+    };
+
+    // Empty listen_addr => the :25 default (prod). A dev/proof node sets it to an
+    // unprivileged port so a non-root spin-up needs no source patch.
+    let listen = if listen_addr.trim().is_empty() {
+        String::from(LISTEN_ADDR)
+    } else {
+        listen_addr
     };
 
     log(format!("[inbox-smtp-acceptor] init (router={})", router_id));
 
-    let listener_id = match tcp_listen(String::from(LISTEN_ADDR)) {
+    let listener_id = match tcp_listen(listen.clone()) {
         Ok(id) => id,
         Err(e) => return err_str(&format!("listen failed: {}", e)),
     };
-    log(format!("[inbox-smtp-acceptor] SMTP listening on {} (id={})", LISTEN_ADDR, listener_id));
+    log(format!("[inbox-smtp-acceptor] SMTP listening on {} (id={})", listen, listener_id));
 
     SmtpAcceptorState::set(SmtpAcceptorState { listener_id, router_id, smtp_handler_manifest });
     ok_unit()
