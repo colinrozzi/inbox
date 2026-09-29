@@ -51,9 +51,12 @@ package = "__PACKAGE__"
 #     "mailbox_manifest":       "<https reference>",
 #     "router_manifest":        "<https reference>",
 #     "smtp_acceptor_manifest": "<https reference>",
-#     "smtp_handler_manifest":  "<https reference>"
+#     "smtp_handler_manifest":  "<https reference>",
+#     "tenant_registry_manifest": "<https reference>"   # multi-tenancy: the acceptor
+#         spawns the tenant-registry singleton from this. OMIT/empty => registry not
+#         spawned => enforcement can never engage (safe/inert). Present => tenancy-capable.
 #   }
-initial_state = '{"listen_addr":"__LISTEN_ADDR__","api_handler_manifest":"__API_HANDLER_MANIFEST__","mailbox_manifest":"__MAILBOX_MANIFEST__","router_manifest":"__ROUTER_MANIFEST__","smtp_acceptor_manifest":"__SMTP_ACCEPTOR_MANIFEST__","smtp_handler_manifest":"__SMTP_HANDLER_MANIFEST__"}'
+initial_state = '{"listen_addr":"__LISTEN_ADDR__","api_handler_manifest":"__API_HANDLER_MANIFEST__","mailbox_manifest":"__MAILBOX_MANIFEST__","router_manifest":"__ROUTER_MANIFEST__","smtp_acceptor_manifest":"__SMTP_ACCEPTOR_MANIFEST__","smtp_handler_manifest":"__SMTP_HANDLER_MANIFEST__","tenant_registry_manifest":"__TENANT_REGISTRY_MANIFEST__"}'
 
 [[handler]]
 type = "self"
