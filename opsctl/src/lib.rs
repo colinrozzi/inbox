@@ -169,7 +169,24 @@ fn init(config: Value) -> Value {
             Some(Value::Record { fields, .. }) => {
                 let tid = record_field(&fields, "tenant_id");
                 let tok = record_field(&fields, "root_token");
-                log(format!("[opsctl] created tenant '{}' id={} root_token={}", label, tid, tok));
+                // opsctl does its work in init, but the supervisor attaches its
+                // monitor AFTER spawn (spawn auto-runs init), so init-time log
+                // events are never captured — `supervisor chain` is empty for a
+                // one-shot (supervisor-dev's finding). So PERSIST the token to a
+                // store label: readable after exit, timing-independent, prod-true
+                // (the flip consumes tokens from a durable place, not a chain dump).
+                // Value = "<tenant_id> <root_token>".
+                let out_label = format!("opsctl-created-{}", label);
+                match store_at_label(STORE_ID.into(), out_label.clone(), format!("{} {}", tid, tok).into_bytes()) {
+                    Ok(_) => log(format!(
+                        "[opsctl] created tenant '{}' id={} -> token persisted to store label '{}'",
+                        label, tid, out_label
+                    )),
+                    Err(e) => return abort(&format!(
+                        "created tenant '{}' (id={}) but FAILED to persist its token to '{}': {}",
+                        label, tid, out_label, e
+                    )),
+                }
             }
             _ => return abort(&format!("opsctl: create-tenant '{}' failed", label)),
         }
