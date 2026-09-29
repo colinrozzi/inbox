@@ -142,12 +142,18 @@ struct Config {
     // registry unspawned and api-handler enforcement permanently off (inert).
     #[serde(default)]
     tenant_registry_manifest: String,
+    // SMTP :25 bind address for the smtp-acceptor. Optional — empty => its :25
+    // default (prod). A dev/proof node sets an unprivileged port (e.g. 0.0.0.0:2525)
+    // so a non-root spin-up needs no source patch.
+    #[serde(default)]
+    smtp_listen_addr: String,
 }
 
 #[derive(Serialize)]
 struct SmtpInit<'a> {
     router_id: &'a str,
     smtp_handler_manifest: &'a str,
+    listen_addr: &'a str,
 }
 
 #[derive(Serialize)]
@@ -224,6 +230,7 @@ fn init(config: Value) -> Value {
         smtp_acceptor_manifest,
         smtp_handler_manifest,
         tenant_registry_manifest,
+        smtp_listen_addr,
     } = cfg;
 
     // GATEKEEPER: secrets must already be seeded in the store (manager-owned, never
@@ -271,6 +278,7 @@ fn init(config: Value) -> Value {
     let smtp_init_state = match serde_json::to_string(&SmtpInit {
         router_id: &router_id,
         smtp_handler_manifest: &smtp_handler_manifest,
+        listen_addr: &smtp_listen_addr,
     }) {
         Ok(s) => Value::String(s),
         Err(e) => return err_str(&format!("serialize smtp-acceptor init failed: {}", e)),
