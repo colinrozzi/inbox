@@ -63,7 +63,9 @@ jobs:
             inbox_mailbox \
             inbox_mailbox_router \
             inbox_smtp_acceptor \
-            inbox_smtp_handler
+            inbox_smtp_handler \
+            inbox_tenant_registry \
+            inbox_opsctl
           do
             # nix build emits plain self-contained actor modules (packr 0.11.0); the
             # deployable artifact is <actor>.wasm, not a bare member.
@@ -107,7 +109,9 @@ jobs:
             inbox_mailbox \
             inbox_mailbox_router \
             inbox_smtp_acceptor \
-            inbox_smtp_handler
+            inbox_smtp_handler \
+            inbox_tenant_registry \
+            inbox_opsctl
           do
             cp "$(realpath result)/${actor}.wasm" "$STAGE/"
           done
