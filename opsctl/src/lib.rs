@@ -79,11 +79,68 @@ fn abort(msg: &str) -> Value {
     ok_unit()
 }
 
-/// Peel the outer result<_, _> off an RPC return.
-fn unwrap_result(v: Value) -> Option<Value> {
+/// Best-effort stringify of a Value for error/diagnostic messages. Intentionally
+/// Debug-free (packr Value's Debug impl isn't relied on): err payloads are strings
+/// in practice, and the non-string arms only feed rare "unexpected shape" messages.
+fn stringify(v: Value) -> String {
     match v {
-        Value::Result { value: Ok(ok), .. } => Some(*ok),
-        _ => None,
+        Value::String(s) => s,
+        Value::Record { .. } => String::from("<record>"),
+        Value::Variant { case_name, .. } => format!("<variant:{}>", case_name),
+        Value::Option { .. } => String::from("<option>"),
+        Value::Tuple(_) => String::from("<tuple>"),
+        _ => String::from("<non-string value>"),
+    }
+}
+
+/// Abort message for an RPC that returned an unexpected (non-error) ok shape.
+fn bad_shape(op: &str, v: Value) -> String {
+    format!("opsctl: {} unexpected ok shape: {}", op, stringify(v))
+}
+
+/// Peel the result-layers off an RPC return, returning Ok(payload) | Err(reason).
+///
+/// theater's `rpc.call` transport-wraps the callee's return, and on prod
+/// (theater 0.3.9, pre-#216) a `result<T,E>` is delivered NOT as a first-class
+/// Value::Result but as a TAGGED VARIANT: `Variant{tag:0, payload:[T]}` for Ok,
+/// `Variant{tag:1, payload:[E]}` for Err (some ABI vintages set case_name "ok"/"err"
+/// instead of / in addition to the numeric tag). The callee's OWN result is nested
+/// inside, so there can be TWO result layers (outer transport variant + inner native
+/// result) — we peel ITERATIVELY until the first value that is NOT a result wrapper
+/// (the callee's actual payload: Record for create-tenant, String for import-key /
+/// register-owned). The old code matched ONLY Value::Result, so on 0.3.9 the outer
+/// Variant fell through and opsctl aborted AFTER the registry had already mutated —
+/// the B1 blocker. This accepts BOTH the tagged-variant shape AND the post-#216
+/// native Value::Result, so it is forward-compatible. An Err at ANY layer returns
+/// Err(reason), preserving the ok/err discriminant (critical: result<string,string>
+/// ok and err are both bare strings, indistinguishable once unwrapped). We do NOT
+/// require type_name=="result" on the variant — opsctl's payloads are never
+/// themselves variants, so recognising any tag-0/1 (or ok/err) variant as a result
+/// wrapper is safe and also covers the bare-tag vintage. Mirrors the proven
+/// api-handler peel + supervisor-dev's runtime_spawn peel.
+fn unwrap_result(v: Value) -> Result<Value, String> {
+    let mut v = v;
+    loop {
+        v = match v {
+            Value::Result { value: Ok(inner), .. } => *inner,
+            Value::Result { value: Err(e), .. } => return Err(stringify(*e)),
+            Value::Variant { tag, case_name, payload, .. }
+                if tag == 1 || case_name.eq_ignore_ascii_case("err") =>
+            {
+                return Err(payload
+                    .into_iter()
+                    .next()
+                    .map(stringify)
+                    .unwrap_or_else(|| String::from("rpc variant err (no payload)")));
+            }
+            Value::Variant { tag, case_name, mut payload, .. }
+                if (tag == 0 || case_name.eq_ignore_ascii_case("ok")) && payload.len() == 1 =>
+            {
+                payload.remove(0)
+            }
+            // Not a result wrapper -> the callee's actual payload.
+            other => return Ok(other),
+        };
     }
 }
 /// Read a string field from a Record, tolerant of snake vs kebab keys.
@@ -166,7 +223,7 @@ fn init(config: Value) -> Value {
             Value::Tuple(vec![]),
         );
         match unwrap_result(v) {
-            Some(Value::Record { fields, .. }) => {
+            Ok(Value::Record { fields, .. }) => {
                 let tid = record_field(&fields, "tenant_id");
                 let tok = record_field(&fields, "root_token");
                 // opsctl does its work in init, but the supervisor attaches its
@@ -188,7 +245,8 @@ fn init(config: Value) -> Value {
                     )),
                 }
             }
-            _ => return abort(&format!("opsctl: create-tenant '{}' failed", label)),
+            Ok(other) => return abort(&bad_shape("create-tenant", other)),
+            Err(e) => return abort(&format!("opsctl: create-tenant '{}' failed: {}", label, e)),
         }
     }
 
@@ -210,12 +268,32 @@ fn init(config: Value) -> Value {
             Value::Tuple(vec![]),
         );
         match unwrap_result(v) {
-            Some(Value::String(kid)) => log(format!("[opsctl] imported key {} into tenant {}", kid, im.tenant)),
-            _ => return abort(&format!("opsctl: import-key into '{}' failed", im.tenant)),
+            Ok(Value::String(kid)) => log(format!("[opsctl] imported key {} into tenant {}", kid, im.tenant)),
+            Ok(other) => return abort(&bad_shape("import-key", other)),
+            // Idempotent re-run: the registry enforces global token uniqueness, so a
+            // second B3 run re-presenting the same token gets "token already registered".
+            // The key is already fleet's — that's the desired end state, not a failure.
+            Err(e) if e.contains("already registered") => log(format!(
+                "[opsctl] token already imported into tenant {} (idempotent re-run) — continuing",
+                im.tenant
+            )),
+            Err(e) => return abort(&format!("opsctl: import-key '{}' failed: {}", im.tenant, e)),
         }
     }
 
     // 4. adopt — stamp existing addresses to a tenant via register-owned.
+    //
+    // RESILIENT by design (supervisor-dev's belt-and-suspenders on top of the peel
+    // fix): register-owned is idempotent for the same tenant (re-stamping an address
+    // already owned by this tenant is a no-op Ok), so one odd return must NOT halt the
+    // whole 26-address grandfather and leave a partial, unknowable state. We record
+    // each failure + CONTINUE, persist a summary to a store label (init-time chain logs
+    // aren't captured — same reason create-tenant persists its token), and if anything
+    // failed we exit done=false so the operator re-runs opsctl-b3 to finish the
+    // stragglers. The manager independently verifies router state (list-by-tenant)
+    // rather than trusting this return, so a partial adopt is caught and completable.
+    let mut adopted = 0usize;
+    let mut failures: Vec<String> = Vec::new();
     for a in &cfg.adopt {
         if cfg.router_id.is_empty() {
             return abort("opsctl: adopt requires router_id");
@@ -227,8 +305,39 @@ fn init(config: Value) -> Value {
             Value::Tuple(vec![]),
         );
         match unwrap_result(v) {
-            Some(Value::String(_)) => log(format!("[opsctl] adopted {} -> tenant {}", a.address, a.tenant)),
-            _ => return abort(&format!("opsctl: register-owned '{}' failed", a.address)),
+            Ok(Value::String(_)) => {
+                adopted += 1;
+                log(format!("[opsctl] adopted {} -> tenant {}", a.address, a.tenant));
+            }
+            Ok(other) => {
+                failures.push(format!("{} (bad shape: {})", a.address, stringify(other)));
+                log(format!("[opsctl] adopt {} bad shape, continuing", a.address));
+            }
+            Err(e) => {
+                failures.push(format!("{} ({})", a.address, e));
+                log(format!("[opsctl] adopt {} FAILED: {}, continuing", a.address, e));
+            }
+        }
+    }
+    if !cfg.adopt.is_empty() {
+        log(format!("[opsctl] adopt summary: {}/{} adopted", adopted, cfg.adopt.len()));
+        let summary = if failures.is_empty() {
+            format!("adopted {}/{} OK", adopted, cfg.adopt.len())
+        } else {
+            format!("adopted {}/{}; FAILURES: {}", adopted, cfg.adopt.len(), failures.join("; "))
+        };
+        let _ = store_at_label(
+            STORE_ID.into(),
+            String::from("opsctl-adopt-summary"),
+            summary.into_bytes(),
+        );
+        if !failures.is_empty() {
+            log(format!(
+                "[opsctl] adopt INCOMPLETE: {} failed; re-run opsctl-b3 (idempotent)",
+                failures.len()
+            ));
+            OpsState::set(OpsState { done: false });
+            return ok_unit();
         }
     }
 
