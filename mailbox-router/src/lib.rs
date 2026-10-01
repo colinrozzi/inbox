@@ -98,6 +98,9 @@ pack_types! {
         theater:inbox/router.register-owned: func(address: string, tenant: string) -> result<string, string>,
         theater:inbox/router.lookup-owned: func(address: string) -> result<option<owned>, string>,
         theater:inbox/router.list-by-tenant: func(tenant: string) -> result<list<binding>, string>,
+        // Operator reassignment (phase 2): move an EXISTING address to a new owning
+        // tenant unconditionally (register-owned refuses a cross-tenant re-stamp).
+        theater:inbox/router.reassign-owned: func(address: string, tenant: string) -> result<string, string>,
     }
 }
 
@@ -373,6 +376,40 @@ fn register_owned(address: String, tenant: String) -> Value {
                 Err(e) => err_str(&e),
             }
         }
+    }
+}
+
+/// Operator reassignment: move an EXISTING address to a new owning tenant
+/// UNCONDITIONALLY — unlike register-owned, which refuses a cross-tenant re-stamp.
+/// This is the phase-2 "grandfather off the fleet tenant" primitive: operator-only
+/// (reached via opsctl over rpc, never a tenant-facing HTTP route). Ensures the
+/// mailbox is spawned, re-stamps the owner, persists. Unknown address -> Err
+/// (creating is register-owned's job, not reassignment's).
+#[export(name = "theater:inbox/router.reassign-owned")]
+fn reassign_owned(address: String, tenant: String) -> Value {
+    let address = canon(&address);
+    if !valid_address(&address) {
+        return err_str(&format!("invalid address: {}", address));
+    }
+    if is_reserved(&address) {
+        return err_str(&format!("address is operator-reserved, not claimable: {}", address));
+    }
+    match find(&address) {
+        Some((idx, id)) => {
+            let mbox = if id.is_empty() {
+                match ensure_spawned(idx, &address) {
+                    Ok(i) => i,
+                    Err(e) => return err_str(&e),
+                }
+            } else {
+                id
+            };
+            RouterState::with_mut(|s| s.bindings[idx].tenant = tenant.clone());
+            RouterState::with(|s| save_bindings(&s.bindings));
+            log(format!("[mailbox-router] reassigned {} -> tenant '{}'", address, tenant));
+            ok_result(Value::String(mbox))
+        }
+        None => err_str(&format!("reassign-owned: unknown address: {}", address)),
     }
 }
 

@@ -171,6 +171,11 @@ struct Cfg {
     /// Grandfather existing addresses to a tenant via register-owned.
     #[serde(default)]
     adopt: Vec<Adopt>,
+    /// Phase-2: REASSIGN existing addresses to a new tenant via reassign-owned
+    /// (unconditional owner-change; adopt/register-owned refuse a cross-tenant
+    /// re-stamp). Same {address, tenant} shape as adopt.
+    #[serde(default)]
+    reassign: Vec<Adopt>,
 }
 #[derive(Deserialize)]
 struct Lbl {
@@ -336,6 +341,57 @@ fn init(config: Value) -> Value {
                 "[opsctl] adopt INCOMPLETE: {} failed; re-run opsctl-b3 (idempotent)",
                 failures.len()
             ));
+            OpsState::set(OpsState { done: false });
+            return ok_unit();
+        }
+    }
+
+    // 5. reassign (phase-2): move existing addresses to a new tenant via the
+    // unconditional reassign-owned (register-owned refuses cross-tenant re-stamps).
+    // Resilient like adopt; reassign-owned is idempotent (re-stamping to the same
+    // tenant is a no-op Ok), so a re-run safely finishes any stragglers.
+    let mut reassigned = 0usize;
+    let mut re_failures: Vec<String> = Vec::new();
+    for a in &cfg.reassign {
+        if cfg.router_id.is_empty() {
+            return abort("opsctl: reassign requires router_id");
+        }
+        let v = rpc_call(
+            cfg.router_id.clone(),
+            String::from("theater:inbox/router.reassign-owned"),
+            Value::Tuple(vec![Value::String(a.address.clone()), Value::String(a.tenant.clone())]),
+            Value::Tuple(vec![]),
+        );
+        match unwrap_result(v) {
+            Ok(Value::String(_)) => {
+                reassigned += 1;
+                log(format!("[opsctl] reassigned {} -> tenant {}", a.address, a.tenant));
+            }
+            Ok(other) => {
+                re_failures.push(format!("{} (bad shape: {})", a.address, stringify(other)));
+                log(format!("[opsctl] reassign {} bad shape, continuing", a.address));
+            }
+            Err(e) => {
+                re_failures.push(format!("{} ({})", a.address, e));
+                log(format!("[opsctl] reassign {} FAILED: {}, continuing", a.address, e));
+            }
+        }
+    }
+    if !cfg.reassign.is_empty() {
+        let n = cfg.reassign.len();
+        log(format!("[opsctl] reassign summary: {}/{} reassigned", reassigned, n));
+        let summary = if re_failures.is_empty() {
+            format!("reassigned {}/{} OK", reassigned, n)
+        } else {
+            format!("reassigned {}/{}; FAILURES: {}", reassigned, n, re_failures.join("; "))
+        };
+        let _ = store_at_label(
+            STORE_ID.into(),
+            String::from("opsctl-reassign-summary"),
+            summary.into_bytes(),
+        );
+        if !re_failures.is_empty() {
+            log(format!("[opsctl] reassign INCOMPLETE: {} failed; re-run", re_failures.len()));
             OpsState::set(OpsState { done: false });
             return ok_unit();
         }
