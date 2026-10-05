@@ -253,9 +253,22 @@ pieces around T0:
   take no deadline today). Not blocking.
 - Interim holding the line now: container agents disable auto-retry on `POST /send` (claude@ broadcast).
 
+### §2.3 egress decision (company-dev 2026-10-05): operator-configured SMARTHOST (option #1)
+No in-guest MX resolution and no proxy — route all non-local outbound through a deploy-configured
+smarthost relay; drop the client-supplied `smtp_server` fallback entirely (the SSRF/open-relay vector).
+Deliverability lens (company-dev's call): an established sending provider gives warmed IPs, reputation
+management, DKIM alignment, and the bounce/complaint feedback loops the abuse ladder needs — a self-run
+MTA on a cold shared-domain IP is the wrong v0 risk. Provider + creds are deploy-time (Colin). In-guest
+MX resolution / a theater DNS-MX host capability are documented as the future "self-send, no provider"
+path — explicitly NOT v0.
+
 ### Implementation status
 - **§2.1 cap-lock (public-instance, legacy-path hard-refused) — IMPLEMENTED: PR #105** (+
-  `ops/public-instance-cap-lock-proof.sh`). Spine-adjacent; needs a manager/Colin-gated deploy +
-  setting the `public-instance` store label on the company instance.
-- Next up: §2.3 `/send` egress allowlist (SSRF/open-relay), then the operator seam (§1) in parallel
-  with §2.5b mailbox persistence.
+  `ops/public-instance-cap-lock-proof.sh`).
+- **§2.3 smarthost relay + drop client `smtp_server` fallback + SMTP AUTH PLAIN (STARTTLS-gated) —
+  IMPLEMENTED: PR #106.** Config via store labels `outbound-smarthost` / `smarthost-user` /
+  `smarthost-pass` / `local-domain`; fleet instance unaffected (behavior changes only when a smarthost
+  is configured). DKIM preserved.
+- Both PRs are spine-adjacent → need a manager/Colin-gated deploy + the company-instance store labels
+  (`public-instance=1`, `tenancy-enforce=1`, the smarthost config). I don't deploy.
+- Next up: the operator seam (§1) in parallel with §2.5b mailbox incremental-persistence.
