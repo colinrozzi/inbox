@@ -272,3 +272,42 @@ path — explicitly NOT v0.
 - Both PRs are spine-adjacent → need a manager/Colin-gated deploy + the company-instance store labels
   (`public-instance=1`, `tenancy-enforce=1`, the smarthost config). I don't deploy.
 - Next up: the operator seam (§1) in parallel with §2.5b mailbox incremental-persistence.
+
+## 8. Operator-seam contract (company-dev, confirmed 2026-10-05) + 3-PR decomposition
+
+Auth: all `/v1/admin/*` gated on the new `operator` cap (Bearer operator-key). The control-plane holds
+exactly one operator key, **rotatable** (mint new → cut over → revoke old, via existing mint/revoke, so
+no redeploy on suspected compromise). Spine secret; bootstrap out-of-band via opsctl at deploy (never
+over the public API).
+
+Routes: `POST /v1/admin/tenants` (create-tenant) · `POST /v1/admin/tenants/<tid>/mailboxes`
+(register-owned; control-plane passes the fully-formed address) · `POST /v1/admin/tenants/<tid>/keys`
+(mint, caps=`use` only) · `DELETE /v1/admin/keys/<kid>` (revoke) · `GET /v1/admin/tenants/<tid>/keys`
+(list, hashes only) · `POST /v1/admin/tenants/<tid>/suspend` + `.../unsuspend` · (T1) set-limits.
+
+Idempotency (load-bearing — the control-plane retries over a flaky transport): an `Idempotency-Key`
+header on ALL admin POSTs → store key→{status, body} and **replay verbatim**, scoped per route+operator.
+Implemented as **HTTP-response caching in the api-handler — no registry change**. Consequences:
+- **mint-key token recovery:** the one-time plaintext token lives in the cached response body, so a
+  replay re-returns the SAME token automatically (a dropped mint response can't strand a dead key).
+  That cached body holds a plaintext token → store in the spine-secret namespace, **1h TTL** for mint
+  (24h for other admin results).
+- create-tenant is ALSO idempotent on a body `external_id` (the control-plane's opaque customer_id,
+  first-write-wins → same tenant_id, never a dup). register-owned is idempotent on the address.
+
+Address: control-plane hands `<localpart>@agent-inbox.dev` fully formed (v0 = assigned random ~6-char
+base32, collision-checked + reserved-list by them). The inbox applies no namespace policy beyond its 3
+hardcoded reserved names.
+
+Suspend: reversible flag checked at auth; blocks OUTBOUND, keeps accepting INBOUND, allows read.
+revoke-all stays a separate hard action.
+
+### 3-PR decomposition + status
+- **PR A — tenant-registry foundation: IMPLEMENTED, PR #107.** `operator` cap in the vocabulary +
+  reversible `suspended` flag on Tenant (`set-suspended` export + surfaced in `resolve`). Registry-only,
+  independently deployable (api-handler ignores the extra `resolve` field until PR B).
+- **PR B — api-handler operator routes** (next): `/v1/admin/*` gated on `operator`; wire create-tenant /
+  mint (use-only) / revoke / list / register-owned / suspend+unsuspend; + the suspended-blocks-outbound
+  check at the send path.
+- **PR C — api-handler idempotency** (after B): `Idempotency-Key` response-cache (1h mint / 24h others,
+  per route+operator) + create-tenant `external_id` natural key + register-owned address idempotency.
