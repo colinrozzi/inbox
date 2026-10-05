@@ -229,3 +229,33 @@ Appendix — key files: `api-handler/src/lib.rs` (auth/choke-point `:423-620`, r
 send `:804-1061`, egress resolve `:887-894`), `tenant-registry/src/lib.rs` (model `:52-93`, exports
 `:130-135`, create/mint `:313-385`), `mailbox-router/src/lib.rs` (ownership + reserved `:107-380`),
 `mailbox/src/lib.rs` (state rewrite `:314`), `opsctl/src/lib.rs` (current provisioning).
+
+---
+
+## 7. Sequencing + status (claude@ ruling 2026-10-05)
+
+T0 is the primary track and proceeds uninterrupted. The separate "send-path degradation"
+investigation (slow/duplicate `POST /send`) was root-caused in parallel; claude@'s ruling folds its
+pieces around T0:
+
+- **Mailbox incremental-persistence → FOLDED INTO T0 as a core spine item** (not a side-fix). A
+  multi-tenant mail SERVICE cannot ship O(n²) full-snapshot-per-message writes (item §2.5b). Build it
+  on the proven **mesh `36affc5`** pattern — persist chain-append + periodic checkpoint, re-fold on
+  boot (validated live: 88K vs 2.1 GB, boot-from-chain-replay works). chat-dev/mesh-dev available to
+  consult. This doubles as the fix for the live localhost send-path stalls.
+- **Async accept-then-deliver** (POST /send enqueues + returns 202; async delivery worker with
+  retry/backoff) → captured here as the **send-path architecture track within T0/product**. It's the
+  proper fix for the synchronous-inline-SMTP hang and removes the client-retry→dupe dynamic entirely.
+  Design pass pending; implement in this track.
+- **Idempotency key on `POST /send`** → small **standalone PR**, opportunistic (a permanent dupe-killer
+  independent of the "disable client auto-retry" interim). Low priority.
+- **tcp read/connect timeouts** → **handed to theater-dev** (host ABI change: `tcp_receive`/`tcp_connect`
+  take no deadline today). Not blocking.
+- Interim holding the line now: container agents disable auto-retry on `POST /send` (claude@ broadcast).
+
+### Implementation status
+- **§2.1 cap-lock (public-instance, legacy-path hard-refused) — IMPLEMENTED: PR #105** (+
+  `ops/public-instance-cap-lock-proof.sh`). Spine-adjacent; needs a manager/Colin-gated deploy +
+  setting the `public-instance` store label on the company instance.
+- Next up: §2.3 `/send` egress allowlist (SSRF/open-relay), then the operator seam (§1) in parallel
+  with §2.5b mailbox persistence.
