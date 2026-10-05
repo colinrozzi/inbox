@@ -45,6 +45,12 @@ pub struct HandlerState {
     /// Multi-tenant enforcement engaged (registry wired AND the store flag set).
     /// When false, the legacy shared-bearer path runs unchanged.
     pub enforce: bool,
+    /// Public (company) instance mode. When true the legacy shared-bearer path is
+    /// hard-refused: authentication NEVER yields `Caller::Legacy` (which has every
+    /// capability), so "create requires `admin`; operator creds never reach a
+    /// customer" is an UNCONDITIONAL invariant even if `enforce` is mis-set.
+    /// Fails closed — if a public instance isn't actually enforcing, it serves 401.
+    pub public_instance: bool,
 }
 
 pack_types! {
@@ -118,6 +124,10 @@ const BEARER_TOKEN_LABEL: &str = "api-bearer-token";
 // the store label takes effect on the next connection — no redeploy. "1" = on;
 // absent/anything-else = off (legacy shared-bearer behavior).
 const TENANCY_ENFORCE_LABEL: &str = "tenancy-enforce";
+// Public (company) instance flag. "1" => this is the multi-tenant public product
+// instance: the legacy shared-bearer path is hard-refused (see HandlerState docs).
+// Set it on the company instance; never on the fleet/personal instance.
+const PUBLIC_INSTANCE_LABEL: &str = "public-instance";
 
 // ============================================================================
 // API request/response types — all JSON shapes the handler reads or writes.
@@ -320,7 +330,11 @@ fn init(config: Value) -> Value {
     };
     // Enforce only when a registry is wired AND the store flag is "1".
     let enforce = !registry_id.is_empty() && flag_enabled(TENANCY_ENFORCE_LABEL);
-    HandlerState::set(HandlerState { router_id, registry_id, dkim_private_key_pem, bearer_token, enforce });
+    // Public-instance mode is a pure store flag (independent of enforce): when set,
+    // the legacy path is refused and auth fails closed if enforcement isn't actually
+    // engaged, so a mis-set public instance serves 401 rather than all-caps Legacy.
+    let public_instance = flag_enabled(PUBLIC_INSTANCE_LABEL);
+    HandlerState::set(HandlerState { router_id, registry_id, dkim_private_key_pem, bearer_token, enforce, public_instance });
     ok_unit()
 }
 
@@ -404,7 +418,7 @@ fn handle_connection_transfer(connection_id: String) -> Value {
     };
 
     let response = HandlerState::with(|s| {
-        route(&request, &s.router_id, &s.registry_id, &s.dkim_private_key_pem, &s.bearer_token, s.enforce)
+        route(&request, &s.router_id, &s.registry_id, &s.dkim_private_key_pem, &s.bearer_token, s.enforce, s.public_instance)
     });
 
     if let Err(e) = tcp_send(connection_id.clone(), response) {
@@ -427,6 +441,7 @@ fn route(
     dkim_private_key_pem: &str,
     bearer_token: &str,
     enforce: bool,
+    public_instance: bool,
 ) -> Vec<u8> {
     let request_str = match core::str::from_utf8(request) {
         Ok(s) => s,
@@ -435,7 +450,7 @@ fn route(
 
     // Authenticate: legacy shared-token, or (when enforcing) resolve the bearer to
     // a tenant + capabilities via the registry.
-    let caller = match authenticate(request_str, bearer_token, registry_id, enforce) {
+    let caller = match authenticate(request_str, bearer_token, registry_id, enforce, public_instance) {
         Ok(c) => c,
         Err(resp) => return resp,
     };
@@ -529,7 +544,15 @@ impl Caller {
 /// Authenticate the request. Legacy: match the presented bearer against the shared
 /// token(s). Enforcing: resolve the bearer to a tenant via the registry. Returns a
 /// 401 response on failure. Fails closed.
-fn authenticate(request_str: &str, bearer_token: &str, registry_id: &str, enforce: bool) -> Result<Caller, Vec<u8>> {
+///
+/// `public_instance`: on the public (company) multi-tenant instance the legacy
+/// shared-bearer path is hard-refused. Legacy callers have EVERY capability
+/// (`Caller::Legacy::has_cap` is always true), so permitting them on a customer-
+/// facing instance would let a shared token create/claim any address. With this
+/// set we only ever return a registry-resolved `Caller::Tenant` (whose caps are
+/// what they were minted with — `use`-only for customers); if enforcement isn't
+/// actually engaged we return 401 rather than silently falling back to Legacy.
+fn authenticate(request_str: &str, bearer_token: &str, registry_id: &str, enforce: bool, public_instance: bool) -> Result<Caller, Vec<u8>> {
     let presented = extract_bearer(request_str);
     if enforce {
         let token = match presented {
@@ -541,6 +564,12 @@ fn authenticate(request_str: &str, bearer_token: &str, registry_id: &str, enforc
             None => Err(error_response(401, "unauthorized")),
         }
     } else {
+        // Public instance must never yield an all-caps Legacy caller. If we reached
+        // here it means enforcement is off on an instance that must enforce — fail
+        // closed instead of granting the legacy shared-bearer every capability.
+        if public_instance {
+            return Err(error_response(401, "unauthorized"));
+        }
         let ok = bearer_token
             .split(',')
             .map(str::trim)
