@@ -1,0 +1,195 @@
+# T0 — Inbox productization for the public Agent Inbox (v0, narrowed scope)
+
+Status: DRAFT for review (inbox-dev, 2026-10-05). Greenlit by Colin via company-dev at reduced scope.
+Audience: company-dev (control-plane), claude@ (sequencing), Colin.
+
+This doc designs the **inbox-side (data-plane) T0 work** to run a **separate company instance** of
+the inbox as a public multi-tenant mail service under the split-plane architecture:
+
+- **Data plane = the inbox** (this repo). One mail interface; customers talk to it directly with a
+  per-customer tenant token. Generic knobs live here.
+- **Control plane = company** (separate repo/service). Thin, non-mail: signup, key lifecycle, tier/
+  quota *config*, usage→billing, abuse policy, suspend. Owns what the knobs *mean*. Never a mail API.
+
+It supersedes the first sizing pass with **two scope cuts Colin made on 2026-10-05**, both of which
+delete the heaviest chunks:
+
+- **Cut 1 — single shared domain, no BYO.** Everything is under **`agent-inbox.dev`**. ⇒ per-tenant
+  DKIM **dropped** (one domain key is correct); per-tenant domain-ownership verification **deferred**.
+- **Cut 2 — customers get `use`-only tokens; mailbox creation stays in the control-plane.** Customer
+  keys carry the `use` cap only, **never `admin`**. Address allocation (`register-owned`) never leaves
+  the control-plane. ⇒ the free-claim/impersonation risk is removed **by capability**, so no namespace-
+  policy build is needed in the inbox.
+
+---
+
+## 0. Headline invariant (and its one caveat) — CONFIRMED IN CODE
+
+> **Creating/claiming an address requires the `admin` capability; a `use`-only customer token cannot.
+> The operator/`admin` capability never reaches a customer.**
+
+Verified in `api-handler/src/lib.rs`:
+
+- `authenticate()` (`:532-555`) is **fail-closed**. With `enforce=true`, every request's bearer must
+  resolve via `registry.resolve` → `Caller::Tenant{id, caps}`; unknown/revoked/rpc-failure → **401**
+  (`:539-542`, `registry_resolve :559-576`).
+- `POST /v1/mailboxes` for a tenant (`handle_register_mailbox :671-674`) returns **403 unless the caller
+  has the `admin` cap**, then calls `router.register-owned` which stamps ownership + enforces the
+  reserved-list + one-tenant-per-mailbox (`mailbox-router/src/lib.rs:332-380`).
+- Per-address read/write (`resolve_for_caller :607-620`) returns **404 (never 403)** when a tenant
+  doesn't own the address — no existence leak. Uniform across every `/v1/mailboxes/<addr>/*` route
+  (the single choke-point at `:489`, before the method match).
+- Caps vocabulary is the closed set `{use, admin}` (`tenant-registry/src/lib.rs:47-48`). Minting a
+  customer key with `caps=["use"]` is exactly the use-only token we want.
+
+**THE ONE CAVEAT (must-fix for the company instance):** `Caller::Legacy::has_cap()` returns `true`
+for **every** capability (`api-handler/src/lib.rs:523`). `Caller::Legacy` is produced only when
+`enforce=false` (shared-bearer mode, `:543-553`), and the legacy `router.register` path it reaches is
+owner-less and skips the reserved/valid checks. So the invariant holds **only when**:
+
+1. the instance runs **`enforce=1`** (store flag `tenancy-enforce`, read at init), AND
+2. **no usable shared bearer** is configured/distributed (ideally the `api-bearer-token` label is
+   absent on the company instance), AND
+3. customer keys are minted **`use`-only**.
+
+**T0 ask:** on the company instance, make the Legacy path **unreachable** — simplest is a build/config
+mode that hard-disables the `enforce=false` branch and the legacy `router.register` entirely, so there
+is no "enforce off ⇒ all caps" foot-gun. (Small; see §2.)
+
+---
+
+## 1. The operator HTTP seam (control-plane ↔ inbox) — START HERE
+
+Today there is **no operator HTTP API**. All provisioning is in-tree Theater RPC or a spawned,
+spawn-gated `opsctl` WASM actor. The registry already implements the primitives we need — and three of
+them are implemented but **unreachable** (zero callers): `mint-key`, `revoke-key`, `list-keys`
+(`tenant-registry/src/lib.rs:130-135`). `create-tenant` and `router.register-owned` are reachable.
+
+The seam the control-plane calls is a **new authed operator HTTP surface** on the inbox. Proposed:
+
+| Method + route | Calls (existing export) | Notes |
+|---|---|---|
+| `POST /v1/admin/tenants` `{label, idempotency_key}` | `registry.create-tenant(label)` → `{tenant_id, root_token}` | **Make idempotent** (see below). Root token returned once. |
+| `POST /v1/admin/tenants/<tid>/mailboxes` `{address}` | `router.register-owned(address, tid)` | Control-plane picks the local-part under `agent-inbox.dev`; inbox just allocates+stamps. 409 if taken/reserved. |
+| `POST /v1/admin/tenants/<tid>/keys` `{caps:["use"], label}` | `registry.mint-key(tid, caps, label, created_by)` | Customer token minted here, **use-only**. Returned once. Wire the dead primitive. |
+| `DELETE /v1/admin/keys/<kid>` | `registry.revoke-key(kid)` | Wire the dead primitive. Idempotent already. |
+| `GET /v1/admin/tenants/<tid>/keys` | `registry.list-keys(tid)` | Wire the dead primitive (hashes/labels only, never clear tokens). |
+| `POST /v1/admin/tenants/<tid>/limits` `{...}` | `registry.set-limits` (NEW, T1) | Deferred to T1 with quota enforcement. |
+
+**Operator authentication.** The operator surface must be authed with a credential **distinct from
+customer bearers**, and the check must sit at the `/v1/admin/*` prefix *before* any of the above.
+Two options:
+
+- **(A) Operator cap (recommended).** Extend the caps vocabulary with an `operator` capability
+  (cross-tenant provisioning), mint a single operator tenant whose key carries it, and require
+  `operator` on `/v1/admin/*`. Reuses the existing `registry.resolve` auth path, so the operator key
+  gets rotation/revocation/list for free, and there's one auth mechanism not two. Cost: a small
+  registry change (extend `caps_valid` + let create-tenant/mint-key issue `operator`).
+- **(B) Dedicated operator bearer.** A separate secret (store label `operator-token`) checked at the
+  prefix, mirroring the existing bearer/flag pattern. Simpler, but a second parallel auth mechanism
+  and no built-in rotation.
+
+Recommend **(A)**. Either way: **must be done before the operator API is exposed off-box.**
+
+**Idempotency.** `create-tenant` is **not** idempotent today — a retried provision double-mints
+(counter-driven). Add a client idempotency key: index label `tenant-idem-<key>` → `tenant_id`; on
+repeat, return the existing tenant instead of minting. Matters because the control-plane will retry
+over the network. (Small.)
+
+**Why HTTP, not direct actor calls:** keeps the control-plane decoupled from rotating actor-ids
+(router/registry ids rotate on restart and must be read from acceptor state), gives one authed,
+idempotent, auditable seam, and keeps the control-plane out of the Theater tree.
+
+---
+
+## 2. Narrowed T0 feature list
+
+1. **Confirm + lock the cap boundary** (§0). The check is correct and fail-closed *for Tenant callers*;
+   the work is making the Legacy/`enforce=false` escape hatch unreachable on the company instance and
+   adding a regression test: a `use`-only token gets 403 on `POST /v1/mailboxes` and 404 on any
+   mailbox it doesn't own. **S.**
+2. **Operator HTTP seam** (§1): routes + operator authn + wire the three dead primitives + idempotent
+   create-tenant. **~1 week** (authn is the gating sub-task; the primitives already exist).
+3. **/send egress allowlist (MX-only) — the SSRF/open-relay fix. BLOCKING.** Today `resolve_smtp_server`
+   (`api-handler/src/lib.rs:887-894`) falls back to a **tenant-supplied `smtp_server`** from the request
+   body and `tcp_connect`s to it (`:917`) — an untrusted tenant can aim outbound at any internal
+   host:port or use us as an open relay. Fix: drop the body fallback; resolve recipients to real MX
+   (or the known in-domain target) only; deny everything else. **S-M.**
+4. **Single-domain DKIM/SPF/DMARC for `agent-inbox.dev`** — one DKIM key (the code already hardcodes a
+   single `dkim::DOMAIN`/`SELECTOR`), plus correct SPF + DMARC DNS for the one domain. Per-tenant DKIM
+   is explicitly **out** (Cut 1). Mostly deployment/DNS + confirming the signer. **S** (code) **+ DNS.**
+5. **Hardening (shared-reputation domain ⇒ these matter more):**
+   - **Inbound whole-message size cap.** `read_data_block` caps per *line* (10 MB) but enforces **no
+     total-message cap** (`smtp-handler/src/lib.rs`), despite advertising `SIZE 10485760`. **S.**
+   - **Mailbox O(n²) rewrite.** `mailbox` rewrites its **entire** state blob on every `put-message`
+     (`mailbox/src/lib.rs:314 → save_state`). Same full-snapshot-per-event pathology chat just fixed in
+     mesh (the 27s cold-sync stall; mesh `36affc5`). Move to append + periodic checkpoint, re-fold on
+     boot. Also implicated in the current send-path stalls (separate thread). **M.**
+   - **Hand-rolled MIME parser** on untrusted inbound (`parse_headers_and_body`, `extract_text_plain`,
+     base64/qp decoders) — bound part-count/recursion/size; fuzz. **M.**
+   - **Move spine secrets off the shared store namespace** for the company instance — DKIM key, token
+     seed, bearer currently share the flat `inbox` store with tenant data; isolation is purely
+     actor-layer. Separate store id / out-of-band for secrets. **M.**
+6. **Shared-store dedup existence-leak guard (lower priority now).** Real but latent: content-refs are
+   never serialized to clients and there is no by-ref/by-label fetch endpoint, and with use-only tokens
+   there's no creation-probing surface. Keep refs off the API + a regression guard; revisit structurally
+   only if/when raw/IMAP retrieval is built. **S.**
+7. **Re-scoped adversarial security review for untrusted tenants — the hard gate, manager-run.** Smaller
+   now (no namespace policy, no per-tenant DKIM, use-only customers), but still the go/no-go before
+   onboarding untrusted token-holders. Headline invariant from §0 is the first thing to attack.
+
+---
+
+## 3. Re-sized effort
+
+| Item | Effort | Was |
+|---|---|---|
+| 1. Cap-boundary lock + Legacy-path disable + regression test | S (~1d) | (new framing) |
+| 2. Operator HTTP seam (routes + authn + wire primitives + idempotency) | ~1 wk | ~1 wk |
+| 3. /send egress allowlist (SSRF/open-relay) | S-M (~1-2d) | S-M (blocking) |
+| 4. Single-domain DKIM/SPF/DMARC | S + DNS | (was M-H per-tenant — **cut**) |
+| 5a. Inbound message-size cap | S | S |
+| 5b. Mailbox append/checkpoint (O(n²) fix) | M (~2-4d) | M |
+| 5c. MIME parser hardening | M | M |
+| 5d. Spine-secret store separation | M | M |
+| 6. Dedup-leak guard | S | S (down-prioritized) |
+| 7. Adversarial review (manager-run) | gate | gate |
+
+**Deleted by the scope cuts:** per-tenant DKIM (M-H), domain-ownership verification (M-H), in-inbox
+namespace policy (M). These were the long pole. **Net T0 ≈ 2–3 focused weeks + the review**, down from
+the ~4–5 weeks in the first pass. Suggested order: **#1 + #3 first** (small, and #3 is blocking), then
+**#2 (the seam)** in parallel with **#5b** (which also helps the live send-path degradation), then
+**#4 + #5a/c/d**, then **#7** as the gate.
+
+---
+
+## 4. Explicitly OUT of scope for v0
+
+- Per-tenant DKIM keys; bring-your-own-domain; DNS-TXT/assignment domain-ownership verification.
+- In-inbox namespace/vanity policy (moves to the control-plane: it allocates local-parts under
+  `agent-inbox.dev`, applies reserved words, and never issues an impersonating vanity).
+- Structural cross-tenant dedup defeat (per-tenant store namespace / salted hashing).
+- Quotas/metering beyond a basic abuse rate-limit — counts-first quota + pull metering stay T1/T2.
+- Windowed rate-limits, bounce/complaint capture, self-service key management — T2 fast-follow.
+
+---
+
+## 5. What I need from the control-plane spec (open questions)
+
+1. **Address allocation policy** (control-plane owns it): assigned/random local-part format under
+   `agent-inbox.dev`? reserved-word list? Confirm the inbox only ever receives a fully-formed address
+   to `register-owned` and applies no policy of its own beyond the 3 hardcoded reserved names.
+2. **Operator authn choice:** OK with option (A) operator-cap? It needs the small caps-vocabulary
+   extension; otherwise I'll do (B) a dedicated operator bearer.
+3. **Idempotency key** shape on create-tenant (and whether register-mailbox/mint-key also need one).
+4. **Suspend/kill-switch** mechanism: is suspend = `revoke-key` (all of a tenant's keys), or do you
+   want a distinct tenant-level `suspended` flag the data plane checks at auth? (The latter is a small
+   add and cleaner for reversible suspend.)
+5. **Metering** granularity you'll actually bill on, so I scope the T1 pull exports to match.
+
+---
+
+Appendix — key files: `api-handler/src/lib.rs` (auth/choke-point `:423-620`, register `:646-689`,
+send `:804-1061`, egress resolve `:887-894`), `tenant-registry/src/lib.rs` (model `:52-93`, exports
+`:130-135`, create/mint `:313-385`), `mailbox-router/src/lib.rs` (ownership + reserved `:107-380`),
+`mailbox/src/lib.rs` (state rewrite `:314`), `opsctl/src/lib.rs` (current provisioning).
