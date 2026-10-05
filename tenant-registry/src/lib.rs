@@ -46,6 +46,11 @@ const SEED_LABEL: &str = "tenant-registry-seed";
 
 const CAP_USE: &str = "use";
 const CAP_ADMIN: &str = "admin";
+/// Cross-tenant provisioning capability: gates the operator HTTP surface
+/// (/v1/admin/*) on the public instance. Strictly higher than `admin` (which is
+/// scoped to a tenant's own mailboxes). Held only by the control-plane's single
+/// operator key; NEVER minted onto a customer key.
+const CAP_OPERATOR: &str = "operator";
 
 // ---- persisted types (forward_compatible: field-add tolerant, rollback-safe) ----
 
@@ -74,6 +79,11 @@ pub struct Tenant {
     pub id: String,
     pub label: String,
     pub keys: Vec<Key>,
+    /// Reversible suspension (abuse handling). When true the data plane blocks
+    /// OUTBOUND send for this tenant but keeps accepting inbound + allowing reads
+    /// (never drop a customer's mail). Distinct from revoke-all (the hard action).
+    /// forward_compatible: decodes to false on pre-existing state. Default = active.
+    pub suspended: bool,
 }
 
 #[derive(Clone, GraphValue, State)]
@@ -90,6 +100,9 @@ pub struct Resolved {
     pub tenant_id: String,
     pub key_id: String,
     pub caps: Vec<String>,
+    /// The owning tenant's suspension state, surfaced so the data plane can block
+    /// outbound at the auth choke-point without a second lookup.
+    pub suspended: bool,
 }
 
 #[derive(Clone, GraphValue)]
@@ -133,6 +146,7 @@ pack_types! {
         theater:inbox/registry.import-key: func(tenant-id: string, token: string, caps: list<string>, label: string) -> result<string, string>,
         theater:inbox/registry.revoke-key: func(key-id: string) -> result<_, string>,
         theater:inbox/registry.list-keys: func(tenant-id: string) -> result<list<key-meta>, string>,
+        theater:inbox/registry.set-suspended: func(tenant-id: string, suspended: bool) -> result<_, string>,
     }
 }
 
@@ -261,7 +275,7 @@ fn save_state(state: &RegistryState) {
 
 fn caps_valid(caps: &[String]) -> Result<(), String> {
     for c in caps {
-        if c != CAP_USE && c != CAP_ADMIN {
+        if c != CAP_USE && c != CAP_ADMIN && c != CAP_OPERATOR {
             return Err(format!("unknown capability: {}", c));
         }
     }
@@ -300,6 +314,7 @@ fn resolve(token: String) -> Value {
                         tenant_id: t.id.clone(),
                         key_id: k.id.clone(),
                         caps: k.caps.clone(),
+                        suspended: t.suspended,
                     });
                 }
             }
@@ -338,6 +353,7 @@ fn create_tenant(label: String) -> Value {
                 created_seq: kseq,
                 created_by: String::new(),
             }],
+            suspended: false,
         });
         (tenant_id, token)
     });
@@ -379,6 +395,31 @@ fn mint_key(tenant_id: String, caps: Vec<String>, label: String, created_by: Str
         Ok((key_id, token)) => {
             RegistryState::with(save_state);
             ok_result(Minted { key_id, token }.into())
+        }
+        Err(e) => err_str(&e),
+    }
+}
+
+/// Set/clear a tenant's reversible `suspended` flag (abuse handling). Operator-only
+/// (the api-handler gates the route on the `operator` cap). Idempotent — setting the
+/// same value twice is a no-op success. Surfaced via `resolve` so the data plane can
+/// block outbound at auth.
+#[export(name = "theater:inbox/registry.set-suspended")]
+fn set_suspended(tenant_id: String, suspended: bool) -> Value {
+    let result = RegistryState::with_mut(|s| {
+        match s.tenants.iter_mut().find(|t| t.id == tenant_id) {
+            Some(t) => {
+                t.suspended = suspended;
+                Ok(())
+            }
+            None => Err(format!("unknown tenant: {}", tenant_id)),
+        }
+    });
+    match result {
+        Ok(()) => {
+            RegistryState::with(save_state);
+            log(format!("[tenant-registry] tenant {} suspended={}", tenant_id, suspended));
+            ok_unit()
         }
         Err(e) => err_str(&e),
     }
