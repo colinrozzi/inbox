@@ -189,6 +189,42 @@ the ~4–5 weeks in the first pass. Suggested order: **#1 + #3 first** (small, a
 
 ---
 
+## 6. Decisions (resolved 2026-10-05, company-dev id=765)
+
+- **enforce=1 / no shared bearer / Legacy hard-disabled — ACCEPTED as unconditional.** The public
+  instance runs `enforce=1` from day one, configures no usable shared bearer, and the
+  `enforce=false`/legacy-`register` path is **compiled or configured out (or hard-refused)** when
+  running as the public instance. This makes "create requires `admin`; operator creds never reach a
+  customer" an *unconditional* invariant and closes the `Caller::Legacy::has_cap()==true` foot-gun.
+  Baked into T0 item #1 + its regression test.
+- **(a) Operator authn = the `operator` cap.** Caps vocabulary becomes `{use, admin, operator}`;
+  `/v1/admin/*` is gated on `operator`. Control-plane holds exactly one (rotatable) operator key.
+- **(b) Idempotency = an `Idempotency-Key` request header on all `/v1/admin/*` POSTs** (create-tenant,
+  register-mailbox, mint-key); store key→result for a 24h window and replay on repeat. Additionally:
+  create-tenant is idempotent on a caller-supplied external `customer_id` (same customer_id → same
+  tenant, never a dup); mint-key must be idempotent (a retry must not mint two credentials);
+  register-mailbox is idempotent on the address (re-register same address by same owner → no-op/200);
+  revoke/DELETE is naturally idempotent.
+- **(c) Suspend = a distinct tenant-level `suspended` flag checked at the auth choke-point** (NOT
+  revoke-all). v0 semantics: suspended **blocks OUTBOUND send**; **inbound is still accepted + stored**
+  (never drop a customer's mail); read/receive stays allowed. revoke-all-keys remains a separate,
+  harder action for compromise/termination. → **New small T0 item (§2.8).**
+- **(d) Address allocation is the control-plane's** — it hands the inbox a fully-formed
+  `<localpart>@agent-inbox.dev` (v0 default: assigned random readable local-part, ~6-char base32,
+  collision-checked by them). Inbox keeps its 3 hardcoded reserved names as a backstop and applies no
+  other policy. Vanity/custom deferred.
+- **(e) Metering dimensions (T1 pull exports): per-tenant MONTHLY `{sent, received, mailbox_count,
+  bytes(optional)}`.** Primary bill/abuse signal = outbound `sent`; secondary = `mailbox_count`. No
+  per-message event stream needed for v0.
+
+### §2.8 Suspend flag (new T0 item, from decision (c))
+A tenant-level `suspended: bool` on the `Tenant` record (forward-compatible field, no migration),
+set/cleared via an operator route (`POST /v1/admin/tenants/<tid>/suspend` / `.../unsuspend`), surfaced
+through `registry.resolve` (extend `Resolved`), and checked at the send choke-point: a suspended tenant
+gets a 403 on `POST .../send` while inbound delivery and reads continue. **S-M.**
+
+---
+
 Appendix — key files: `api-handler/src/lib.rs` (auth/choke-point `:423-620`, register `:646-689`,
 send `:804-1061`, egress resolve `:887-894`), `tenant-registry/src/lib.rs` (model `:52-93`, exports
 `:130-135`, create/mint `:313-385`), `mailbox-router/src/lib.rs` (ownership + reserved `:107-380`),
