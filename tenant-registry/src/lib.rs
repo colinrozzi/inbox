@@ -143,6 +143,7 @@ pack_types! {
         theater:inbox/registry.resolve: func(token: string) -> result<option<resolved>, string>,
         theater:inbox/registry.create-tenant: func(label: string) -> result<tenant-created, string>,
         theater:inbox/registry.mint-key: func(tenant-id: string, caps: list<string>, label: string, created-by: string) -> result<minted, string>,
+        theater:inbox/registry.mint-use-key: func(tenant-id: string, label: string) -> result<minted, string>,
         theater:inbox/registry.import-key: func(tenant-id: string, token: string, caps: list<string>, label: string) -> result<string, string>,
         theater:inbox/registry.revoke-key: func(key-id: string) -> result<_, string>,
         theater:inbox/registry.list-keys: func(tenant-id: string) -> result<list<key-meta>, string>,
@@ -364,6 +365,20 @@ fn create_tenant(label: String) -> Value {
 
 #[export(name = "theater:inbox/registry.mint-key")]
 fn mint_key(tenant_id: String, caps: Vec<String>, label: String, created_by: String) -> Value {
+    do_mint(tenant_id, caps, label, created_by)
+}
+
+/// Mint a `use`-ONLY key for a tenant — the mint primitive the operator HTTP route
+/// (/v1/admin/tenants/<tid>/keys) calls for customer keys. caps are forced to [use]
+/// SERVER-SIDE, so the public operator API can never mint an admin/operator key even
+/// by mistake (defense in depth), and the api-handler passes only string params (no
+/// list<string> over the wire). `created_by` is stamped "operator".
+#[export(name = "theater:inbox/registry.mint-use-key")]
+fn mint_use_key(tenant_id: String, label: String) -> Value {
+    do_mint(tenant_id, vec![CAP_USE.to_string()], label, String::from("operator"))
+}
+
+fn do_mint(tenant_id: String, caps: Vec<String>, label: String, created_by: String) -> Value {
     if let Err(e) = caps_valid(&caps) {
         return err_str(&e);
     }
