@@ -12,3 +12,4 @@ packr-abi = { version = "0.24", default-features = false }
 theater-guest = { git = "https://github.com/colinrozzi/theater", rev = "cfcd737606758d388ab9d7042932d13e8da23a76" }
 serde = { version = "1", default-features = false, features = ["alloc", "derive"] }
 serde_json = { version = "1", default-features = false, features = ["alloc"] }
+base64 = { version = "0.22", default-features = false, features = ["alloc"] }

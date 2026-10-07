@@ -20,10 +20,22 @@ use alloc::format;
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
+use base64::engine::{general_purpose::STANDARD as B64, Engine as _};
 use packr_guest::{decode, encode, export, import, pack_types, GraphValue, Value, ValueType};
+use serde::Deserialize;
 use theater_guest::State;
 
 packr_guest::setup_guest!();
+
+// Router init_state (bare-box deploy): the mailbox manifest + its wasm (base64), so
+// the router threads wasm_bytes into each lazy per-address mailbox spawn. The acceptor
+// sends this JSON; a bare manifest string is still accepted for back-compat (fleet).
+#[derive(Deserialize)]
+struct RouterInit {
+    mailbox_manifest: String,
+    #[serde(default)]
+    mailbox_wasm_b64: String,
+}
 
 const STORE_ID: &str = "inbox";
 const BINDINGS_LABEL: &str = "router-bindings";
@@ -56,6 +68,11 @@ pub struct Owned {
 pub struct RouterState {
     /// The manifest reference used to spawn new mailbox actors.
     pub mailbox_manifest: String,
+    /// Mailbox wasm bytes for the bare-box push-spawn, threaded into each lazy
+    /// per-address mailbox spawn. Empty on the fleet instance (init omits it) =>
+    /// runtime.spawn resolves manifest.package. Init-provided, NOT persisted (only
+    /// `bindings` persist, under `router-bindings`), so no state-migration concern.
+    pub mailbox_wasm: Vec<u8>,
     pub bindings: Vec<Binding>,
 }
 
@@ -140,8 +157,8 @@ fn log(msg: String);
 #[import(module = "theater:simple/runtime", name = "spawn")]
 fn supervisor_spawn_raw(manifest: String, init_state: Option<Value>, wasm_bytes: Option<Vec<u8>>) -> Value;
 
-fn supervisor_spawn(manifest: &str, init_state: Option<Value>) -> Result<String, String> {
-    match supervisor_spawn_raw(String::from(manifest), init_state, None) {
+fn supervisor_spawn(manifest: &str, init_state: Option<Value>, wasm: Option<Vec<u8>>) -> Result<String, String> {
+    match supervisor_spawn_raw(String::from(manifest), init_state, wasm) {
         Value::Result { value: Ok(ok), .. } => match *ok {
             Value::String(id) => Ok(id),
             _ => Err(String::from("spawn: bad ok payload")),
@@ -217,18 +234,41 @@ fn save_bindings(bindings: &[Binding]) {
     }
 }
 
-fn spawn_mailbox(manifest: &str, address: &str) -> Result<String, String> {
-    supervisor_spawn(manifest, Some(Value::String(String::from(address))))
+fn spawn_mailbox(manifest: &str, wasm: Option<Vec<u8>>, address: &str) -> Result<String, String> {
+    supervisor_spawn(manifest, Some(Value::String(String::from(address))), wasm)
         .map_err(|e| format!("spawn mailbox failed: {}", e))
+}
+
+/// The mailbox wasm bytes to thread into a spawn: None when empty (fleet => package).
+fn mailbox_wasm_opt() -> Option<Vec<u8>> {
+    RouterState::with(|s| if s.mailbox_wasm.is_empty() { None } else { Some(s.mailbox_wasm.clone()) })
 }
 
 #[export(name = "theater:simple/actor.init")]
 fn init(config: Value) -> Value {
-    let mailbox_manifest = match config {
+    let raw = match config {
         Value::String(s) => s,
-        _ => return err_str("mailbox-router init: expected init_state = string (mailbox manifest path)"),
+        _ => return err_str("mailbox-router init: expected init_state = string (mailbox manifest, or JSON {mailbox_manifest, mailbox_wasm_b64})"),
     };
-    log(format!("[mailbox-router] init (manifest={}) — lazy mailbox spawn", mailbox_manifest));
+    // Accept JSON {mailbox_manifest, mailbox_wasm_b64} (bare-box push) OR a bare
+    // manifest string (legacy/fleet — a manifest ref is never a JSON object, so the
+    // fallback is unambiguous; wasm then empty => mailbox spawns resolve package).
+    let (mailbox_manifest, mailbox_wasm_b64) = match serde_json::from_str::<RouterInit>(&raw) {
+        Ok(r) => (r.mailbox_manifest, r.mailbox_wasm_b64),
+        Err(_) => (raw, String::new()),
+    };
+    if mailbox_manifest.is_empty() {
+        return err_str("mailbox-router init: mailbox_manifest must be non-empty");
+    }
+    let mailbox_wasm = if mailbox_wasm_b64.is_empty() {
+        Vec::new()
+    } else {
+        match B64.decode(mailbox_wasm_b64.as_bytes()) {
+            Ok(b) => b,
+            Err(e) => return err_str(&format!("mailbox-router init: mailbox_wasm_b64 decode failed: {}", e)),
+        }
+    };
+    log(format!("[mailbox-router] init (manifest={}, wasm={}B) — lazy mailbox spawn", mailbox_manifest, mailbox_wasm.len()));
     let saved = match load_bindings() {
         Ok(Some(b)) => b,
         // No bindings stored yet -> fresh empty index is correct.
@@ -252,7 +292,7 @@ fn init(config: Value) -> Value {
         .into_iter()
         .map(|b| Binding { address: canon(&b.address), mailbox_id: String::new(), tenant: b.tenant })
         .collect();
-    RouterState::set(RouterState { mailbox_manifest, bindings });
+    RouterState::set(RouterState { mailbox_manifest, mailbox_wasm, bindings });
     ok_unit()
 }
 
@@ -271,7 +311,7 @@ fn find(address: &str) -> Option<(usize, String)> {
 /// borrow, then the id is written back.
 fn ensure_spawned(idx: usize, address: &str) -> Result<String, String> {
     let manifest = RouterState::with(|s| s.mailbox_manifest.clone());
-    let id = spawn_mailbox(&manifest, address)?;
+    let id = spawn_mailbox(&manifest, mailbox_wasm_opt(), address)?;
     log(format!("[mailbox-router] lazily spawned {} -> {}", address, id));
     RouterState::with_mut(|s| s.bindings[idx].mailbox_id = id.clone());
     Ok(id)
@@ -288,7 +328,7 @@ fn register(address: String) -> Value {
         },
         None => {
             let manifest = RouterState::with(|s| s.mailbox_manifest.clone());
-            match spawn_mailbox(&manifest, &address) {
+            match spawn_mailbox(&manifest, mailbox_wasm_opt(), &address) {
                 Ok(id) => {
                     log(format!("[mailbox-router] registered {} -> {}", address, id));
                     RouterState::with_mut(|s| {
@@ -360,7 +400,7 @@ fn register_owned(address: String, tenant: String) -> Value {
         // New address: spawn + create the owned binding.
         None => {
             let manifest = RouterState::with(|s| s.mailbox_manifest.clone());
-            match spawn_mailbox(&manifest, &address) {
+            match spawn_mailbox(&manifest, mailbox_wasm_opt(), &address) {
                 Ok(id) => {
                     log(format!("[mailbox-router] registered {} -> {} (tenant={})", address, id, tenant));
                     RouterState::with_mut(|s| {

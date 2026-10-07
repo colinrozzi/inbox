@@ -29,6 +29,7 @@ use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec;
 use alloc::vec::Vec;
+use base64::engine::{general_purpose::STANDARD as B64, Engine as _};
 use packr_guest::{export, import, pack_types, GraphValue, Value, ValueType};
 use serde::{Deserialize, Serialize};
 use theater_guest::State;
@@ -42,6 +43,11 @@ pub struct AcceptorState {
     /// tenant-registry actor id, "" if not wired. Passed to each api-handler.
     pub registry_id: String,
     pub api_handler_manifest: String,
+    /// api-handler wasm bytes for the bare-box push-spawn (decoded from init_state's
+    /// base64). Empty on the fleet instance (init omits it) => runtime.spawn resolves
+    /// the manifest.package from /nix as before. Held here because the api-handler is
+    /// spawned per HTTP connection, not at init.
+    pub api_handler_wasm: Vec<u8>,
 }
 
 pack_types! {
@@ -99,8 +105,8 @@ fn supervisor_spawn_raw(manifest: String, init_state: Option<Value>, wasm_bytes:
 #[import(module = "theater:simple/runtime", name = "stop-actor")]
 fn supervisor_stop_actor_raw(id: String) -> Value;
 
-fn supervisor_spawn(manifest: String, init_state: Option<Value>) -> Result<String, String> {
-    match supervisor_spawn_raw(manifest, init_state, None) {
+fn supervisor_spawn(manifest: String, init_state: Option<Value>, wasm: Option<Vec<u8>>) -> Result<String, String> {
+    match supervisor_spawn_raw(manifest, init_state, wasm) {
         Value::Result { value: Ok(ok), .. } => match *ok {
             Value::String(id) => Ok(id),
             _ => Err(String::from("spawn: bad ok payload")),
@@ -147,6 +153,24 @@ struct Config {
     // so a non-root spin-up needs no source patch.
     #[serde(default)]
     smtp_listen_addr: String,
+    // Bare-box push-spawn (server3 has no /nix): the child wasm BINARIES, base64'd,
+    // alongside the inline:<toml> *_manifest refs above. Decoded + threaded as the
+    // TYPED wasm_bytes arg of runtime.spawn (inline: can't carry binary). All optional
+    // (#[serde(default)] = ""): the fleet /nix instance omits them, so wasm_bytes stays
+    // None and runtime.spawn resolves manifest.package as before. The acceptor's OWN
+    // wasm rides the supervisor root-push, not here.
+    #[serde(default)]
+    api_handler_wasm_b64: String,
+    #[serde(default)]
+    router_wasm_b64: String,
+    #[serde(default)]
+    tenant_registry_wasm_b64: String,
+    #[serde(default)]
+    smtp_acceptor_wasm_b64: String,
+    #[serde(default)]
+    mailbox_wasm_b64: String,
+    #[serde(default)]
+    smtp_handler_wasm_b64: String,
 }
 
 #[derive(Serialize)]
@@ -154,12 +178,35 @@ struct SmtpInit<'a> {
     router_id: &'a str,
     smtp_handler_manifest: &'a str,
     listen_addr: &'a str,
+    // smtp-handler wasm (base64) for the bare-box grandchild spawn. "" on the fleet.
+    smtp_handler_wasm_b64: &'a str,
 }
 
 #[derive(Serialize)]
 struct ApiHandlerInit<'a> {
     router_id: &'a str,
     registry_id: &'a str,
+}
+
+// Router init_state: the mailbox manifest + its wasm (base64) so the router can
+// thread wasm_bytes into each lazy per-address mailbox spawn on a bare box. The
+// router also accepts a bare manifest string (legacy/fleet) — see its init.
+#[derive(Serialize)]
+struct RouterInit<'a> {
+    mailbox_manifest: &'a str,
+    mailbox_wasm_b64: &'a str,
+}
+
+/// Decode an OPTIONAL base64 wasm blob. "" (fleet instance) => None => runtime.spawn
+/// resolves manifest.package. A non-empty value that fails to decode is fatal (a
+/// corrupt push must not silently fall back to a /nix path the bare box lacks).
+fn decode_wasm(b64: &str) -> Result<Option<Vec<u8>>, String> {
+    if b64.is_empty() {
+        return Ok(None);
+    }
+    B64.decode(b64.as_bytes())
+        .map(Some)
+        .map_err(|e| format!("base64 wasm decode failed: {}", e))
 }
 
 // ---- result-Value helpers (identical across all inbox actors) ----
@@ -231,7 +278,34 @@ fn init(config: Value) -> Value {
         smtp_handler_manifest,
         tenant_registry_manifest,
         smtp_listen_addr,
+        api_handler_wasm_b64,
+        router_wasm_b64,
+        tenant_registry_wasm_b64,
+        smtp_acceptor_wasm_b64,
+        mailbox_wasm_b64,
+        smtp_handler_wasm_b64,
     } = cfg;
+
+    // Decode the pushed child wasms once (bare-box deploy). Each is None on the fleet
+    // instance (fields omitted), so runtime.spawn falls back to manifest.package.
+    let router_wasm = match decode_wasm(&router_wasm_b64) {
+        Ok(w) => w,
+        Err(e) => return err_str(&format!("router_wasm_b64: {}", e)),
+    };
+    let tenant_registry_wasm = match decode_wasm(&tenant_registry_wasm_b64) {
+        Ok(w) => w,
+        Err(e) => return err_str(&format!("tenant_registry_wasm_b64: {}", e)),
+    };
+    let smtp_acceptor_wasm = match decode_wasm(&smtp_acceptor_wasm_b64) {
+        Ok(w) => w,
+        Err(e) => return err_str(&format!("smtp_acceptor_wasm_b64: {}", e)),
+    };
+    let api_handler_wasm = match decode_wasm(&api_handler_wasm_b64) {
+        Ok(w) => w,
+        Err(e) => return err_str(&format!("api_handler_wasm_b64: {}", e)),
+    };
+    // mailbox + smtp_handler wasms are forwarded (still base64) to the router /
+    // smtp-acceptor init_states for their lazy grandchild spawns — decoded there.
 
     // GATEKEEPER: secrets must already be seeded in the store (manager-owned, never
     // in this http-publishable manifest). Fail LOUD if absent/empty/unreadable —
@@ -246,8 +320,17 @@ fn init(config: Value) -> Value {
         "[inbox-acceptor] secrets verified present in store (bearer + dkim) — gatekeeper ok",
     ));
 
-    // Spawn the mailbox-router (owns address -> mailbox mapping; lazy-spawns).
-    let router_id = match supervisor_spawn(router_manifest, Some(Value::String(mailbox_manifest))) {
+    // Spawn the mailbox-router (owns address -> mailbox mapping; lazy-spawns). It gets
+    // the mailbox manifest + (base64) wasm so it can thread wasm_bytes into each lazy
+    // per-address mailbox spawn on a bare box.
+    let router_init = match serde_json::to_string(&RouterInit {
+        mailbox_manifest: &mailbox_manifest,
+        mailbox_wasm_b64: &mailbox_wasm_b64,
+    }) {
+        Ok(s) => Value::String(s),
+        Err(e) => return err_str(&format!("serialize router init failed: {}", e)),
+    };
+    let router_id = match supervisor_spawn(router_manifest, Some(router_init), router_wasm) {
         Ok(id) => id,
         Err(e) => return err_str(&format!("spawn router failed: {}", e)),
     };
@@ -259,7 +342,7 @@ fn init(config: Value) -> Value {
     let registry_id = if tenant_registry_manifest.is_empty() {
         String::new()
     } else {
-        match supervisor_spawn(tenant_registry_manifest, Some(Value::String(String::new()))) {
+        match supervisor_spawn(tenant_registry_manifest, Some(Value::String(String::new())), tenant_registry_wasm) {
             Ok(id) => {
                 log(format!("[inbox-acceptor] spawned tenant-registry {}", id));
                 id
@@ -279,17 +362,24 @@ fn init(config: Value) -> Value {
         router_id: &router_id,
         smtp_handler_manifest: &smtp_handler_manifest,
         listen_addr: &smtp_listen_addr,
+        smtp_handler_wasm_b64: &smtp_handler_wasm_b64,
     }) {
         Ok(s) => Value::String(s),
         Err(e) => return err_str(&format!("serialize smtp-acceptor init failed: {}", e)),
     };
-    let smtp_acceptor_id = match supervisor_spawn(smtp_acceptor_manifest, Some(smtp_init_state)) {
+    let smtp_acceptor_id = match supervisor_spawn(smtp_acceptor_manifest, Some(smtp_init_state), smtp_acceptor_wasm) {
         Ok(id) => id,
         Err(e) => return err_str(&format!("spawn smtp-acceptor failed: {}", e)),
     };
     log(format!("[inbox-acceptor] spawned smtp-acceptor {}", smtp_acceptor_id));
 
-    AcceptorState::set(AcceptorState { listener_id, router_id, registry_id, api_handler_manifest });
+    AcceptorState::set(AcceptorState {
+        listener_id,
+        router_id,
+        registry_id,
+        api_handler_manifest,
+        api_handler_wasm: api_handler_wasm.unwrap_or_default(),
+    });
     ok_unit()
 }
 
@@ -304,14 +394,16 @@ fn handle_connection(connection_id: String) -> Value {
 }
 
 fn try_handle_connection(connection_id: &str) -> Result<(), String> {
-    let (api_handler_manifest, router_id, registry_id) = AcceptorState::with(|s| {
-        (s.api_handler_manifest.clone(), s.router_id.clone(), s.registry_id.clone())
+    let (api_handler_manifest, router_id, registry_id, api_handler_wasm) = AcceptorState::with(|s| {
+        (s.api_handler_manifest.clone(), s.router_id.clone(), s.registry_id.clone(), s.api_handler_wasm.clone())
     });
 
     // Pass both ids as JSON. api-handler tolerates a bare router_id too (legacy).
     let init = serde_json::to_string(&ApiHandlerInit { router_id: &router_id, registry_id: &registry_id })
         .map_err(|e| format!("serialize api-handler init failed: {}", e))?;
-    let handler_id = supervisor_spawn(api_handler_manifest, Some(Value::String(init)))
+    // Thread the pushed api-handler wasm on a bare box; empty => None => manifest.package.
+    let wasm = if api_handler_wasm.is_empty() { None } else { Some(api_handler_wasm) };
+    let handler_id = supervisor_spawn(api_handler_manifest, Some(Value::String(init)), wasm)
         .map_err(|e| format!("spawn api-handler failed: {}", e))?;
 
     // Non-blocking hand-off (avoids the accept-loop wedge). On sync failure the

@@ -16,6 +16,7 @@ use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec;
 use alloc::vec::Vec;
+use base64::engine::{general_purpose::STANDARD as B64, Engine as _};
 use packr_guest::{export, import, pack_types, GraphValue, Value, ValueType};
 use serde::Deserialize;
 use theater_guest::State;
@@ -27,6 +28,10 @@ pub struct SmtpAcceptorState {
     pub listener_id: String,
     pub router_id: String,
     pub smtp_handler_manifest: String,
+    /// smtp-handler wasm bytes for the bare-box push-spawn, threaded into each
+    /// per-connection smtp-handler spawn. Empty on the fleet instance (init omits it)
+    /// => runtime.spawn resolves manifest.package. Init-provided; not store-persisted.
+    pub smtp_handler_wasm: Vec<u8>,
 }
 
 pack_types! {
@@ -78,8 +83,8 @@ fn supervisor_spawn_raw(manifest: String, init_state: Option<Value>, wasm_bytes:
 #[import(module = "theater:simple/runtime", name = "stop-actor")]
 fn supervisor_stop_actor_raw(id: String) -> Value;
 
-fn supervisor_spawn(manifest: String, init_state: Option<Value>) -> Result<String, String> {
-    match supervisor_spawn_raw(manifest, init_state, None) {
+fn supervisor_spawn(manifest: String, init_state: Option<Value>, wasm: Option<Vec<u8>>) -> Result<String, String> {
+    match supervisor_spawn_raw(manifest, init_state, wasm) {
         Value::Result { value: Ok(ok), .. } => match *ok {
             Value::String(id) => Ok(id),
             _ => Err(String::from("spawn: bad ok payload")),
@@ -107,6 +112,10 @@ struct Config {
     // from init config, no source patch; prod omits it and gets :25.
     #[serde(default)]
     listen_addr: String,
+    // smtp-handler wasm (base64) for the bare-box push-spawn, threaded into each
+    // per-connection handler spawn. "" on the fleet instance => package resolution.
+    #[serde(default)]
+    smtp_handler_wasm_b64: String,
 }
 
 // ---- result-Value helpers (identical across all inbox actors) ----
@@ -128,16 +137,26 @@ fn init(config: Value) -> Value {
         ),
     };
 
-    let (router_id, smtp_handler_manifest, listen_addr) = if let Ok(cfg) = serde_json::from_str::<Config>(&raw) {
+    let (router_id, smtp_handler_manifest, listen_addr, smtp_handler_wasm_b64) = if let Ok(cfg) = serde_json::from_str::<Config>(&raw) {
         if cfg.router_id.is_empty() {
             return err_str("router_id must be non-empty");
         }
         if cfg.smtp_handler_manifest.is_empty() {
             return err_str("smtp_handler_manifest must be non-empty");
         }
-        (cfg.router_id, cfg.smtp_handler_manifest, cfg.listen_addr)
+        (cfg.router_id, cfg.smtp_handler_manifest, cfg.listen_addr, cfg.smtp_handler_wasm_b64)
     } else {
-        (raw, String::from(DEFAULT_SMTP_HANDLER_MANIFEST), String::new())
+        (raw, String::from(DEFAULT_SMTP_HANDLER_MANIFEST), String::new(), String::new())
+    };
+
+    // Decode the pushed smtp-handler wasm (bare box); empty on the fleet => package.
+    let smtp_handler_wasm = if smtp_handler_wasm_b64.is_empty() {
+        Vec::new()
+    } else {
+        match B64.decode(smtp_handler_wasm_b64.as_bytes()) {
+            Ok(b) => b,
+            Err(e) => return err_str(&format!("smtp_handler_wasm_b64 decode failed: {}", e)),
+        }
     };
 
     // Empty listen_addr => the :25 default (prod). A dev/proof node sets it to an
@@ -156,7 +175,7 @@ fn init(config: Value) -> Value {
     };
     log(format!("[inbox-smtp-acceptor] SMTP listening on {} (id={})", listen, listener_id));
 
-    SmtpAcceptorState::set(SmtpAcceptorState { listener_id, router_id, smtp_handler_manifest });
+    SmtpAcceptorState::set(SmtpAcceptorState { listener_id, router_id, smtp_handler_manifest, smtp_handler_wasm });
     ok_unit()
 }
 
@@ -170,10 +189,13 @@ fn handle_connection(connection_id: String) -> Value {
 }
 
 fn try_handle_connection(connection_id: &str) -> Result<(), String> {
-    let (router_id, manifest) =
-        SmtpAcceptorState::with(|s| (s.router_id.clone(), s.smtp_handler_manifest.clone()));
+    let (router_id, manifest, handler_wasm) = SmtpAcceptorState::with(|s| {
+        (s.router_id.clone(), s.smtp_handler_manifest.clone(), s.smtp_handler_wasm.clone())
+    });
 
-    let handler_id = supervisor_spawn(manifest, Some(Value::String(router_id)))
+    // Thread the pushed smtp-handler wasm on a bare box; empty => None => package.
+    let wasm = if handler_wasm.is_empty() { None } else { Some(handler_wasm) };
+    let handler_id = supervisor_spawn(manifest, Some(Value::String(router_id)), wasm)
         .map_err(|e| format!("spawn smtp-handler failed: {}", e))?;
 
     // Non-blocking hand-off — a slow/stalled/malicious client can't serialize +
