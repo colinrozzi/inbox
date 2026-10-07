@@ -41,7 +41,7 @@ set -uo pipefail
 API="${INBOX_API:-https://agent-inbox.dev}"
 : "${TOKEN_ADMIN:?set TOKEN_ADMIN (an admin-capped key)}"
 : "${TOKEN_USE:?set TOKEN_USE (a use-only key, same tenant)}"
-: "${ADDR_OWN:?set ADDR_OWN (the tenant's registered address)}"
+: "${ADDR_OWN:?set ADDR_OWN - the registered address for the test tenant}"
 ADDR_OTHER="${ADDR_OTHER:-nobody-else-$RANDOM@agent-inbox.dev}"
 NEW_ADDR="${NEW_ADDR:-claim-attempt-$RANDOM@agent-inbox.dev}"
 
