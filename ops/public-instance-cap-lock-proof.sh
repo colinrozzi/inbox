@@ -64,7 +64,7 @@ status() {
   fi
 }
 
-echo "== use-only token: the `use` cap works on its OWN mailbox =="
+echo "== use-only token: the 'use' cap works on its OWN mailbox =="
 status "USE reads own inbox            -> 200" 200 "$TOKEN_USE" GET  "/v1/mailboxes/$ADDR_OWN/inbox?since=0"
 status "USE sends from own address     -> 200" 200 "$TOKEN_USE" POST "/v1/mailboxes/$ADDR_OWN/send" "{\"to\":[\"$ADDR_OWN\"],\"subject\":\"self\",\"body\":\"ok\"}"
 
