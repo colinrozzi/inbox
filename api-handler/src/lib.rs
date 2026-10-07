@@ -17,6 +17,7 @@ use alloc::boxed::Box;
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
+use base64::engine::{general_purpose::STANDARD as B64, Engine as _};
 use packr_guest::{export, import, pack_types, GraphValue, Value, ValueType};
 use serde::{Deserialize, Serialize};
 use theater_guest::State;
@@ -51,6 +52,19 @@ pub struct HandlerState {
     /// customer" is an UNCONDITIONAL invariant even if `enforce` is mis-set.
     /// Fails closed — if a public instance isn't actually enforcing, it serves 401.
     pub public_instance: bool,
+    /// Outbound relay (smarthost) "host:port". Empty => unset (legacy per-domain +
+    /// client-fallback behavior, used by the fleet instance). When set, ALL non-local
+    /// outbound is delivered to this host and the client-supplied `smtp_server` is
+    /// NEVER consulted — closing the SSRF/open-relay vector. Deploy-configured.
+    pub smarthost: String,
+    /// SMTP AUTH credentials for the smarthost. Empty user => no AUTH (e.g. an
+    /// IP-allowlisted relay). When set, AUTH PLAIN is sent only after STARTTLS.
+    pub smarthost_user: String,
+    pub smarthost_pass: String,
+    /// This instance's own mail domain (e.g. "agent-inbox.dev") — recipients here
+    /// deliver locally (localhost:25) instead of via the smarthost. Empty => the
+    /// legacy default local domain ("colinrozzi.com").
+    pub local_domain: String,
 }
 
 pack_types! {
@@ -128,6 +142,14 @@ const TENANCY_ENFORCE_LABEL: &str = "tenancy-enforce";
 // instance: the legacy shared-bearer path is hard-refused (see HandlerState docs).
 // Set it on the company instance; never on the fleet/personal instance.
 const PUBLIC_INSTANCE_LABEL: &str = "public-instance";
+// Outbound relay (smarthost) config. Deploy-configured on the public instance; all
+// absent/empty on the fleet instance (which keeps the legacy per-domain behavior).
+// NOTE: smarthost-pass is a secret — belongs in the separate spine-secret store once
+// that lands (T0 secret-store separation); read from the inbox store for now.
+const SMARTHOST_LABEL: &str = "outbound-smarthost";
+const SMARTHOST_USER_LABEL: &str = "smarthost-user";
+const SMARTHOST_PASS_LABEL: &str = "smarthost-pass";
+const LOCAL_DOMAIN_LABEL: &str = "local-domain";
 
 // ============================================================================
 // API request/response types — all JSON shapes the handler reads or writes.
@@ -307,6 +329,15 @@ fn flag_enabled(label: &str) -> bool {
     matches!(load_label_as_string(label), Ok(v) if v.trim() == "1")
 }
 
+/// Read an OPTIONAL store label as a trimmed string; "" if absent/unreadable. Used
+/// for deploy-time config (smarthost, local domain) that the fleet instance omits.
+fn load_label_opt(label: &str) -> String {
+    match load_label_as_string(label) {
+        Ok(v) => v.trim().to_string(),
+        Err(_) => String::new(),
+    }
+}
+
 #[export(name = "theater:simple/actor.init")]
 fn init(config: Value) -> Value {
     let raw = match config {
@@ -334,7 +365,15 @@ fn init(config: Value) -> Value {
     // the legacy path is refused and auth fails closed if enforcement isn't actually
     // engaged, so a mis-set public instance serves 401 rather than all-caps Legacy.
     let public_instance = flag_enabled(PUBLIC_INSTANCE_LABEL);
-    HandlerState::set(HandlerState { router_id, registry_id, dkim_private_key_pem, bearer_token, enforce, public_instance });
+    // Outbound relay (smarthost) config — all optional; absent on the fleet instance.
+    let smarthost = load_label_opt(SMARTHOST_LABEL);
+    let smarthost_user = load_label_opt(SMARTHOST_USER_LABEL);
+    let smarthost_pass = load_label_opt(SMARTHOST_PASS_LABEL);
+    let local_domain = load_label_opt(LOCAL_DOMAIN_LABEL);
+    HandlerState::set(HandlerState {
+        router_id, registry_id, dkim_private_key_pem, bearer_token, enforce,
+        public_instance, smarthost, smarthost_user, smarthost_pass, local_domain,
+    });
     ok_unit()
 }
 
@@ -418,7 +457,13 @@ fn handle_connection_transfer(connection_id: String) -> Value {
     };
 
     let response = HandlerState::with(|s| {
-        route(&request, &s.router_id, &s.registry_id, &s.dkim_private_key_pem, &s.bearer_token, s.enforce, s.public_instance)
+        let relay = RelayCfg {
+            host: &s.smarthost,
+            user: &s.smarthost_user,
+            pass: &s.smarthost_pass,
+            local_domain: &s.local_domain,
+        };
+        route(&request, &s.router_id, &s.registry_id, &s.dkim_private_key_pem, &s.bearer_token, s.enforce, s.public_instance, &relay)
     });
 
     if let Err(e) = tcp_send(connection_id.clone(), response) {
@@ -434,6 +479,15 @@ fn handle_connection_transfer(connection_id: String) -> Value {
 // Routing
 // ============================================================================
 
+/// Outbound relay (smarthost) config, borrowed for the lifetime of one request.
+/// `host` empty => no relay configured (legacy behavior). See `HandlerState`.
+struct RelayCfg<'a> {
+    host: &'a str,
+    user: &'a str,
+    pass: &'a str,
+    local_domain: &'a str,
+}
+
 fn route(
     request: &[u8],
     router_id: &str,
@@ -442,6 +496,7 @@ fn route(
     bearer_token: &str,
     enforce: bool,
     public_instance: bool,
+    relay: &RelayCfg,
 ) -> Vec<u8> {
     let request_str = match core::str::from_utf8(request) {
         Ok(s) => s,
@@ -515,7 +570,7 @@ fn route(
                 },
             ),
             ("GET", "inbox") => handle_inbox(query, &mailbox_id),
-            ("POST", "send") => handle_send(request_str, &address, dkim_private_key_pem),
+            ("POST", "send") => handle_send(request_str, &address, dkim_private_key_pem, relay),
             ("POST", "backfill-raw") => handle_backfill(&mailbox_id),
             _ => error_response(404, "not found"),
         };
@@ -830,7 +885,7 @@ fn handle_backfill(mailbox_id: &str) -> Vec<u8> {
 /// message in their own mailbox they should Bcc themselves, which goes
 /// through the same SMTP code path as any external recipient — including
 /// loopback when the address is on this server's domain.
-fn handle_send(request_str: &str, from: &str, dkim_private_key_pem: &str) -> Vec<u8> {
+fn handle_send(request_str: &str, from: &str, dkim_private_key_pem: &str, relay: &RelayCfg) -> Vec<u8> {
     let req: SendRequest = match parse_body(request_str) {
         Ok(r) => r,
         Err(resp) => return resp,
@@ -843,12 +898,21 @@ fn handle_send(request_str: &str, from: &str, dkim_private_key_pem: &str) -> Vec
     // Group every recipient by the SMTP server that should handle it.
     // Unresolvable recipients (no domain match, no fallback) go straight
     // into the `failed` list — we still attempt the others.
-    let fallback_server = req.smtp_server.as_deref();
+    //
+    // When a smarthost is configured the client-supplied `smtp_server` is IGNORED
+    // (set to None) — a customer must never be able to pick the delivery host, which
+    // is the SSRF/open-relay vector. Without a smarthost (fleet instance) the legacy
+    // fallback stands.
+    let fallback_server = if relay.host.is_empty() {
+        req.smtp_server.as_deref()
+    } else {
+        None
+    };
     let mut groups: Vec<(String, Vec<String>)> = Vec::new();
     let mut delivered: Vec<String> = Vec::new();
     let mut failed: Vec<FailedRecipient> = Vec::new();
     for rcpt in req.to.iter().chain(req.cc.iter()).chain(req.bcc.iter()) {
-        match resolve_smtp_server(rcpt, fallback_server) {
+        match resolve_smtp_server(rcpt, fallback_server, relay.host, relay.local_domain) {
             Some(server) => match groups.iter_mut().find(|(s, _)| s == &server) {
                 Some((_, list)) => list.push(rcpt.clone()),
                 None => groups.push((server, alloc::vec![rcpt.clone()])),
@@ -863,6 +927,13 @@ fn handle_send(request_str: &str, from: &str, dkim_private_key_pem: &str) -> Vec
     let in_reply_to = req.in_reply_to.as_deref().unwrap_or("");
     let references = req.references.as_deref().unwrap_or("");
     for (server, group_rcpts) in &groups {
+        // AUTH only to the configured smarthost, and only when creds are set. A plain
+        // relay (IP-allowlisted) or local/legacy delivery uses no AUTH.
+        let auth = if !relay.host.is_empty() && server.as_str() == relay.host && !relay.user.is_empty() {
+            Some((relay.user, relay.pass))
+        } else {
+            None
+        };
         match smtp_deliver(
             server,
             from,
@@ -874,6 +945,7 @@ fn handle_send(request_str: &str, from: &str, dkim_private_key_pem: &str) -> Vec
             in_reply_to,
             references,
             dkim_private_key_pem,
+            auth,
         ) {
             Ok(()) => delivered.extend(group_rcpts.iter().cloned()),
             Err(e) => {
@@ -910,13 +982,28 @@ fn handle_send(request_str: &str, from: &str, dkim_private_key_pem: &str) -> Vec
 }
 
 /// Map a recipient address to the SMTP server we should deliver to.
-/// Known domains are hardcoded; unknown domains fall through to the
-/// caller-supplied fallback (the body's `smtp_server` field). Real MX
-/// lookup is a separate follow-up.
-fn resolve_smtp_server(addr: &str, fallback: Option<&str>) -> Option<String> {
+///
+/// - The instance's own domain (`local_domain`, or "colinrozzi.com" when unset)
+///   delivers locally to the in-box MTA (localhost:25).
+/// - Otherwise, when a `smarthost` is configured, ALL external mail goes there — the
+///   client-supplied `fallback` is never consulted (SSRF/open-relay safe). This is
+///   the public-instance path; no in-guest MX lookup needed.
+/// - With no smarthost (fleet instance), the legacy behavior stands: a hardcoded
+///   gmail MX, else the caller-supplied fallback. (Real MX lookup remains a follow-up.)
+fn resolve_smtp_server(addr: &str, fallback: Option<&str>, smarthost: &str, local_domain: &str) -> Option<String> {
     let domain = addr.rsplit('@').next().unwrap_or("");
+    let is_local = if local_domain.is_empty() {
+        domain.eq_ignore_ascii_case("colinrozzi.com")
+    } else {
+        domain.eq_ignore_ascii_case(local_domain)
+    };
+    if is_local {
+        return Some(String::from("localhost:25"));
+    }
+    if !smarthost.is_empty() {
+        return Some(smarthost.to_string());
+    }
     match domain {
-        "colinrozzi.com" => Some(String::from("localhost:25")),
         "gmail.com" => Some(String::from("gmail-smtp-in.l.google.com:25")),
         _ => fallback.map(String::from),
     }
@@ -931,6 +1018,7 @@ fn resolve_smtp_server(addr: &str, fallback: Option<&str>) -> Option<String> {
 /// outgoing visible headers — they're the same for every per-domain
 /// transaction so a message split across servers presents identical
 /// To/Cc headers to all recipients.
+#[allow(clippy::too_many_arguments)]
 fn smtp_deliver(
     server_addr: &str,
     from: &str,
@@ -942,6 +1030,7 @@ fn smtp_deliver(
     in_reply_to: &str,
     references: &str,
     dkim_private_key_pem: &str,
+    auth: Option<(&str, &str)>,
 ) -> Result<(), String> {
     let conn = tcp_connect(server_addr.to_string())
         .map_err(|e| format!("connect to {} failed: {}", server_addr, e))?;
@@ -964,11 +1053,13 @@ fn smtp_deliver(
         in_reply_to,
         references,
         dkim_private_key_pem,
+        auth,
     );
     let _ = tcp_close(conn);
     result
 }
 
+#[allow(clippy::too_many_arguments)]
 fn smtp_session(
     conn: &str,
     server_addr: &str,
@@ -981,19 +1072,38 @@ fn smtp_session(
     in_reply_to: &str,
     references: &str,
     dkim_private_key_pem: &str,
+    auth: Option<(&str, &str)>,
 ) -> Result<(), String> {
-    let ehlo_resp = smtp_command_get_body(conn, "EHLO inbox.local\r\n", 250)?;
+    let mut ehlo_resp = smtp_command_get_body(conn, "EHLO inbox.local\r\n", 250)?;
 
     // Opportunistic STARTTLS: if the server advertises it, upgrade the
     // connection before exchanging mail. RFC 3207 requires re-issuing
     // EHLO over the encrypted channel.
+    let mut tls_active = false;
     if smtp_caps_have(&ehlo_resp, "STARTTLS") {
         let server_name = server_addr.split(':').next().unwrap_or(server_addr).to_string();
         smtp_command(conn, "STARTTLS\r\n", 220)?;
         tcp_upgrade_to_tls_client(conn.to_string(), server_name.clone())
             .map_err(|e| format!("starttls upgrade to {}: {}", server_name, e))?;
         log(format!("[inbox-api] STARTTLS upgrade ok to {}", server_name));
-        smtp_command(conn, "EHLO inbox.local\r\n", 250)?;
+        // Re-EHLO over TLS; capture the (post-upgrade) caps so AUTH can be checked.
+        ehlo_resp = smtp_command_get_body(conn, "EHLO inbox.local\r\n", 250)?;
+        tls_active = true;
+    }
+
+    // SMTP AUTH to the smarthost. Credentials must only ever cross an encrypted
+    // channel, and only if the server actually offers AUTH.
+    if let Some((user, pass)) = auth {
+        if !tls_active {
+            return Err(String::from("refusing SMTP AUTH without STARTTLS (smarthost must support TLS)"));
+        }
+        if !smtp_caps_have(&ehlo_resp, "AUTH") {
+            return Err(String::from("smarthost did not advertise AUTH after STARTTLS"));
+        }
+        // AUTH PLAIN: base64 of "\0<authcid>\0<passwd>" (empty authzid). RFC 4616.
+        let creds = format!("\0{}\0{}", user, pass);
+        let token = B64.encode(creds.as_bytes());
+        smtp_command(conn, &format!("AUTH PLAIN {}\r\n", token), 235)?;
     }
 
     smtp_command(conn, &format!("MAIL FROM:<{}>\r\n", from), 250)?;
