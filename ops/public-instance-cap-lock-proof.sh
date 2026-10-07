@@ -41,7 +41,7 @@ set -uo pipefail
 API="${INBOX_API:-https://agent-inbox.dev}"
 : "${TOKEN_ADMIN:?set TOKEN_ADMIN (an admin-capped key)}"
 : "${TOKEN_USE:?set TOKEN_USE (a use-only key, same tenant)}"
-: "${ADDR_OWN:?set ADDR_OWN (the tenant's registered address)}"
+: "${ADDR_OWN:?set ADDR_OWN - the registered address for the test tenant}"
 ADDR_OTHER="${ADDR_OTHER:-nobody-else-$RANDOM@agent-inbox.dev}"
 NEW_ADDR="${NEW_ADDR:-claim-attempt-$RANDOM@agent-inbox.dev}"
 
@@ -64,7 +64,7 @@ status() {
   fi
 }
 
-echo "== use-only token: the `use` cap works on its OWN mailbox =="
+echo "== use-only token: the 'use' cap works on its OWN mailbox =="
 status "USE reads own inbox            -> 200" 200 "$TOKEN_USE" GET  "/v1/mailboxes/$ADDR_OWN/inbox?since=0"
 status "USE sends from own address     -> 200" 200 "$TOKEN_USE" POST "/v1/mailboxes/$ADDR_OWN/send" "{\"to\":[\"$ADDR_OWN\"],\"subject\":\"self\",\"body\":\"ok\"}"
 
