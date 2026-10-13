@@ -555,23 +555,51 @@ fn route(
         };
         let address = url_decode(address_enc);
 
-        // Resolve the address → mailbox id via the router.
-        let mailbox_id = match resolve_for_caller(router_id, &address, &caller) {
-            Ok(id) => id,
-            Err(resp) => return resp,
-        };
-
+        // Resolution is PER-ROUTE, not one gate for all. GET <addr> is a DISCOVERY
+        // lookup (does this address exist + its mailbox_id); the mail-bearing routes
+        // (inbox read, send-as, backfill) stay owner-gated on every instance.
         return match (method, sub) {
-            ("GET", "") => json_response(
-                200,
-                &MailboxInfo {
-                    address,
-                    mailbox_id,
-                },
-            ),
-            ("GET", "inbox") => handle_inbox(query, &mailbox_id),
-            ("POST", "send") => handle_send(request_str, &address, dkim_private_key_pem, relay),
-            ("POST", "backfill-raw") => handle_backfill(&mailbox_id),
+            // Existence/discovery. On the FLEET (cooperative, shared @domain namespace)
+            // resolve ANY registered address owner-blind — matches send-routing, so an
+            // agent can pre-flight a peer. On the PUBLIC instance stay owner-isolated
+            // (404-not-403, existence-privacy — the T0 two-tenant-proof invariant).
+            ("GET", "") => {
+                let mailbox_id = if public_instance {
+                    match resolve_for_caller(router_id, &address, &caller) {
+                        Ok(id) => id,
+                        Err(resp) => return resp,
+                    }
+                } else {
+                    match resolve_mailbox(router_id, &address) {
+                        Ok(Some(id)) => id,
+                        Ok(None) => return error_response(404, &format!("unknown address: {}", address)),
+                        Err(e) => return error_response(500, &format!("router rpc failed: {}", e)),
+                    }
+                };
+                json_response(200, &MailboxInfo { address, mailbox_id })
+            }
+            // Mail-bearing routes: owner-gated on BOTH instances. Discovering a peer
+            // exists must never grant reading its mail or sending as it.
+            ("GET", "inbox") => {
+                let mailbox_id = match resolve_for_caller(router_id, &address, &caller) {
+                    Ok(id) => id,
+                    Err(resp) => return resp,
+                };
+                handle_inbox(query, &mailbox_id)
+            }
+            ("POST", "send") => {
+                if let Err(resp) = resolve_for_caller(router_id, &address, &caller) {
+                    return resp;
+                }
+                handle_send(request_str, &address, dkim_private_key_pem, relay)
+            }
+            ("POST", "backfill-raw") => {
+                let mailbox_id = match resolve_for_caller(router_id, &address, &caller) {
+                    Ok(id) => id,
+                    Err(resp) => return resp,
+                };
+                handle_backfill(&mailbox_id)
+            }
             _ => error_response(404, "not found"),
         };
     }
