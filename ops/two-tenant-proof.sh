@@ -32,10 +32,13 @@
 #   INBOX_API=https://mail.colinrozzi.com \
 #   TOKEN_A=... TOKEN_B=... ADDR_A=a@colinrozzi.com ADDR_B=b@colinrozzi.com \
 #   RESERVED=postmaster@colinrozzi.com \
+#   [PUBLIC_INSTANCE=1]   # set when the instance runs public-instance=1 (the public product)
 #   bash ops/two-tenant-proof.sh
 #
-# Exit 0 iff every isolation assertion holds. The cross-tenant checks demand 404
-# (NOT 403) — a mailbox you don't control must be indistinguishable from absent.
+# Exit 0 iff every isolation assertion holds. Mail-bearing cross-tenant checks demand
+# 404 (NOT 403) — a mailbox you don't control must be indistinguishable from absent.
+# GET <addr> (info/existence) is model-dependent: PUBLIC_INSTANCE=1 => 404 (existence-
+# privacy, T0 invariant); unset (fleet) => 200 (global discovery, matches send-routing).
 set -uo pipefail
 
 API="${INBOX_API:-https://mail.colinrozzi.com}"
@@ -45,6 +48,8 @@ API="${INBOX_API:-https://mail.colinrozzi.com}"
 : "${ADDR_B:?set ADDR_B (tenant B address)}"
 RESERVED="${RESERVED:-postmaster@colinrozzi.com}"
 BAD="${TOKEN_BAD:-not-a-real-key}"
+# PUBLIC_INSTANCE: set (="1") to validate the public-instance isolation model (cross-
+# tenant info -> 404); unset to validate the cooperative fleet model (info -> 200 discovery).
 
 pass=0
 fail=0
@@ -85,11 +90,24 @@ status "A sees own mailbox info"          200 "$TOKEN_A" GET  "/v1/mailboxes/$AD
 status "B reads own inbox"                200 "$TOKEN_B" GET  "/v1/mailboxes/$ADDR_B/inbox?since=0"
 
 echo "== CROSS-TENANT: A must NOT reach B (404, never 403) =="
+# Mail-bearing routes are owner-gated on EVERY instance — discovering a peer must
+# never grant reading its mail, sending as it, or backfilling it. These are 404 always.
 status "A reads B inbox -> 404"           404 "$TOKEN_A" GET  "/v1/mailboxes/$ADDR_B/inbox?since=0"
-status "A reads B info  -> 404"           404 "$TOKEN_A" GET  "/v1/mailboxes/$ADDR_B"
 status "A sends AS B    -> 404"           404 "$TOKEN_A" POST "/v1/mailboxes/$ADDR_B/send" '{"to":["x@y.z"],"subject":"x","body":"x"}'
 status "A backfills B   -> 404"           404 "$TOKEN_A" POST "/v1/mailboxes/$ADDR_B/backfill-raw"
 status "B reads A inbox -> 404"           404 "$TOKEN_B" GET  "/v1/mailboxes/$ADDR_A/inbox?since=0"
+
+# GET <addr> (info/existence) is MODEL-DEPENDENT (the send/lookup-asymmetry fix):
+#   PUBLIC instance (PUBLIC_INSTANCE=1): owner-isolated — cross-tenant info -> 404
+#     (existence-privacy; the T0 invariant a customer must not probe another's address).
+#   FLEET instance (unset): global discovery — cross-tenant info -> 200 (resolves any
+#     registered address + its mailbox_id, matching send-routing) so agents pre-flight peers.
+# Asserting BOTH here is the safety that makes the fix landable.
+if [ -n "${PUBLIC_INSTANCE:-}" ]; then
+  status "A reads B info  -> 404 (public: existence-private)"  404 "$TOKEN_A" GET "/v1/mailboxes/$ADDR_B"
+else
+  status "A reads B info  -> 200 (fleet: discovery resolves)"  200 "$TOKEN_A" GET "/v1/mailboxes/$ADDR_B"
+fi
 
 echo "== list is tenant-scoped (no cross-tenant existence leak) =="
 body_excludes "A list omits B address"    "$TOKEN_A" "/v1/mailboxes" "$ADDR_B"
