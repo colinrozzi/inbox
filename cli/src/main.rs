@@ -407,23 +407,11 @@ fn http(ctx: &Ctx, method: &str, path: &str, body: Option<&str>) -> Result<Strin
         .map_err(|e| format!("write request: {e}"))?;
     let _ = tls.flush();
 
-    // Connection: close -> read to EOF. Tolerate an unclean TLS close (peer drops
-    // without close_notify) once we already have the response bytes.
-    let mut buf = Vec::new();
-    let mut chunk = [0u8; 8192];
-    loop {
-        match tls.read(&mut chunk) {
-            Ok(0) => break,
-            Ok(n) => buf.extend_from_slice(&chunk[..n]),
-            Err(ref e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
-            Err(e) => {
-                if buf.is_empty() {
-                    return Err(format!("read response: {e}"));
-                }
-                break;
-            }
-        }
-    }
+    // Connection: close -> read to EOF. TCP is a byte stream: one read() returns only
+    // what's currently available, so a SINGLE read would TRUNCATE any response bigger
+    // than one segment/record (the exact class of bug that bit non-looping relay
+    // readers on large /inbox responses). read_to_eof loops until EOF; see its test.
+    let buf = read_to_eof(&mut tls)?;
 
     let text = String::from_utf8_lossy(&buf).into_owned();
     let (head, resp_body) = text.split_once("\r\n\r\n").ok_or_else(|| {
@@ -539,4 +527,91 @@ fn url_encode(s: &str) -> String {
         }
     }
     out
+}
+
+/// Read a byte-stream to EOF, accumulating every chunk. A single `read()` on a TCP
+/// stream returns only what is currently available (often one segment/TLS record), so
+/// reading a large response REQUIRES this loop — a single read truncates anything
+/// bigger than one read. Mirrors the server-side read_full_request loop, on the
+/// response-read side. Extracted so the multi-record reassembly is unit-tested.
+fn read_to_eof<R: Read>(r: &mut R) -> Result<Vec<u8>, String> {
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        match r.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            // Tolerate an unclean TLS close (peer drops without close_notify) once we
+            // already have bytes — the body is complete, just not cleanly shut down.
+            Err(ref e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(e) => {
+                if buf.is_empty() {
+                    return Err(format!("read response: {e}"));
+                }
+                break;
+            }
+        }
+    }
+    Ok(buf)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::read_to_eof;
+    use std::io::{self, Read};
+
+    // Hands back its data in FIXED-SIZE pieces, one per read() call, then EOF —
+    // simulating a multi-segment TCP response where a single read() returns far less
+    // than the whole body.
+    struct ChunkedReader {
+        data: Vec<u8>,
+        pos: usize,
+        piece: usize,
+    }
+    impl Read for ChunkedReader {
+        fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+            if self.pos >= self.data.len() {
+                return Ok(0); // EOF
+            }
+            let end = (self.pos + self.piece).min(self.data.len());
+            let n = (end - self.pos).min(out.len());
+            out[..n].copy_from_slice(&self.data[self.pos..self.pos + n]);
+            self.pos += n;
+            Ok(n)
+        }
+    }
+
+    // REGRESSION: a ~1.2MB body delivered 1500 bytes per read() (TCP-segment-sized,
+    // many iterations, smaller than the 8192 chunk) must reassemble WHOLE. A single
+    // read (the truncation bug class) would return only the first 1500 bytes.
+    #[test]
+    fn read_to_eof_reassembles_multi_record_body() {
+        let body: Vec<u8> = (0..1_200_000u32).map(|i| (i % 251) as u8).collect();
+        let mut r = ChunkedReader { data: body.clone(), pos: 0, piece: 1500 };
+        let got = read_to_eof(&mut r).expect("read_to_eof");
+        assert_eq!(got.len(), body.len(), "truncated: got {} of {} bytes", got.len(), body.len());
+        assert_eq!(got, body, "reassembled bytes differ from original");
+    }
+
+    // The unclean-EOF-with-bytes tolerance (peer drops without close_notify after the
+    // body) must still return the bytes, not error.
+    #[test]
+    fn read_to_eof_tolerates_unclean_eof_with_bytes() {
+        struct OneChunkThenUncleanEof {
+            sent: bool,
+        }
+        impl Read for OneChunkThenUncleanEof {
+            fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+                if !self.sent {
+                    self.sent = true;
+                    let data = b"partial-but-complete-body";
+                    out[..data.len()].copy_from_slice(data);
+                    return Ok(data.len());
+                }
+                Err(io::Error::new(io::ErrorKind::UnexpectedEof, "no close_notify"))
+            }
+        }
+        let got = read_to_eof(&mut OneChunkThenUncleanEof { sent: false }).expect("tolerate unclean eof");
+        assert_eq!(got, b"partial-but-complete-body");
+    }
 }
