@@ -97,6 +97,9 @@ pack_types! {
         theater:inbox/mailbox.list-since: func(cursor: u64) -> result<inbox-page, string>,
         theater:inbox/mailbox.put-message: func(from: string, to: string, subject: string, body: string, message-id: string, in-reply-to: string, references: string, cc: string, raw: string) -> result<u64, string>,
         theater:inbox/mailbox.backfill-raw: func() -> result<u64, string>,
+        // Read-only usage metering (control-plane polls this for billing): the
+        // count of stored messages. No state, no hot-path write — replay-safe.
+        theater:inbox/mailbox.message-count: func() -> result<u64, string>,
     }
 }
 
@@ -262,6 +265,15 @@ fn list_since(cursor: u64) -> Value {
         InboxPage { messages, next_cursor }
     });
     ok_result(page.into())
+}
+
+/// Read-only usage metering for the control-plane: how many messages this
+/// mailbox holds (the messages Vec length). No state, no mutation — a cheap,
+/// replay-safe polled read for per-tenant billing.
+#[export(name = "theater:inbox/mailbox.message-count")]
+fn message_count() -> Value {
+    let count = MAILBOX.with(|s| s.messages.len() as u64);
+    ok_result(Value::U64(count))
 }
 
 #[export(name = "theater:inbox/mailbox.put-message")]
