@@ -115,6 +115,10 @@ pack_types! {
         theater:inbox/router.register-owned: func(address: string, tenant: string) -> result<string, string>,
         theater:inbox/router.lookup-owned: func(address: string) -> result<option<owned>, string>,
         theater:inbox/router.list-by-tenant: func(tenant: string) -> result<list<binding>, string>,
+        // Read-only usage metering (control-plane polls this for billing): the
+        // number of mailbox bindings owned by `tenant`. list-by-tenant's count,
+        // without shipping the binding list. No state, no hot-path write.
+        theater:inbox/router.count-by-tenant: func(tenant: string) -> result<u64, string>,
         // Operator reassignment (phase 2): move an EXISTING address to a new owning
         // tenant unconditionally (register-owned refuses a cross-tenant re-stamp).
         theater:inbox/router.reassign-owned: func(address: string, tenant: string) -> result<string, string>,
@@ -504,6 +508,17 @@ fn list_by_tenant(tenant: String) -> Value {
         s.bindings.iter().filter(|b| b.tenant == tenant).cloned().collect::<Vec<_>>()
     });
     ok_result(bindings.into())
+}
+
+/// Count of bindings controlled by `tenant` — read-only usage metering for the
+/// control-plane's billing poll. Same owner match as `list-by-tenant`, returning
+/// just the count instead of the binding list. No state, no mutation.
+#[export(name = "theater:inbox/router.count-by-tenant")]
+fn count_by_tenant(tenant: String) -> Value {
+    let count = RouterState::with(|s| {
+        s.bindings.iter().filter(|b| b.tenant == tenant).count() as u64
+    });
+    ok_result(Value::U64(count))
 }
 
 #[cfg(test)]
