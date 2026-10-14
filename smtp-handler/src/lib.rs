@@ -118,7 +118,7 @@ fn run_session(conn: &str, router_id: &str) -> Result<(), String> {
             "EHLO" | "HELO" => {
                 let domain = trimmed.split_whitespace().nth(1).unwrap_or("anonymous");
                 send_line(conn, &format!("250-{} hello {}", HOSTNAME, domain))?;
-                send_line(conn, "250-SIZE 10485760")?;
+                send_line(conn, &format!("250-SIZE {}", MAX_MESSAGE_SIZE))?;
                 send_line(conn, "250 OK")?;
                 mail_from = None;
                 rcpts.clear();
@@ -171,7 +171,23 @@ fn run_session(conn: &str, router_id: &str) -> Result<(), String> {
                 }
                 send_line(conn, "354 Start mail input; end with <CRLF>.<CRLF>")?;
 
-                let raw = read_data_block(conn)?;
+                let raw = match read_data_block(conn)? {
+                    DataOutcome::Complete(raw) => raw,
+                    DataOutcome::TooLarge => {
+                        // Advertised SIZE exceeded mid-DATA. Reject hard and
+                        // close: reading was aborted, so the socket may still
+                        // hold unread body bytes — treating those as commands
+                        // would be garbage, so we end the session cleanly
+                        // rather than wedge on them.
+                        send_line(conn, "552 message size exceeds limit")?;
+                        log(format!(
+                            "[inbox-smtp] rejected oversize message from {} (> {} bytes)",
+                            mail_from.clone().unwrap_or_default(),
+                            MAX_MESSAGE_SIZE
+                        ));
+                        return Ok(());
+                    }
+                };
                 let parsed = parse_headers_and_body(&raw);
                 let from = mail_from.clone().unwrap_or_default();
 
@@ -303,9 +319,25 @@ fn extract_address(line: &str, marker: &str) -> Option<String> {
     }
 }
 
+/// Outcome of reading a DATA block.
+enum DataOutcome {
+    /// The full message body, terminated by the lone `.` line.
+    Complete(String),
+    /// The accumulated body exceeded `MAX_MESSAGE_SIZE`; reading was aborted
+    /// before the terminating `.` (so we stop consuming the sender's stream
+    /// rather than buffering it without bound). The caller must reply 552 and
+    /// close the session — there may be unread body bytes left on the socket.
+    TooLarge,
+}
+
 /// Read a DATA block: lines until a single "." on its own line.
 /// Strips dot-stuffing (lines starting with ".." → ".").
-fn read_data_block(conn: &str) -> Result<String, String> {
+///
+/// Enforces `MAX_MESSAGE_SIZE` across the WHOLE stream, not just per line: on
+/// exceed it returns `DataOutcome::TooLarge` immediately, so an untrusted
+/// sender can't force unbounded in-memory accumulation with a flood of sub-cap
+/// lines.
+fn read_data_block(conn: &str) -> Result<DataOutcome, String> {
     let mut out = String::new();
     loop {
         // DATA body lines can be long (base64 blob / minified paste); cap at the
@@ -314,7 +346,7 @@ fn read_data_block(conn: &str) -> Result<String, String> {
         // Trim only the trailing CRLF, keep internal whitespace.
         let line = line.trim_end_matches('\n').trim_end_matches('\r');
         if line == "." {
-            return Ok(out);
+            return Ok(DataOutcome::Complete(out));
         }
         let line = if let Some(stripped) = line.strip_prefix("..") {
             // Dot-stuffing: ".." → "."
@@ -324,6 +356,12 @@ fn read_data_block(conn: &str) -> Result<String, String> {
         } else {
             line.to_string()
         };
+        // Stop BEFORE appending: the total (existing bytes + this line + its
+        // '\n') must stay within the advertised SIZE. Abort here rather than
+        // read the rest of the stream.
+        if exceeds_message_size(out.len(), line.len()) {
+            return Ok(DataOutcome::TooLarge);
+        }
         out.push_str(&line);
         out.push('\n');
     }
@@ -608,6 +646,21 @@ fn send_line(conn: &str, line: &str) -> Result<(), String> {
 const MAX_COMMAND_LINE: usize = 4096;
 const MAX_DATA_LINE: usize = 10 * 1024 * 1024; // matches the advertised 250-SIZE 10485760
 
+// Total message-byte cap across the whole DATA stream. MAX_DATA_LINE bounds a
+// SINGLE body line, but a flood of sub-cap lines would otherwise grow the
+// in-memory buffer (and the stored blob) without bound -> memory/DoS from an
+// untrusted sender. This is the value advertised via `250-SIZE`; keep the two
+// in sync (both are 10 MB).
+const MAX_MESSAGE_SIZE: usize = 10 * 1024 * 1024; // 10485760, advertised via 250-SIZE
+
+/// True if appending a body line of `line_len` bytes (plus its trailing `\n`)
+/// to an accumulator already holding `acc_len` bytes would push the total past
+/// `MAX_MESSAGE_SIZE`. Pure arithmetic (saturating, so it can't overflow on a
+/// 32-bit `usize`) so the bound is unit-testable in isolation.
+fn exceeds_message_size(acc_len: usize, line_len: usize) -> bool {
+    acc_len.saturating_add(line_len).saturating_add(1) > MAX_MESSAGE_SIZE
+}
+
 fn read_line(conn: &str) -> Result<String, String> {
     read_line_capped(conn, MAX_COMMAND_LINE)
 }
@@ -631,4 +684,37 @@ fn read_line_capped(conn: &str, max_len: usize) -> Result<String, String> {
     core::str::from_utf8(&buf)
         .map(|s| s.to_string())
         .map_err(|_| String::from("invalid utf-8 in SMTP line"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{exceeds_message_size, MAX_MESSAGE_SIZE};
+
+    // Note: this crate is a `#![no_std]` wasm `cdylib`, so the nix/wasm CI build
+    // never compiles `cfg(test)`. This test documents and pins the DATA-size
+    // bound; it covers `exceeds_message_size`, the pure arithmetic extracted
+    // from the DATA accumulation loop.
+
+    #[test]
+    fn under_cap_is_allowed() {
+        // Accumulator + line + trailing '\n' lands exactly on the cap.
+        assert!(!exceeds_message_size(0, MAX_MESSAGE_SIZE - 1));
+        assert!(!exceeds_message_size(MAX_MESSAGE_SIZE - 11, 10));
+        assert!(!exceeds_message_size(0, 0));
+    }
+
+    #[test]
+    fn over_cap_is_rejected() {
+        // One byte past the cap (the +1 is the line's trailing '\n').
+        assert!(exceeds_message_size(0, MAX_MESSAGE_SIZE));
+        assert!(exceeds_message_size(MAX_MESSAGE_SIZE, 0));
+        assert!(exceeds_message_size(MAX_MESSAGE_SIZE / 2, MAX_MESSAGE_SIZE / 2));
+    }
+
+    #[test]
+    fn saturates_instead_of_overflowing() {
+        // Huge inputs must not wrap around to a small sum and read as "under".
+        assert!(exceeds_message_size(usize::MAX, usize::MAX));
+        assert!(exceeds_message_size(usize::MAX, 0));
+    }
 }
