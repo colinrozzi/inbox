@@ -12,7 +12,7 @@
 //! its first lookup/register instead (a single spawn from an RPC context). An
 //! empty `mailbox_id` means "known address, not yet spawned this process".
 
-#![no_std]
+#![cfg_attr(not(test), no_std)]
 extern crate alloc;
 
 use alloc::boxed::Box;
@@ -140,13 +140,28 @@ fn canon(address: &str) -> String {
     address.to_ascii_lowercase()
 }
 
-/// Minimal address sanity for claiming: exactly one '@', non-empty local + domain,
-/// no whitespace. Bounds the otherwise-unbounded claimable space (review FIX 1).
+/// Minimal address sanity for claiming + routing. On the untrusted register /
+/// inbound paths this enforces:
+///   * exactly one '@', with a non-empty local part and non-empty domain;
+///   * RFC 5321 size ceilings — whole address <= 254 octets, local part <= 64
+///     octets — which bounds the otherwise-unbounded claimable space (review
+///     FIX 1) and caps the per-address resource cost of a claim;
+///   * no control, whitespace, or other non-printable characters anywhere,
+///     closing malformed-address / header-injection vectors.
+/// Input is already `canon`ed (lowercased) at both call sites.
 fn valid_address(a: &str) -> bool {
+    // Cheap length guard (octets) before the per-char scan.
+    if a.len() > 254 {
+        return false;
+    }
     let mut parts = a.split('@');
     let local = parts.next().unwrap_or("");
     let domain = parts.next().unwrap_or("");
-    parts.next().is_none() && !local.is_empty() && !domain.is_empty() && !a.contains(char::is_whitespace)
+    parts.next().is_none()
+        && !local.is_empty()
+        && !domain.is_empty()
+        && local.len() <= 64
+        && !a.chars().any(|c| c.is_control() || c.is_whitespace())
 }
 
 #[import(module = "theater:simple/self", name = "log")]
@@ -489,4 +504,52 @@ fn list_by_tenant(tenant: String) -> Value {
         s.bindings.iter().filter(|b| b.tenant == tenant).cloned().collect::<Vec<_>>()
     });
     ok_result(bindings.into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::valid_address;
+    use alloc::format;
+
+    #[test]
+    fn accepts_normal_addresses() {
+        assert!(valid_address("alice@example.com"));
+        assert!(valid_address("bob.smith+tag@sub.example.co.uk"));
+        assert!(valid_address("user_name-1@example.com"));
+        assert!(valid_address("a@b"));
+        // Boundary: 64-octet local part and a whole address of exactly 254 octets.
+        assert!(valid_address(&format!("{}@example.com", "a".repeat(64))));
+        let at_limit = format!("{}@{}", "a".repeat(64), format!("{}.com", "d".repeat(185)));
+        assert_eq!(at_limit.len(), 254);
+        assert!(valid_address(&at_limit));
+    }
+
+    #[test]
+    fn rejects_structural_problems() {
+        assert!(!valid_address(""));             // empty
+        assert!(!valid_address("noatsign"));     // no '@'
+        assert!(!valid_address("@example.com")); // empty local part
+        assert!(!valid_address("alice@"));       // empty domain
+        assert!(!valid_address("a@b@c"));        // more than one '@'
+    }
+
+    #[test]
+    fn rejects_overlength() {
+        // Local part > 64 octets.
+        assert!(!valid_address(&format!("{}@example.com", "a".repeat(65))));
+        // Whole address > 254 octets (local within 64, domain pushes it over).
+        let too_long = format!("{}@{}.com", "a".repeat(64), "d".repeat(200));
+        assert!(too_long.len() > 254);
+        assert!(!valid_address(&too_long));
+    }
+
+    #[test]
+    fn rejects_control_and_whitespace() {
+        assert!(!valid_address("ali ce@example.com"));       // space
+        assert!(!valid_address("alice@exa\tmple.com"));      // tab
+        assert!(!valid_address("alice@example.com\n"));      // trailing newline (header injection)
+        assert!(!valid_address("alice\r@example.com"));      // carriage return
+        assert!(!valid_address("alice@exam\u{7f}ple.com"));  // DEL
+        assert!(!valid_address("alice@exam\u{0}ple.com"));   // NUL
+    }
 }
