@@ -11,12 +11,25 @@
 //!   INBOX_TOKEN  bearer token; required    (alt: ~/.config/inbox/token, one line)
 
 use std::io::{Read, Write};
+use std::net::{TcpStream, ToSocketAddrs};
 use std::process::ExitCode;
+use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 
 const DEFAULT_API: &str = "mail.colinrozzi.com:443";
+
+// Network timeouts for the HTTPS request path in http(). Without these the CLI
+// does a blocking connect + blocking rustls read with NO timeout, so a slow or
+// unreachable server hangs it indefinitely — in a Monitor poll-loop that's a
+// silently-dark agent. Fail fast instead.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const IO_TIMEOUT: Duration = Duration::from_secs(30);
+// Bounded retry on the TCP connect ONLY (see connect_with_retry). 1 initial try
+// + up to 2 retries, with a short backoff between attempts.
+const CONNECT_RETRIES: u32 = 2;
+const CONNECT_BACKOFF: Duration = Duration::from_millis(250);
 
 #[derive(Parser)]
 #[command(name = "inbox", about = "Client to the inbox mail server HTTP API")]
@@ -399,8 +412,50 @@ fn http(ctx: &Ctx, method: &str, path: &str, body: Option<&str>) -> Result<Strin
         .map_err(|_| format!("invalid host: {host}"))?;
     let mut conn = rustls::ClientConnection::new(std::sync::Arc::new(config), server_name)
         .map_err(|e| format!("tls setup: {e}"))?;
-    let mut sock = std::net::TcpStream::connect((host.as_str(), port))
-        .map_err(|e| format!("connect {host}:{port}: {e}"))?;
+
+    // Resolve host:port to concrete socket addresses. connect_timeout() needs a
+    // SocketAddr (unlike plain connect(), which resolves internally), and having
+    // the list lets us try each address with the per-attempt connect timeout.
+    let addrs: Vec<std::net::SocketAddr> = (host.as_str(), port)
+        .to_socket_addrs()
+        .map_err(|e| format!("resolve {host}:{port}: {e}"))?
+        .collect();
+    if addrs.is_empty() {
+        return Err(format!("resolve {host}:{port}: no addresses"));
+    }
+
+    // Connect with a bounded retry. CRITICAL: the retry wraps the CONNECT ONLY —
+    // no request bytes have been written at this point. We deliberately do NOT
+    // retry the write/read below: the inbox /send path is NON-IDEMPOTENT, so
+    // resending a request whose bytes already reached the server would duplicate
+    // mail. A request must be sent AT MOST ONCE; a failed TCP connect is the only
+    // phase safe to retry, precisely because nothing has been sent yet.
+    let mut sock = connect_with_retry(
+        CONNECT_RETRIES,
+        CONNECT_BACKOFF,
+        &mut |d| std::thread::sleep(d),
+        || {
+            let mut last_err = None;
+            for addr in &addrs {
+                match TcpStream::connect_timeout(addr, CONNECT_TIMEOUT) {
+                    Ok(s) => return Ok(s),
+                    Err(e) => last_err = Some(e),
+                }
+            }
+            // addrs is non-empty (checked above), so the loop set last_err.
+            Err(last_err.expect("addrs non-empty => at least one attempt"))
+        },
+    )
+    .map_err(|e| format!("connect {host}:{port}: {e}"))?;
+
+    // READ/WRITE timeouts so a server that accepts the connection but then stalls
+    // mid-handshake or mid-response can't wedge us forever. Set BEFORE the rustls
+    // handshake so the handshake's own I/O is covered too, not just the body read.
+    sock.set_read_timeout(Some(IO_TIMEOUT))
+        .map_err(|e| format!("set read timeout: {e}"))?;
+    sock.set_write_timeout(Some(IO_TIMEOUT))
+        .map_err(|e| format!("set write timeout: {e}"))?;
+
     let mut tls = rustls::Stream::new(&mut conn, &mut sock);
 
     tls.write_all(req.as_bytes())
@@ -529,6 +584,35 @@ fn url_encode(s: &str) -> String {
     out
 }
 
+// Try `connect` up to `1 + retries` times, sleeping `backoff` between attempts;
+// return the first Ok, or the LAST Err if every attempt fails.
+//
+// CRITICAL — at-most-once discipline: the caller must pass a closure that does
+// ONLY the TCP connect (no request write). Retrying is safe here precisely
+// because no request bytes have been sent when connect fails; the inbox /send
+// path is non-idempotent, so this must never be used to re-drive a write/read.
+// `sleep` is injected so this logic is unit-testable without real delays.
+fn connect_with_retry<T, E>(
+    retries: u32,
+    backoff: Duration,
+    sleep: &mut dyn FnMut(Duration),
+    mut connect: impl FnMut() -> Result<T, E>,
+) -> Result<T, E> {
+    let mut attempt = 0u32;
+    loop {
+        match connect() {
+            Ok(v) => return Ok(v),
+            Err(e) => {
+                if attempt >= retries {
+                    return Err(e);
+                }
+                sleep(backoff);
+                attempt += 1;
+            }
+        }
+    }
+}
+
 /// Read a byte-stream to EOF, accumulating every chunk. A single `read()` on a TCP
 /// stream returns only what is currently available (often one segment/TLS record), so
 /// reading a large response REQUIRES this loop — a single read truncates anything
@@ -541,6 +625,16 @@ fn read_to_eof<R: Read>(r: &mut R) -> Result<Vec<u8>, String> {
         match r.read(&mut chunk) {
             Ok(0) => break,
             Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            // A read timeout (set_read_timeout) surfaces as WouldBlock/TimedOut. This
+            // means the server STALLED mid-response, not that it finished — treat it
+            // as an error even if we already have bytes, so we fail fast with a clear
+            // message rather than silently returning a TRUNCATED body to the parser.
+            Err(ref e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                return Err(format!("read response timed out after {IO_TIMEOUT:?}"));
+            }
             // Tolerate an unclean TLS close (peer drops without close_notify) once we
             // already have bytes — the body is complete, just not cleanly shut down.
             Err(ref e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
@@ -557,8 +651,100 @@ fn read_to_eof<R: Read>(r: &mut R) -> Result<Vec<u8>, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::read_to_eof;
+    use super::{connect_with_retry, read_to_eof};
+    use std::cell::Cell;
     use std::io::{self, Read};
+    use std::time::Duration;
+
+    // A connect that fails `fail_n` times then succeeds must be driven at most
+    // `1 + retries` times and sleep once before each retry — bounded, never
+    // unbounded. This encodes the at-most-once discipline: the retry count is a
+    // hard ceiling.
+    #[test]
+    fn connect_with_retry_succeeds_after_bounded_failures() {
+        let calls = Cell::new(0u32);
+        let mut slept = 0u32;
+        let out: Result<&str, &str> = connect_with_retry(
+            2,
+            Duration::from_millis(1),
+            &mut |_| slept += 1,
+            || {
+                let n = calls.get();
+                calls.set(n + 1);
+                if n < 2 {
+                    Err("refused")
+                } else {
+                    Ok("connected")
+                }
+            },
+        );
+        assert_eq!(out, Ok("connected"));
+        assert_eq!(calls.get(), 3, "1 initial attempt + 2 retries");
+        assert_eq!(slept, 2, "slept once before each of the 2 retries");
+    }
+
+    // When every attempt fails, it gives up after exactly `1 + retries` tries and
+    // returns the last error — it must NOT loop forever.
+    #[test]
+    fn connect_with_retry_gives_up_after_ceiling() {
+        let calls = Cell::new(0u32);
+        let mut slept = 0u32;
+        let out: Result<&str, &str> = connect_with_retry(
+            2,
+            Duration::from_millis(1),
+            &mut |_| slept += 1,
+            || {
+                calls.set(calls.get() + 1);
+                Err("refused")
+            },
+        );
+        assert_eq!(out, Err("refused"));
+        assert_eq!(calls.get(), 3, "attempts capped at 1 + retries");
+        assert_eq!(slept, 2);
+    }
+
+    // retries = 0 means exactly one attempt and no sleep — the degenerate bound.
+    #[test]
+    fn connect_with_retry_zero_retries_tries_once() {
+        let calls = Cell::new(0u32);
+        let mut slept = 0u32;
+        let out: Result<&str, &str> = connect_with_retry(
+            0,
+            Duration::from_millis(1),
+            &mut |_| slept += 1,
+            || {
+                calls.set(calls.get() + 1);
+                Err("refused")
+            },
+        );
+        assert_eq!(out, Err("refused"));
+        assert_eq!(calls.get(), 1);
+        assert_eq!(slept, 0);
+    }
+
+    // A read timeout (WouldBlock) mid-body must ERROR, not silently return the
+    // partial bytes it had buffered — otherwise a stalled server yields a
+    // truncated response the parser would mis-handle.
+    #[test]
+    fn read_to_eof_errors_on_read_timeout_even_with_partial_bytes() {
+        struct OneChunkThenTimeout {
+            sent: bool,
+        }
+        impl Read for OneChunkThenTimeout {
+            fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+                if !self.sent {
+                    self.sent = true;
+                    let data = b"partial";
+                    out[..data.len()].copy_from_slice(data);
+                    return Ok(data.len());
+                }
+                Err(io::Error::new(io::ErrorKind::WouldBlock, "read timed out"))
+            }
+        }
+        let err = read_to_eof(&mut OneChunkThenTimeout { sent: false })
+            .expect_err("timeout mid-body must error, not truncate");
+        assert!(err.contains("timed out"), "unexpected error: {err}");
+    }
 
     // Hands back its data in FIXED-SIZE pieces, one per read() call, then EOF —
     // simulating a multi-segment TCP response where a single read() returns far less
