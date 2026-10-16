@@ -176,6 +176,20 @@ fn err_str(msg: &str) -> Value {
     Value::Result { ok_type: Value::Tuple(vec![]).infer_type(), err_type: ValueType::String, value: Err(Box::new(e)) }
 }
 
+/// Constant-time byte-slice equality: compares EVERY byte (no early return),
+/// so comparison time does not depend on where the first mismatch is. Returns
+/// false for differing lengths. Used for secret/token comparisons only.
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff: u8 = 0;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
 // ---- crypto: sha256 hex + hand-rolled HMAC-SHA256 (avoids a new crate dep) ----
 fn to_hex(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
@@ -310,7 +324,7 @@ fn resolve(token: String) -> Value {
     let found = RegistryState::with(|s| {
         for t in &s.tenants {
             for k in &t.keys {
-                if k.token_hash == hash {
+                if ct_eq(k.token_hash.as_bytes(), hash.as_bytes()) {
                     return Some(Resolved {
                         tenant_id: t.id.clone(),
                         key_id: k.id.clone(),
@@ -457,7 +471,7 @@ fn import_key(tenant_id: String, token: String, caps: Vec<String>, label: String
     let token_hash = sha256_hex(token.as_bytes());
     let result = RegistryState::with_mut(|s| {
         // Global uniqueness: a token must map to exactly one tenant.
-        if s.tenants.iter().any(|t| t.keys.iter().any(|k| k.token_hash == token_hash)) {
+        if s.tenants.iter().any(|t| t.keys.iter().any(|k| ct_eq(k.token_hash.as_bytes(), token_hash.as_bytes()))) {
             return Err(String::from("token already registered"));
         }
         let idx = match s.tenants.iter().position(|t| t.id == tenant_id) {
@@ -526,5 +540,31 @@ fn list_keys(tenant_id: String) -> Value {
     match metas {
         Some(v) => ok_result(v.into()),
         None => err_str(&format!("unknown tenant: {}", tenant_id)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ct_eq;
+
+    #[test]
+    fn ct_eq_equal_slices_true() {
+        assert!(ct_eq(b"deadbeefcafe", b"deadbeefcafe"));
+    }
+
+    #[test]
+    fn ct_eq_same_length_one_bit_different_false() {
+        // Single bit flip in the last byte: 'e' (0x65) ^ 'g' (0x67) == 0x02.
+        assert!(!ct_eq(b"deadbeefcafe", b"deadbeefcafg"));
+    }
+
+    #[test]
+    fn ct_eq_different_length_false() {
+        assert!(!ct_eq(b"deadbeef", b"deadbeefcafe"));
+    }
+
+    #[test]
+    fn ct_eq_both_empty_true() {
+        assert!(ct_eq(b"", b""));
     }
 }

@@ -624,6 +624,20 @@ impl Caller {
     }
 }
 
+/// Constant-time byte-slice equality: compares EVERY byte (no early return),
+/// so comparison time does not depend on where the first mismatch is. Returns
+/// false for differing lengths. Used for secret/token comparisons only.
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff: u8 = 0;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
 /// Authenticate the request. Legacy: match the presented bearer against the shared
 /// token(s). Enforcing: resolve the bearer to a tenant via the registry. Returns a
 /// 401 response on failure. Fails closed.
@@ -653,11 +667,14 @@ fn authenticate(request_str: &str, bearer_token: &str, registry_id: &str, enforc
         if public_instance {
             return Err(error_response(401, "unauthorized"));
         }
-        let ok = bearer_token
-            .split(',')
-            .map(str::trim)
-            .filter(|t| !t.is_empty())
-            .any(|t| presented == Some(t));
+        let ok = match presented {
+            Some(p) => bearer_token
+                .split(',')
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+                .any(|t| ct_eq(p.as_bytes(), t.as_bytes())),
+            None => false,
+        };
         if ok {
             Ok(Caller::Legacy)
         } else {
@@ -1508,3 +1525,28 @@ fn url_decode(s: &str) -> String {
     String::from_utf8(out).unwrap_or_else(|_| s.to_string())
 }
 
+#[cfg(test)]
+mod tests {
+    use super::ct_eq;
+
+    #[test]
+    fn ct_eq_equal_slices_true() {
+        assert!(ct_eq(b"secret-token", b"secret-token"));
+    }
+
+    #[test]
+    fn ct_eq_same_length_one_bit_different_false() {
+        // Single bit flip in the last byte: 'n' (0x6e) ^ 'o' (0x6f) == 0x01.
+        assert!(!ct_eq(b"secret-token", b"secret-tokeo"));
+    }
+
+    #[test]
+    fn ct_eq_different_length_false() {
+        assert!(!ct_eq(b"secret", b"secret-token"));
+    }
+
+    #[test]
+    fn ct_eq_both_empty_true() {
+        assert!(ct_eq(b"", b""));
+    }
+}
