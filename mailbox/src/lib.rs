@@ -251,62 +251,68 @@ fn read_seq_cursor(address: &str) -> Result<Option<u64>, String> {
     }
 }
 
-/// Read + decode ONE per-message entry `msg:<address>:<seq>`.
-///   Some(m) = present + decoded.
-///   None    = absent (torn tail: a crash mid-append left no entry here) OR the
-///             entry is unreadable. Either way the fold stops here; the specific
-///             reason is logged. We never panic and never zero-fill a gap.
-fn load_message(address: &str, seq: u64) -> Option<Message> {
+/// Outcome of reading one per-message entry `msg:<address>:<seq>`. Absent and
+/// unreadable are DISTINCT and the fold treats them differently (see below) —
+/// collapsing both to "stop" would silently drop committed mail on corruption.
+enum MsgEntry {
+    /// Present in the store + decoded.
+    Present(Message),
+    /// Absent (get-by-label returned None). Because the seq cursor is advanced
+    /// LAST (after the message bytes are durable), an in-range absent entry does
+    /// not arise in normal operation; the fold treats it as a torn tail — stop
+    /// and keep the prefix, never panic/zero-fill.
+    Absent,
+    /// Present in the store but UNREADABLE (store get error / decode / try_from
+    /// failure) — corruption of an already-committed message. The fold FAILS
+    /// LOUD (aborts init) rather than silently truncating the mailbox to the
+    /// prefix: same data-loss guard as an unreadable seq cursor or legacy blob.
+    Unreadable(String),
+}
+
+/// Read + decode ONE per-message entry `msg:<address>:<seq>`. Distinguishes
+/// absent (torn tail) from present-but-unreadable (corruption) — see `MsgEntry`.
+fn load_message(address: &str, seq: u64) -> MsgEntry {
     let content_ref = match store_get_by_label(STORE_ID.into(), msg_label(address, seq)) {
         Ok(Some(r)) => r,
-        Ok(None) => return None, // absent -> torn tail, stop folding
-        Err(e) => {
-            log(format!("[inbox-mailbox] msg get-by-label failed (seq={}): {}", seq, e));
-            return None;
-        }
+        Ok(None) => return MsgEntry::Absent, // absent -> torn tail, stop folding
+        Err(e) => return MsgEntry::Unreadable(format!("get-by-label failed (seq={}): {}", seq, e)),
     };
     let bytes = match store_get(STORE_ID.into(), content_ref) {
         Ok(b) => b,
-        Err(e) => {
-            log(format!("[inbox-mailbox] msg get failed (seq={}): {}", seq, e));
-            return None;
-        }
+        Err(e) => return MsgEntry::Unreadable(format!("get failed (seq={}): {}", seq, e)),
     };
     let value = match decode(&bytes) {
         Ok(v) => v,
-        Err(e) => {
-            log(format!("[inbox-mailbox] msg decode failed (seq={}): {:?}", seq, e));
-            return None;
-        }
+        Err(e) => return MsgEntry::Unreadable(format!("decode failed (seq={}): {:?}", seq, e)),
     };
     match Message::try_from(value) {
-        Ok(m) => Some(m),
-        Err(_) => {
-            log(format!("[inbox-mailbox] msg try_from failed (seq={})", seq));
-            None
-        }
+        Ok(m) => MsgEntry::Present(m),
+        Err(_) => MsgEntry::Unreadable(format!("try_from failed (seq={})", seq)),
     }
 }
 
-/// PURE fold (testable): walk seq `0..next_seq`, pulling each Message from
-/// `fetch`. `fetch(seq)` returns `Some(m)` to append-and-continue, or `None` for
-/// a torn tail (missing/unreadable entry from a crash mid-append) — on `None` we
-/// STOP folding at that seq and keep exactly what we have (never zero-fill).
-/// Returns `(messages, torn_at)`: `torn_at = Some(seq)` iff we stopped early.
-fn fold_messages<F>(next_seq: u64, mut fetch: F) -> (Vec<Message>, Option<u64>)
+/// PURE fold (testable): walk seq `0..next_seq`, pulling each entry from `fetch`.
+///   Present(m) -> append and continue.
+///   Absent     -> TORN TAIL (missing in-range entry): STOP at this seq and keep
+///                 exactly the prefix (never zero-fill); returns Ok((prefix, Some(seq))).
+///   Unreadable -> CORRUPTION of a committed message: FAIL LOUD — returns Err so
+///                 the caller aborts init instead of silently truncating.
+/// A clean full fold returns `Ok((messages, None))`.
+fn fold_messages<F>(next_seq: u64, mut fetch: F) -> Result<(Vec<Message>, Option<u64>), String>
 where
-    F: FnMut(u64) -> Option<Message>,
+    F: FnMut(u64) -> MsgEntry,
 {
     let mut messages: Vec<Message> = Vec::new();
     let mut seq = 0u64;
     while seq < next_seq {
         match fetch(seq) {
-            Some(m) => messages.push(m),
-            None => return (messages, Some(seq)),
+            MsgEntry::Present(m) => messages.push(m),
+            MsgEntry::Absent => return Ok((messages, Some(seq))),
+            MsgEntry::Unreadable(why) => return Err(why),
         }
         seq += 1;
     }
-    (messages, None)
+    Ok((messages, None))
 }
 
 /// Which hydration path `init` takes, decided PURELY from the two store probes.
@@ -444,14 +450,29 @@ fn init(config: Value) -> Value {
     let path = decide_init_path(cursor_opt, &legacy);
     let state = match path {
         InitPath::Hydrate(next_seq) => {
-            // Fold the per-message entries back into a MailboxState. A missing
-            // entry inside the range is a torn tail (crash mid-append): log
-            // loudly and stop — do NOT panic, do NOT zero-fill.
-            let (messages, torn) =
-                fold_messages(next_seq, |seq| load_message(&address, seq));
+            // Fold the per-message entries back into a MailboxState:
+            //   - an ABSENT in-range entry is a torn tail (crash mid-append):
+            //     log loudly and keep the prefix — do NOT panic, do NOT zero-fill.
+            //   - a PRESENT-but-UNREADABLE entry is corruption of an already-
+            //     committed message: FAIL LOUD (refuse to start) — the same
+            //     data-loss guard as an unreadable cursor/legacy blob, never a
+            //     silent truncation of the mailbox to the readable prefix.
+            let (messages, torn) = match fold_messages(next_seq, |seq| load_message(&address, seq)) {
+                Ok(folded) => folded,
+                Err(e) => {
+                    log(format!(
+                        "[inbox-mailbox] init ABORT for {}: committed msg entry unreadable while folding (cursor={}): {} — refusing to start (data-loss guard)",
+                        address, next_seq, e
+                    ));
+                    return err_str(&format!(
+                        "mailbox init: a committed msg entry for {} is unreadable ({}); refusing silent-truncation",
+                        address, e
+                    ));
+                }
+            };
             if let Some(at) = torn {
                 log(format!(
-                    "[inbox-mailbox] TORN TAIL for {}: msg entry seq={} missing/unreadable while cursor={} — crash mid-append; folded first {} message(s) and stopped (NOT zero-filling)",
+                    "[inbox-mailbox] TORN TAIL for {}: msg entry seq={} absent while cursor={} — crash mid-append; folded first {} message(s) and stopped (NOT zero-filling)",
                     address, at, next_seq, messages.len()
                 ));
             }
@@ -626,7 +647,7 @@ mod tests {
     // The store calls are host calls (not unit-testable in-crate), so we test
     // the PURE logic: the hydration fold and the init-path decision. The store
     // wiring + write-ordering are verified by `nix build` + reviewer reading.
-    use super::{decide_init_path, fold_messages, InitPath, MailboxState, Message};
+    use super::{decide_init_path, fold_messages, InitPath, MailboxState, Message, MsgEntry};
     use alloc::string::String;
     use alloc::vec;
     use alloc::vec::Vec;
@@ -655,9 +676,18 @@ mod tests {
 
     // ---- fold_messages ----
 
+    // Map an Option<Message> "store" to MsgEntry: present => Present, missing =>
+    // Absent (a torn tail, NOT corruption).
+    fn fetch_from(store: &[Message], seq: u64) -> MsgEntry {
+        match store.get(seq as usize) {
+            Some(m) => MsgEntry::Present(m.clone()),
+            None => MsgEntry::Absent,
+        }
+    }
+
     #[test]
     fn fold_empty_yields_empty() {
-        let (msgs, torn) = fold_messages(0, |_| None);
+        let (msgs, torn) = fold_messages(0, |_| MsgEntry::Absent).expect("no fetch for empty range");
         assert!(msgs.is_empty());
         assert_eq!(torn, None);
     }
@@ -665,7 +695,7 @@ mod tests {
     #[test]
     fn fold_full_range_in_order() {
         let store: Vec<Message> = vec![msg(0), msg(1), msg(2)];
-        let (msgs, torn) = fold_messages(3, |seq| store.get(seq as usize).cloned());
+        let (msgs, torn) = fold_messages(3, |seq| fetch_from(&store, seq)).expect("all present");
         assert_eq!(msgs.len(), 3);
         assert_eq!(msgs[0].id, 0);
         assert_eq!(msgs[1].id, 1);
@@ -675,11 +705,11 @@ mod tests {
 
     #[test]
     fn fold_torn_tail_stops_at_gap() {
-        // Cursor claims 3 entries, but only seq 0 and 1 are present (a crash
-        // mid-append left seq 2 missing). We fold the two we have and STOP — no
-        // zero-fill, no panic — reporting the torn seq.
+        // Cursor claims 3 entries, but only seq 0 and 1 are present (absent tail).
+        // We fold the two we have and STOP — no zero-fill, no panic, no error —
+        // reporting the torn seq. Absent is the benign torn-tail case.
         let store: Vec<Message> = vec![msg(0), msg(1)];
-        let (msgs, torn) = fold_messages(3, |seq| store.get(seq as usize).cloned());
+        let (msgs, torn) = fold_messages(3, |seq| fetch_from(&store, seq)).expect("absent tail is torn-tail, not error");
         assert_eq!(msgs.len(), 2);
         assert_eq!(msgs[0].id, 0);
         assert_eq!(msgs[1].id, 1);
@@ -687,11 +717,27 @@ mod tests {
     }
 
     #[test]
-    fn fold_gap_in_middle_stops_early() {
-        // A hole at seq 1 => we keep only seq 0 and stop there.
-        let (msgs, torn) = fold_messages(3, |seq| if seq == 0 { Some(msg(0)) } else { None });
+    fn fold_absent_in_middle_is_torn_tail() {
+        // A hole (absent) at seq 1 => keep only seq 0 and stop there (torn tail).
+        let (msgs, torn) = fold_messages(3, |seq| if seq == 0 { MsgEntry::Present(msg(0)) } else { MsgEntry::Absent })
+            .expect("absent is torn-tail, not error");
         assert_eq!(msgs.len(), 1);
         assert_eq!(torn, Some(1));
+    }
+
+    #[test]
+    fn fold_unreadable_entry_fails_loud() {
+        // THE DATA-LOSS GUARD on the fold: seq 0 present, seq 1 present-but-
+        // UNREADABLE (corruption of a committed message), seq 2 present. The fold
+        // must return Err (fail loud -> init aborts), NOT silently truncate to the
+        // readable prefix [seq 0]. This is the case that distinguishes a corrupt
+        // committed entry from a benign absent torn tail.
+        let r = fold_messages(3, |seq| match seq {
+            0 => MsgEntry::Present(msg(0)),
+            1 => MsgEntry::Unreadable(String::from("decode failed")),
+            _ => MsgEntry::Present(msg(seq)),
+        });
+        assert!(r.is_err(), "an unreadable committed entry must fail loud, not truncate");
     }
 
     // ---- decide_init_path (all four branches) ----
