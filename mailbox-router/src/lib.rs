@@ -151,7 +151,11 @@ fn canon(address: &str) -> String {
 ///     octets — which bounds the otherwise-unbounded claimable space (review
 ///     FIX 1) and caps the per-address resource cost of a claim;
 ///   * no control, whitespace, or other non-printable characters anywhere,
-///     closing malformed-address / header-injection vectors.
+///     closing malformed-address / header-injection vectors;
+///   * no zero-width / Unicode bidi-format control characters anywhere — these
+///     are neither control nor whitespace by Rust's char classification, so the
+///     check above lets them through; they let an address visually impersonate
+///     another (homograph) or hide characters, so reject them at this boundary.
 /// Input is already `canon`ed (lowercased) at both call sites.
 fn valid_address(a: &str) -> bool {
     // Cheap length guard (octets) before the per-char scan.
@@ -166,6 +170,22 @@ fn valid_address(a: &str) -> bool {
         && !domain.is_empty()
         && local.len() <= 64
         && !a.chars().any(|c| c.is_control() || c.is_whitespace())
+        && !a.chars().any(is_invisible_or_format)
+}
+
+/// Zero-width and Unicode bidi/format control code points used for homograph /
+/// character-hiding spoofing. Matched explicitly (not via a unicode-table
+/// lookup) so the router guest stays `no_std` with no extra dependencies.
+///   U+00AD           SOFT HYPHEN
+///   U+200B..=U+200F  ZWSP, ZWNJ, ZWJ, LRM, RLM
+///   U+202A..=U+202E  LRE, RLE, PDF, LRO, RLO (bidi embedding/override)
+///   U+2060           WORD JOINER
+///   U+2066..=U+2069  LRI, RLI, FSI, PDI (bidi isolates)
+///   U+FEFF           ZERO WIDTH NO-BREAK SPACE / BOM
+fn is_invisible_or_format(c: char) -> bool {
+    matches!(c,
+        '\u{00AD}' | '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}'
+        | '\u{2060}' | '\u{2066}'..='\u{2069}' | '\u{FEFF}')
 }
 
 #[import(module = "theater:simple/self", name = "log")]
@@ -566,5 +586,23 @@ mod tests {
         assert!(!valid_address("alice\r@example.com"));      // carriage return
         assert!(!valid_address("alice@exam\u{7f}ple.com"));  // DEL
         assert!(!valid_address("alice@exam\u{0}ple.com"));   // NUL
+    }
+
+    #[test]
+    fn rejects_invisible_and_bidi_format() {
+        // Zero-width space injected mid-local-part (homograph / hidden char).
+        assert!(!valid_address("ali\u{200B}ce@example.com"));
+        // BOM / zero-width no-break space prefix.
+        assert!(!valid_address("\u{feff}alice@example.com"));
+        // Bidi override — can reverse the visual rendering of an address.
+        assert!(!valid_address("alice\u{202e}@example.com"));
+        // Soft hyphen (invisible, discretionary line break).
+        assert!(!valid_address("ali\u{ad}ce@example.com"));
+        // Word joiner and a bidi isolate elsewhere in the denylist.
+        assert!(!valid_address("alice@exa\u{2060}mple.com"));
+        assert!(!valid_address("alice@exa\u{2066}mple.com"));
+        // Plain ASCII addresses are unaffected (no regression).
+        assert!(valid_address("alice@example.com"));
+        assert!(valid_address("bob.smith+tag@sub.example.co.uk"));
     }
 }
